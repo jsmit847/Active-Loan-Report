@@ -1,57 +1,38 @@
-# ============================================================
-# Active Loans Report Builder — ONE FILE (Streamlit)
-#
-# What this file does
-# - Prompts user to log in to Salesforce (OAuth Authorization Code + PKCE)
-# - Pulls Salesforce *Reports* via REST (/analytics/reports/<id>) using simple-salesforce.sf.restful
-# - Parses uploaded servicer files (Statebridge / Berkadia Data Tape / FCI / Midland / CHL)
-# - Builds Bridge Asset / Bridge Loan / Term Loan / Term Asset dataframes
-# - Writes into the user-provided template workbook while PRESERVING formulas
-# - Dynamically labels the UPB column header as "M/D UPB" using the detected report run date
-#
-# Notes
-# - The UPB header date is treated as the REPORT RUN DATE (not necessarily the same as the data cutoff).
-#   By default we choose the latest run-date we can detect from the uploaded servicer files.
-# - Permission/FLS/report-access errors return empty report data instead of crashing the app.
-# - Describe / PKCE state is stored PER USER SESSION (no cross-user token leakage).
-# ============================================================
+"""Active Loans Report Builder (Streamlit)
 
-import base64
-import hashlib
+What you upload:
+  1) Active Loans TEMPLATE workbook (.xlsx)
+  2) Servicer files (csv/xlsx) for UPB/Next Pay/Maturity/Suspense/Servicer Status
+  3) Salesforce report exports (.xlsx) (detail rows)
+
+What it outputs:
+  - One Excel file per requested sheet (fast) OR one workbook containing all requested sheets
+
+Key behaviors (requested):
+  - The UPB column header is dynamic: "M/D UPB" where M/D comes from the *servicer file date in the filename*.
+    (Default = latest date found across uploaded servicer filenames; you can override.)
+  - Servicer files are only used to populate servicer-related columns and to validate SF data.
+  - Template formulas are preserved (formula columns are not overwritten).
+  - Template “as-of” date cells (row 3) are updated so formula columns recalc correctly.
+
+No Salesforce API / OAuth is used in this version (uses exports only).
+"""
+
 import re
-import secrets
-import time
-import urllib.parse
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 from openpyxl import load_workbook
-from simple_salesforce import Salesforce
 
 
 # =============================================================================
-# SALESFORCE REPORTS (IDs you gave)
+# SALESFORCE REPORT EXPORT MAPPINGS (Label-based)
 # =============================================================================
-REPORTS = {
-    "bridge_maturity": ("Bridge Maturity Report v3", "00O5b000005s0aFEAQ"),
-    "do_not_lend": ("Do Not Lend", "00OPK000005tu3V2AQ"),
-    "valuation": ("Valuation v4 Report", "00OPK000003PXS52AO"),
-    "am_assignments": ("AM Assignments Report", "00OPK00000257Kf2AI"),
-    "active_rm": ("Active RM Report", "00OPK000005QLAn2AO"),
-    "term_export": ("Term Data Export", "00OPK000004p7Uz2AI"),
-    "sold_term": ("Sold Term Loans", "00OPK0000030QFJ2A2"),
-    "term_asset": ("Term Asset Level - By Deal", "00OPK00000DRwy52AD"),
-}
 
-
-# =============================================================================
-# PROVIDED MAPPINGS (Label-based; SF report outputs are label columns)
-# =============================================================================
 BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
@@ -160,25 +141,8 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 
 
 # =============================================================================
-# BASIC NORMALIZATION
+# NORMALIZATION
 # =============================================================================
-
-def norm_text(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    s = str(x).strip()
-    s = re.sub(r"\.0$", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s or None
-
-
-def norm_id(x):
-    s = norm_text(x)
-    if not s:
-        return None
-    s = re.sub(r"[^0-9A-Za-z]", "", s)
-    return s or None
-
 
 def norm_id_series(s: pd.Series) -> pd.Series:
     return (
@@ -204,311 +168,23 @@ def to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
 
-def make_upb_header(run_dt: date) -> str:
-    # report run date (month/day) + UPB
-    return f"{run_dt.month}/{run_dt.day} UPB"
-
-
 def dq_bucket(days_past_due: float) -> str:
     if pd.isna(days_past_due):
         return ""
-    d = int(max(0, days_past_due))
+    d = int(max(0, float(days_past_due)))
     if d == 0:
         return "Current"
     if d < 30:
-        return "1-29"
-    if d < 45:
-        return "30-44"
+        return "DQ 1-29"
     if d < 60:
-        return "45-59"
+        return "DQ 30-59"
     if d < 90:
-        return "60-89"
-    return "90+"
+        return "DQ 60-89"
+    return "DQ 90+"
 
 
-# =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE)
-# =============================================================================
-
-def _b64url_no_pad(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
-
-
-def _make_verifier() -> str:
-    v = secrets.token_urlsafe(96)
-    return v[:128]
-
-
-def _make_challenge(verifier: str) -> str:
-    return _b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
-
-
-def _is_perm_error(msg: str) -> bool:
-    m = (msg or "").lower()
-    needles = [
-        "insufficient",
-        "permission",
-        "not authorized",
-        "not permitted",
-        "invalid_type",
-        "insufficient_access",
-        "insufficient access",
-        "insufficient_privileges",
-        "insufficient_access_on_cross_reference_entity",
-        "entity is not accessible",
-        "field is not accessible",
-        "no access",
-        "access denied",
-    ]
-    return any(n in m for n in needles)
-
-
-def sf_restful_safe(sf: Salesforce, path: str, method: str = "GET") -> dict:
-    """Return {} on permission/report-access errors instead of crashing the app."""
-    try:
-        return sf.restful(path, method=method)
-    except Exception as e:
-        if _is_perm_error(str(e)):
-            st.warning(f"⚠️ Salesforce access issue for: {path}. Returning empty results for this item.")
-            return {}
-        raise
-
-
-def _exchange_code_for_token(
-    token_url: str,
-    code: str,
-    verifier: str,
-    client_id: str,
-    redirect_uri: str,
-    client_secret: Optional[str] = None,
-) -> dict:
-    data = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code": code,
-        "code_verifier": verifier,
-    }
-    if client_secret:
-        data["client_secret"] = client_secret
-
-    resp = requests.post(token_url, data=data, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
-    return resp.json()
-
-
-def ensure_sf_session() -> Salesforce:
-    """Forces user login (PKCE) before continuing. Returns simple_salesforce.Salesforce."""
-
-    cfg = st.secrets.get("salesforce")
-    if not cfg:
-        st.error("Missing Salesforce secrets. Add a [salesforce] section to .streamlit/secrets.toml")
-        st.stop()
-
-    client_id = cfg["client_id"]
-    client_secret = cfg.get("client_secret")
-    auth_host = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
-    redirect_uri = cfg["redirect_uri"].rstrip("/")
-
-    auth_url = f"{auth_host}/services/oauth2/authorize"
-    token_url = f"{auth_host}/services/oauth2/token"
-
-    qp = st.query_params
-    code = qp.get("code")
-    state = qp.get("state")
-    err = qp.get("error")
-    err_desc = qp.get("error_description")
-
-    if err:
-        st.error(f"Login error: {err}")
-        if err_desc:
-            st.code(err_desc)
-        st.stop()
-
-    if "sf_token" not in st.session_state:
-        st.session_state.sf_token = None
-
-    # PKCE state store must be per-session (permissions differ by user)
-    if "pkce_store" not in st.session_state:
-        st.session_state.pkce_store = {}
-
-    store = st.session_state.pkce_store
-    now = time.time()
-    ttl = 900  # 15 minutes
-    for s, (_v, t0) in list(store.items()):
-        if now - t0 > ttl:
-            store.pop(s, None)
-
-    # OAuth callback
-    if code:
-        if not state or state not in store:
-            st.error("Login link expired. Click login again.")
-            st.stop()
-
-        verifier, _t0 = store.pop(state)
-        tok = _exchange_code_for_token(token_url, code, verifier, client_id, redirect_uri, client_secret)
-        st.session_state.sf_token = tok
-        st.query_params.clear()
-        st.rerun()
-
-    # Not logged in -> show login button and stop
-    if not st.session_state.sf_token:
-        new_state = secrets.token_urlsafe(24)
-        verifier = _make_verifier()
-        challenge = _make_challenge(verifier)
-        store[new_state] = (verifier, time.time())
-
-        login_params = {
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": new_state,
-            "prompt": "login",
-            "scope": "api refresh_token",
-        }
-        login_url = auth_url + "?" + urllib.parse.urlencode(login_params)
-
-        st.info("Step 1: Log in to Salesforce to pull reports.")
-        st.link_button("Login to Salesforce", login_url)
-        st.stop()
-
-    tok = st.session_state.sf_token
-    access_token = tok.get("access_token")
-    instance_url = tok.get("instance_url")
-
-    if not access_token or not instance_url:
-        st.error("Login token missing needed values.")
-        st.stop()
-
-    return Salesforce(instance_url=instance_url, session_id=access_token)
-
-
-# =============================================================================
-# SALESFORCE REPORT PULL (REST)
-# =============================================================================
-
-def get_report_metadata(sf: Salesforce, report_id: str) -> dict:
-    return sf_restful_safe(sf, f"analytics/reports/{report_id}", method="GET")
-
-
-def run_report_page(sf: Salesforce, report_id: str, page: int, page_size: int) -> dict:
-    return sf_restful_safe(
-        sf,
-        f"analytics/reports/{report_id}?includeDetails=true&pageSize={page_size}&page={page}",
-        method="GET",
-    )
-
-
-def report_json_to_df(report_json: dict) -> pd.DataFrame:
-    if not report_json:
-        return pd.DataFrame()
-
-    rm = report_json.get("reportMetadata") or {}
-    em = report_json.get("reportExtendedMetadata") or {}
-    colinfo = em.get("detailColumnInfo") or {}
-    detail_cols = rm.get("detailColumns") or []
-
-    labels: List[str] = []
-    for col_key in detail_cols:
-        info = colinfo.get(col_key, {}) or {}
-        lbl = info.get("label") or col_key
-        labels.append(lbl)
-
-    factmap = report_json.get("factMap") or {}
-    block = factmap.get("T!T") or {}
-    rows = block.get("rows") or []
-
-    data_rows = []
-    for r in rows:
-        cells = r.get("dataCells") or []
-        vals = []
-        for c in cells:
-            v = c.get("label")
-            if v is None:
-                v = c.get("value")
-            vals.append(v)
-        if len(vals) < len(labels):
-            vals += [None] * (len(labels) - len(vals))
-        data_rows.append(vals[: len(labels)])
-
-    df = pd.DataFrame(data_rows, columns=labels)
-
-    # Avoid duplicate-column headaches
-    if df.columns.duplicated().any():
-        seen: Dict[str, int] = {}
-        new_cols: List[str] = []
-        for c in df.columns:
-            if c not in seen:
-                seen[c] = 1
-                new_cols.append(c)
-            else:
-                seen[c] += 1
-                new_cols.append(f"{c} ({seen[c]})")
-        df.columns = new_cols
-
-    return df
-
-
-def run_report_all_rows(sf: Salesforce, report_id: str, page_size: int = 2000, max_pages: int = 5000) -> pd.DataFrame:
-    meta = get_report_metadata(sf, report_id)
-    if not meta:
-        return pd.DataFrame()
-
-    total_rows = (meta.get("attributes") or {}).get("reportTotalRows") or (meta.get("reportMetadata") or {}).get(
-        "reportTotalRows"
-    )
-
-    chunks: List[pd.DataFrame] = []
-    page = 0
-    total_seen = 0
-
-    while page < max_pages:
-        js = run_report_page(sf, report_id, page=page, page_size=page_size)
-        if not js:
-            break
-
-        df = report_json_to_df(js)
-        n = len(df)
-        if n == 0:
-            break
-
-        chunks.append(df)
-        total_seen += n
-
-        if isinstance(total_rows, int) and total_rows > 0 and total_seen >= total_rows:
-            break
-        if n < page_size:
-            break
-
-        page += 1
-
-    if not chunks:
-        return pd.DataFrame()
-
-    out = pd.concat(chunks, ignore_index=True).drop_duplicates()
-    return out
-
-
-# =============================================================================
-# SERVICER FILE PARSING (NO HARD-CODED NAMES; DETECT BY COLUMNS)
-# =============================================================================
-
-def sniff_excel_header_row(file_bytes: bytes, required_cols: Set[str], max_scan_rows: int = 30) -> Optional[int]:
-    """Scan first rows of the ACTIVE sheet; find row that contains all required columns."""
-    wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
-    ws = wb.active
-    try:
-        for r in range(1, max_scan_rows + 1):
-            row_vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-            cols = {str(v).strip() for v in row_vals if v is not None and str(v).strip() != ""}
-            if required_cols.issubset(cols):
-                return r  # 1-indexed
-        return None
-    finally:
-        wb.close()
+def make_upb_header(as_of: date) -> str:
+    return f"{as_of.month}/{as_of.day} UPB"
 
 
 def date_from_filename(name: str) -> Optional[date]:
@@ -516,186 +192,267 @@ def date_from_filename(name: str) -> Optional[date]:
     m = re.search(r"(20\d{2})(\d{2})(\d{2})", name)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
-    # YYYY-M-D or YYYY-MM-DD
-    m = re.search(r"(20\d{2})[-_](\d{1,2})[-_](\d{1,2})", name)
-    if m:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
     # MM_DD_YYYY or MM-DD-YYYY
     m = re.search(r"(\d{2})[_-](\d{2})[_-](20\d{2})", name)
     if m:
         return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
-
     # MMDDYYYY
     m = re.search(r"(\d{2})(\d{2})(20\d{2})", name)
     if m:
         mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= mm <= 12 and 1 <= dd <= 31:
             return date(yy, mm, dd)
-
     return None
 
 
 def _extract_date_from_text(s: str) -> Optional[date]:
     if not s:
         return None
-    # Try a few patterns
-    m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
+    m = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", s)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-
     m = re.search(r"(\d{1,2})/(\d{1,2})/(20\d{2})", s)
     if m:
         return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
-
     return None
 
 
-def parse_servicer_upload(upload) -> pd.DataFrame:
+# =============================================================================
+# SALESFORCE EXPORT LOADER
+# =============================================================================
+
+def _sniff_export_header_row(file_bytes: bytes, required_any: Sequence[str], max_scan_rows: int = 30) -> int:
+    """Return 0-indexed header row for pandas.read_excel."""
+    wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+    try:
+        best_row = 0
+        best_score = -1
+        req = {str(r).strip() for r in required_any if r and str(r).strip()}
+
+        for r in range(1, max_scan_rows + 1):
+            row = next(ws.iter_rows(min_row=r, max_row=r, values_only=True))
+            vals = {str(v).strip() for v in row if v is not None and str(v).strip()}
+            score = len(vals & req)
+            if score > best_score:
+                best_score = score
+                best_row = r
+            if score >= max(4, min(10, len(req) // 2)):
+                return r - 1
+
+        return best_row - 1
+    finally:
+        wb.close()
+
+
+def load_sf_export(upload, expected_labels: Sequence[str]) -> pd.DataFrame:
+    if upload is None:
+        return pd.DataFrame()
+    b = upload.getvalue()
+    header = _sniff_export_header_row(b, expected_labels)
+    df = pd.read_excel(BytesIO(b), header=header)
+    df = df.dropna(how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+# =============================================================================
+# SERVICER FILE PARSING (STREAMING)
+# =============================================================================
+
+def _sniff_header_row_openpyxl(
+    file_bytes: bytes,
+    required_cols: Set[str],
+    sheet_name: Optional[str] = None,
+    max_scan_rows: int = 35,
+) -> Tuple[Optional[str], Optional[int], Dict[str, int]]:
+    wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    try:
+        sheet_names = [sheet_name] if sheet_name and sheet_name in wb.sheetnames else list(wb.sheetnames)
+        req = {str(x).strip() for x in required_cols}
+
+        for sn in sheet_names:
+            ws = wb[sn]
+            for r in range(1, max_scan_rows + 1):
+                row = next(ws.iter_rows(min_row=r, max_row=r, values_only=True))
+                headers = [str(v).strip() if v is not None else None for v in row]
+                hset = {h for h in headers if h}
+                if req.issubset(hset):
+                    col_map = {h: i for i, h in enumerate(headers) if h}
+                    return sn, r, col_map
+        return None, None, {}
+    finally:
+        wb.close()
+
+
+def _stream_xlsx_columns(
+    file_bytes: bytes,
+    sheet_name: str,
+    header_row: int,
+    col_map: Dict[str, int],
+    wanted: Sequence[str],
+) -> pd.DataFrame:
+    wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        idxs = [(c, col_map[c]) for c in wanted if c in col_map]
+        cols_present = [c for c, _i in idxs]
+
+        rows_out: List[List[object]] = []
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            rows_out.append([row[i] if i < len(row) else None for _c, i in idxs])
+
+        return pd.DataFrame(rows_out, columns=cols_present)
+    finally:
+        wb.close()
+
+
+def parse_servicer_upload(upload) -> Tuple[pd.DataFrame, Optional[date], Optional[date]]:
     name = upload.name
     b = upload.getvalue()
 
-    # -----------------------------
+    file_dt = date_from_filename(name)
+    embedded_dt: Optional[date] = None
+
     # CHL CSV
-    # -----------------------------
     if name.lower().endswith(".csv"):
         df = pd.read_csv(BytesIO(b))
         req = {"Servicer Loan ID", "UPB"}
         if not req.issubset(set(df.columns)):
             raise ValueError(f"CSV doesn't look like CHL Streamline (missing {req - set(df.columns)}).")
 
-        d = date_from_filename(name)
-        as_of = pd.to_datetime(d) if d else pd.NaT
-
         out = pd.DataFrame(
             {
-                "source_file": name,
                 "servicer": "CHL",
                 "servicer_id": norm_id_series(df["Servicer Loan ID"]),
                 "upb": df["UPB"].apply(money_to_float),
-                "suspense": np.nan,
+                "suspense": pd.to_numeric(df.get("Suspense Balance", np.nan), errors="coerce"),
                 "next_payment_date": df.get("Next Due Date", pd.Series([None] * len(df))).apply(to_dt),
                 "maturity_date": df.get("Current Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
                 "status": df.get("Performing Status", pd.Series([None] * len(df))).astype("string"),
-                "as_of": as_of,
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
 
-    # -----------------------------
-    # Excel types detected by required columns
-    # -----------------------------
-    checks: List[Tuple[str, Set[str]]] = [
-        # CHL Streamline Excel export (header row is usually 2)
-        ("CHL", {"Servicer Loan ID", "UPB", "Next Due Date", "Current Maturity Date"}),
-        ("Statebridge", {"Loan Number", "Current UPB", "Due Date", "Maturity Date", "Loan Status"}),
-        # Berkadia "Data Tape" (your CoreVest_Data_Tape file)
-        ("Berkadia", {"BCM Loan#", "Principal Balance", "Next Payment Due Date", "Maturity Date"}),
-        ("FCI", {"Account", "Current Balance", "Next Due Date", "Maturity Date", "Status"}),
-        ("Midland", {"ServicerLoanNumber", "UPB$", "NextPaymentDate", "MaturityDate", "ServicerLoanStatus"}),
+    # CHL Streamline XLSX (tiny; parse via pandas with header sniff)
+    if name.lower().endswith(".xlsx") and "streamline" in name.lower():
+        raw = pd.read_excel(BytesIO(b), header=None)
+        hdr_row = None
+        for i in range(min(15, len(raw))):
+            row = raw.iloc[i].astype("string").fillna("").str.strip().tolist()
+            if "Servicer Loan ID" in row and "UPB" in row:
+                hdr_row = i
+                break
+        if hdr_row is None:
+            raise ValueError("Could not detect CHL Streamline header row.")
+
+        df = pd.read_excel(BytesIO(b), header=hdr_row)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # embedded run date from title cell if present
+        try:
+            title = str(raw.iloc[0, 0]) if pd.notna(raw.iloc[0, 0]) else ""
+            embedded_dt = _extract_date_from_text(title)
+        except Exception:
+            embedded_dt = None
+
+        out = pd.DataFrame(
+            {
+                "servicer": "CHL",
+                "servicer_id": norm_id_series(df["Servicer Loan ID"]),
+                "upb": df["UPB"].apply(money_to_float),
+                "suspense": pd.to_numeric(df.get("Suspense Balance", np.nan), errors="coerce"),
+                "next_payment_date": df.get("Next Due Date", pd.Series([None] * len(df))).apply(to_dt),
+                "maturity_date": df.get("Current Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
+                "status": df.get("Performing Status", pd.Series([None] * len(df))).astype("string"),
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
+            }
+        )
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
+
+    # XLSX types detected by required columns
+    patterns = [
+        ("Statebridge", {"Loan Number", "Current UPB", "Due Date", "Maturity Date", "Loan Status"}, None),
+        ("Berkadia", {"BCM Loan#", "Principal Balance", "Next Payment Due Date", "Maturity Date"}, "Loan"),
+        ("FCI", {"Account", "Current Balance", "Next Due Date", "Maturity Date", "Status"}, None),
+        ("Midland", {"ServicerLoanNumber", "UPB$", "NextPaymentDate", "MaturityDate", "ServicerLoanStatus"}, None),
     ]
 
     detected = None
+    sheet = None
     header_row = None
-    for serv, req in checks:
-        hr = sniff_excel_header_row(b, req)
+    col_map: Dict[str, int] = {}
+
+    for serv, req, sn in patterns:
+        s, hr, cmap = _sniff_header_row_openpyxl(b, req, sheet_name=sn)
         if hr is not None:
-            detected = serv
-            header_row = hr
+            detected, sheet, header_row, col_map = serv, s, hr, cmap
             break
 
-    if detected is None:
-        raise ValueError(
-            "Could not detect servicer file type from columns (Statebridge/Berkadia/FCI/Midland/CHL Streamline)."
-        )
+    if detected is None or sheet is None or header_row is None:
+        raise ValueError("Could not detect servicer file type from columns.")
 
-    # Read sheet using detected header row
-    df = pd.read_excel(BytesIO(b), header=header_row - 1)
-
-    # Best-effort file-name date
-    d_file = date_from_filename(name)
-    as_of_file = pd.to_datetime(d_file) if d_file else pd.NaT
-
-    # -----------------------------
-    # CHL Streamline Excel
-    # -----------------------------
-    if detected == "CHL":
-        # Try to infer run date from A1 title like "Streamline - Servicing-2026-3-2"
-        try:
-            wb = load_workbook(BytesIO(b), read_only=True, data_only=True)
-            ws = wb.active
-            title = ws.cell(1, 1).value
-            wb.close()
-        except Exception:
-            title = None
-
-        d_title = _extract_date_from_text(str(title)) if title else None
-        as_of_title = pd.to_datetime(d_title) if d_title else pd.NaT
-
-        out = pd.DataFrame(
-            {
-                "source_file": name,
-                "servicer": "CHL",
-                "servicer_id": norm_id_series(df["Servicer Loan ID"]),
-                "upb": df["UPB"].apply(money_to_float),
-                "suspense": np.nan,
-                "next_payment_date": df.get("Next Due Date", pd.Series([None] * len(df))).apply(to_dt),
-                "maturity_date": df.get("Current Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
-                "status": df.get("Performing Status", pd.Series([None] * len(df))).astype("string"),
-                "as_of": as_of_title if pd.notna(as_of_title) else as_of_file,
-            }
-        )
-        return out.dropna(subset=["servicer_id"])
-
-    # -----------------------------
-    # Statebridge (CoreVestLoanData_*.xlsx matches this)
-    # -----------------------------
     if detected == "Statebridge":
+        df = _stream_xlsx_columns(
+            b, sheet, header_row, col_map,
+            ["Loan Number", "Current UPB", "Unapplied Balance", "Due Date", "Maturity Date", "Loan Status", "Date"]
+        )
+        if "Date" in df.columns:
+            dmax = pd.to_datetime(df["Date"], errors="coerce").max()
+            embedded_dt = dmax.date() if pd.notna(dmax) else None
+
         out = pd.DataFrame(
             {
-                "source_file": name,
                 "servicer": "Statebridge",
                 "servicer_id": norm_id_series(df["Loan Number"]),
                 "upb": pd.to_numeric(df["Current UPB"], errors="coerce"),
                 "suspense": pd.to_numeric(df.get("Unapplied Balance", np.nan), errors="coerce"),
-                "next_payment_date": df["Due Date"].apply(to_dt),
-                "maturity_date": df["Maturity Date"].apply(to_dt),
-                "status": df["Loan Status"].astype("string"),
-                # Prefer the file's own "Date" column if present; fallback to filename
-                "as_of": df.get("Date", pd.Series([as_of_file] * len(df))).apply(to_dt).fillna(as_of_file),
+                "next_payment_date": df.get("Due Date", pd.Series([None] * len(df))).apply(to_dt),
+                "maturity_date": df.get("Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
+                "status": df.get("Loan Status", pd.Series([None] * len(df))).astype("string"),
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
 
-    # -----------------------------
-    # Berkadia Data Tape
-    # -----------------------------
     if detected == "Berkadia":
+        df = _stream_xlsx_columns(
+            b, sheet, header_row, col_map,
+            ["BCM Loan#", "Principal Balance", "Suspense Balance", "Next Payment Due Date", "Maturity Date", "Run Date"]
+        )
+        if "Run Date" in df.columns:
+            dmax = pd.to_datetime(df["Run Date"], errors="coerce").max()
+            embedded_dt = dmax.date() if pd.notna(dmax) else None
+
+        # Matches your Completed workbook behavior: Berkadia Servicer Status = "Active"
+        status = pd.Series(["Active"] * len(df))
+
         out = pd.DataFrame(
             {
-                "source_file": name,
                 "servicer": "Berkadia",
                 "servicer_id": norm_id_series(df["BCM Loan#"]),
                 "upb": pd.to_numeric(df["Principal Balance"], errors="coerce"),
                 "suspense": pd.to_numeric(df.get("Suspense Balance", np.nan), errors="coerce"),
                 "next_payment_date": df.get("Next Payment Due Date", pd.Series([None] * len(df))).apply(to_dt),
                 "maturity_date": df.get("Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
-                # Use "Loan Status" if available (better than B/T)
-                "status": df.get("Loan Status", df.get("B/T", pd.Series([None] * len(df)))).astype("string"),
-                # Prefer "Run Date" column; fallback to filename
-                "as_of": df.get("Run Date", pd.Series([as_of_file] * len(df))).apply(to_dt).fillna(as_of_file),
+                "status": status.astype("string"),
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
 
-    # -----------------------------
-    # FCI
-    # -----------------------------
     if detected == "FCI":
+        df = _stream_xlsx_columns(
+            b, sheet, header_row, col_map,
+            ["Account", "Current Balance", "Suspense Pmt.", "Next Due Date", "Maturity Date", "Status"]
+        )
         out = pd.DataFrame(
             {
-                "source_file": name,
                 "servicer": "FCI",
                 "servicer_id": norm_id_series(df["Account"]),
                 "upb": pd.to_numeric(df["Current Balance"], errors="coerce"),
@@ -703,81 +460,77 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
                 "next_payment_date": df.get("Next Due Date", pd.Series([None] * len(df))).apply(to_dt),
                 "maturity_date": df.get("Maturity Date", pd.Series([None] * len(df))).apply(to_dt),
                 "status": df.get("Status", pd.Series([None] * len(df))).astype("string"),
-                "as_of": as_of_file,
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
 
-    # -----------------------------
-    # Midland
-    # -----------------------------
     if detected == "Midland":
+        df = _stream_xlsx_columns(
+            b, sheet, header_row, col_map,
+            ["ServicerLoanNumber", "UPB$", "NextPaymentDate", "MaturityDate", "ServicerLoanStatus", "ReportDate"]
+        )
+        # normalize Midland IDs: strip COM, non-alnum, leading zeros
         raw = df["ServicerLoanNumber"].astype("string").str.strip()
         raw = raw.str.replace(r"COM$", "", regex=True)
         raw = raw.str.replace(r"[^0-9A-Za-z]", "", regex=True).str.lstrip("0")
 
+        if "ReportDate" in df.columns:
+            dmax = pd.to_datetime(df["ReportDate"], errors="coerce").max()
+            embedded_dt = dmax.date() if pd.notna(dmax) else None
+
         out = pd.DataFrame(
             {
-                "source_file": name,
                 "servicer": "Midland",
                 "servicer_id": raw.replace({"": pd.NA}),
                 "upb": df["UPB$"].apply(money_to_float),
                 "suspense": np.nan,
-                "next_payment_date": df["NextPaymentDate"].apply(to_dt),
-                "maturity_date": df["MaturityDate"].apply(to_dt),
-                "status": df["ServicerLoanStatus"].astype("string"),
-                "as_of": df.get("ReportDate", pd.Series([as_of_file] * len(df))).apply(to_dt).fillna(as_of_file),
+                "next_payment_date": df.get("NextPaymentDate", pd.Series([None] * len(df))).apply(to_dt),
+                "maturity_date": df.get("MaturityDate", pd.Series([None] * len(df))).apply(to_dt),
+                "status": df.get("ServicerLoanStatus", pd.Series([None] * len(df))).astype("string"),
+                "as_of": pd.to_datetime(file_dt) if file_dt else pd.NaT,
+                "source_file": name,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return out.dropna(subset=["servicer_id"]), file_dt, embedded_dt
 
     raise ValueError("Unhandled servicer type.")
 
 
-def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date]:
+def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, Optional[date], Optional[date]]:
     frames: List[pd.DataFrame] = []
-    asof_candidates: List[date] = []
+    file_dates: List[date] = []
+    embedded_dates: List[date] = []
 
     for f in servicer_uploads:
-        df = parse_servicer_upload(f)
+        df, fdt, edt = parse_servicer_upload(f)
         frames.append(df)
-        dmax = pd.to_datetime(df["as_of"], errors="coerce").max()
-        if pd.notna(dmax):
-            asof_candidates.append(dmax.date())
+        if fdt:
+            file_dates.append(fdt)
+        if edt:
+            embedded_dates.append(edt)
 
-    lookup = (
-        pd.concat(frames, ignore_index=True)
-        if frames
-        else pd.DataFrame(
-            columns=[
-                "source_file",
-                "servicer",
-                "servicer_id",
-                "upb",
-                "suspense",
-                "next_payment_date",
-                "maturity_date",
-                "status",
-                "as_of",
-            ]
-        )
+    lookup = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["servicer", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of", "source_file"]
     )
 
-    # latest row per (servicer, servicer_id)
     if not lookup.empty:
-        lookup = lookup.sort_values("as_of").drop_duplicates(["servicer", "servicer_id"], keep="last")
+        lookup = lookup.dropna(subset=["servicer_id"]).copy()
+        lookup["servicer_id"] = norm_id_series(lookup["servicer_id"])
+        lookup = lookup.sort_values(["as_of"]).drop_duplicates(["servicer", "servicer_id"], keep="last")
 
-    # choose "report run date" default = max as_of found; fallback today
-    run_date = max(asof_candidates) if asof_candidates else date.today()
-    return lookup, run_date
+    as_of_file = max(file_dates) if file_dates else None
+    as_of_embedded = max(embedded_dates) if embedded_dates else None
+
+    return lookup, as_of_file, as_of_embedded
 
 
 # =============================================================================
-# LAST WEEK REPORT CARRY-FORWARD (REO DATE + optional manual columns)
+# LAST WEEK CARRY-FORWARD
 # =============================================================================
 
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
-    # header is row 4 => pandas header=3
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
     df = df.dropna(how="all")
     df.columns = [str(c).strip() for c in df.columns]
@@ -785,9 +538,9 @@ def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame
 
 
 def build_prev_maps(prev_bytes: bytes) -> dict:
-    out = {}
+    out: Dict[str, pd.DataFrame] = {}
 
-    # Term Loan REO carry-forward
+    # Term Loan REO Date
     try:
         tl = read_tab_df_from_active_loans(prev_bytes, "Term Loan")
         if "Deal Number" in tl.columns and "REO Date" in tl.columns:
@@ -797,7 +550,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    # Optional Bridge Loan manual carry-forward
+    # Bridge Loan manual carry-forward
     try:
         bl = read_tab_df_from_active_loans(prev_bytes, "Bridge Loan")
         keep = [c for c in ["Deal Number", "State(s)", "Loan Level Delinquency", "Special Focus (Y/N)"] if c in bl.columns]
@@ -812,7 +565,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
 
 # =============================================================================
-# BUILD: BRIDGE ASSET
+# BUILD DATAFRAMES
 # =============================================================================
 
 def build_bridge_asset(
@@ -826,26 +579,23 @@ def build_bridge_asset(
 ) -> pd.DataFrame:
     out = pd.DataFrame()
 
-    # Base from Bridge Maturity
     for col, label in BRIDGE_ASSET_FROM_BRIDGE_MATURITY.items():
         out[col] = sf_spine[label] if label in sf_spine.columns else None
 
-    # Keys
-    out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
-    out["_serv_id_key"] = norm_id_series(out.get("Servicer ID", pd.Series([None] * len(out))))
-    out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
+    out["_deal_key"] = norm_id_series(out["Deal Number"])
+    out["_serv_id_key"] = norm_id_series(out["Servicer ID"])
+    out["_asset_key"] = norm_id_series(out["Asset ID"])
 
-    # Do Not Lend by Deal
-    if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
+    # Do Not Lend
+    if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns and "Do Not Lend" in sf_dnl.columns:
         dnl = sf_dnl.copy()
         dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
-        if "Do Not Lend" in dnl.columns:
-            dnl_flag = dnl.groupby("_deal_key")["Do Not Lend"].max().reset_index()
-            out = out.merge(dnl_flag, on="_deal_key", how="left")
-            out["Do Not Lend (Y/N)"] = out["Do Not Lend"].fillna(False).map(lambda x: "Y" if bool(x) else "")
-            out = out.drop(columns=["Do Not Lend"], errors="ignore")
+        dnl_flag = dnl.groupby("_deal_key")["Do Not Lend"].max().reset_index()
+        out = out.merge(dnl_flag, on="_deal_key", how="left")
+        out["Do Not Lend (Y/N)"] = out["Do Not Lend"].fillna(False).map(lambda x: "Y" if bool(x) else "N")
+        out = out.drop(columns=["Do Not Lend"], errors="ignore")
 
-    # Valuation by Asset ID
+    # Valuation by Asset
     if not sf_val.empty and "Asset ID" in sf_val.columns:
         v = sf_val.copy()
         v["_asset_key"] = norm_id_series(v["Asset ID"])
@@ -878,23 +628,19 @@ def build_bridge_asset(
         piv_name = am.pivot_table(index="_deal_key", columns="Team Role", values="Team Member Name", aggfunc="first")
         piv_date = am.pivot_table(index="_deal_key", columns="Team Role", values="Date Assigned", aggfunc="first")
 
-        piv_name = piv_name.rename(columns=role_to_namecol).reset_index()
-        piv_date = piv_date.rename(columns=role_to_datecol).reset_index()
+        out = out.merge(piv_name.rename(columns=role_to_namecol).reset_index(), on="_deal_key", how="left")
+        out = out.merge(piv_date.rename(columns=role_to_datecol).reset_index(), on="_deal_key", how="left")
 
-        out = out.merge(piv_name, on="_deal_key", how="left")
-        out = out.merge(piv_date, on="_deal_key", how="left")
-
-    # Active RM by Deal
-    if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns:
+    # Active RM (CAF Originator)
+    if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
         arm = sf_arm.copy()
         arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
-        if "CAF Originator" in arm.columns:
-            arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
-            out = out.merge(arm, on="_deal_key", how="left")
-            out["Active RM"] = out["CAF Originator"]
-            out = out.drop(columns=["CAF Originator"], errors="ignore")
+        arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
+        out = out.merge(arm, on="_deal_key", how="left")
+        out["Active RM"] = out["CAF Originator"]
+        out = out.drop(columns=["CAF Originator"], errors="ignore")
 
-    # Servicer lookup join (by Servicer ID)
+    # Servicer join
     if not serv_lookup.empty:
         s = serv_lookup.dropna(subset=["servicer_id"]).copy()
         out = out.merge(
@@ -908,22 +654,12 @@ def build_bridge_asset(
                     "maturity_date": "Servicer Maturity Date",
                     "status": "Servicer Status",
                 }
-            )[
-                [
-                    "_serv_id_key",
-                    "Servicer",
-                    "_loan_upb",
-                    "_loan_suspense",
-                    "Next Payment Date",
-                    "Servicer Maturity Date",
-                    "Servicer Status",
-                ]
-            ],
+            )[["_serv_id_key", "Servicer", "_loan_upb", "_loan_suspense", "Next Payment Date", "Servicer Maturity Date", "Servicer Status"]],
             on="_serv_id_key",
             how="left",
         )
 
-        # Allocate loan-level UPB across assets.
+        # Allocate loan UPB across assets using SF Current UPB weights if present
         w = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
         out["_w"] = w
         out["_w_sum"] = out.groupby("_serv_id_key")["_w"].transform("sum")
@@ -941,322 +677,124 @@ def build_bridge_asset(
             out["_loan_suspense"] / out["_n_in_loan"],
         )
 
-    # SF Funded Amount: prefer explicit; else sum of funded buckets
-    if "Approved Advance Amount Funded" in sf_spine.columns:
-        out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
-    else:
-        out["SF Funded Amount"] = (
-            pd.to_numeric(out.get("Initial Disbursement Funded", 0), errors="coerce").fillna(0)
-            + pd.to_numeric(out.get("Renovation Holdback Funded", 0), errors="coerce").fillna(0)
-            + pd.to_numeric(out.get("Interest Allocation Funded", 0), errors="coerce").fillna(0)
-        )
+    # Defaults
+    for c in ["Portfolio", "Segment", "Strategy Grouping"]:
+        if c not in out.columns:
+            out[c] = ""
 
-    # Portfolio / Segment / Strategy Grouping — left blank for now
-    out.setdefault("Portfolio", "")
-    out.setdefault("Segment", "")
-    out.setdefault("Strategy Grouping", "")
-
-    # normalize Y/N for Is Special Asset
+    # Y/N
     if "Is Special Asset (Y/N)" in out.columns:
-        out["Is Special Asset (Y/N)"] = out["Is Special Asset (Y/N)"].fillna(False).map(lambda x: "Y" if bool(x) else "")
+        out["Is Special Asset (Y/N)"] = out["Is Special Asset (Y/N)"].fillna(False).map(lambda x: "Y" if bool(x) else "N")
 
     return out
 
-
-# =============================================================================
-# BUILD: TERM LOAN
-# =============================================================================
-
-def build_term_loan(
-    sf_term: pd.DataFrame,
-    sf_sold: pd.DataFrame,
-    sf_am: pd.DataFrame,
-    sf_arm: pd.DataFrame,
-    serv_lookup: pd.DataFrame,
-    upb_col: str,
-    run_dt: date,
-    prev_maps: dict,
-) -> pd.DataFrame:
-    out = pd.DataFrame()
-
-    # Base from Term Data Export
-    for col, label in TERM_LOAN_FROM_TERM_EXPORT.items():
-        out[col] = sf_term[label] if label in sf_term.columns else None
-
-    out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
-
-    # Do Not Lend -> Y/N
-    if "Do Not Lend (Y/N)" in out.columns:
-        out["Do Not Lend (Y/N)"] = out["Do Not Lend (Y/N)"].fillna(False).map(lambda x: "Y" if bool(x) else "")
-
-    # Loan Buyer from Sold Term Loans
-    if not sf_sold.empty and "Deal Loan Number" in sf_sold.columns:
-        sold = sf_sold.copy()
-        sold["_deal_key"] = norm_id_series(sold["Deal Loan Number"])
-        if "Sold Loan: Sold To" in sold.columns:
-            sold = sold[["_deal_key", "Sold Loan: Sold To"]].drop_duplicates("_deal_key")
-            out = out.merge(sold, on="_deal_key", how="left")
-            out["Loan Buyer"] = out["Sold Loan: Sold To"]
-            out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
-
-    # Pull Servicer ID + optional SF servicer name from Term export if present
-    out["Servicer ID"] = sf_term["Servicer Commitment Id"] if "Servicer Commitment Id" in sf_term.columns else None
-    servicer_sf = sf_term["Servicer Name"] if "Servicer Name" in sf_term.columns else None
-
-    # Servicer join for UPB + dates/status
-    out["_serv_id_key"] = norm_id_series(out.get("Servicer ID", pd.Series([None] * len(out))))
-
-    if not serv_lookup.empty:
-        s = serv_lookup.dropna(subset=["servicer_id"]).copy()
-        # Midland normalization: compare also lstrip zeros
-        out["_serv_id_key_mid"] = out["_serv_id_key"].astype("string").str.lstrip("0")
-
-        s2 = s.copy()
-        s2["_sid_mid"] = s2["servicer_id"].astype("string").str.lstrip("0")
-        s2 = s2.rename(
-            columns={
-                "servicer": "_servicer_file",
-                "upb": upb_col,
-                "next_payment_date": "Next Payment Date",
-                "maturity_date": "Maturity Date",
-                "status": "Servicer Status",
-            }
-        )[["_sid_mid", "_servicer_file", upb_col, "Next Payment Date", "Maturity Date", "Servicer Status"]]
-
-        out = out.merge(s2, left_on="_serv_id_key_mid", right_on="_sid_mid", how="left").drop(columns=["_sid_mid"], errors="ignore")
-
-        # Fill Servicer display name
-        out["Servicer"] = out.get("_servicer_file")
-        if servicer_sf is not None:
-            out["Servicer"] = out["Servicer"].fillna(servicer_sf)
-        out = out.drop(columns=["_servicer_file"], errors="ignore")
-
-    else:
-        out["Servicer"] = servicer_sf if servicer_sf is not None else ""
-
-    # Fallbacks if servicer-file join missing
-    if upb_col not in out.columns:
-        out[upb_col] = np.nan
-
-    # SF fallback: Current Servicer UPB (exists in Term Data Export)
-    if "Current Servicer UPB" in sf_term.columns:
-        out[upb_col] = out[upb_col].fillna(pd.to_numeric(sf_term["Current Servicer UPB"], errors="coerce"))
-
-    # Last resort: Loan Amount
-    if "Loan Amount" in out.columns:
-        out[upb_col] = out[upb_col].fillna(pd.to_numeric(out["Loan Amount"], errors="coerce"))
-
-    # Maturity Date fallback from SF (Original Loan Maturity Date)
-    if "Maturity Date" not in out.columns:
-        out["Maturity Date"] = pd.NaT
-    if "Original Loan Maturity Date" in sf_term.columns:
-        out["Maturity Date"] = out["Maturity Date"].fillna(pd.to_datetime(sf_term["Original Loan Maturity Date"], errors="coerce"))
-
-    # Next Payment Date fallback from SF
-    if "Next Payment Date" not in out.columns:
-        out["Next Payment Date"] = pd.NaT
-    if "Next Payment Date" in sf_term.columns:
-        out["Next Payment Date"] = out["Next Payment Date"].fillna(pd.to_datetime(sf_term["Next Payment Date"], errors="coerce"))
-
-    # Active RM: if Term export has it, use it; else fallback to Active RM report
-    if "Active RM" in sf_term.columns:
-        out["Active RM"] = sf_term["Active RM"]
-    else:
-        out["Active RM"] = ""
-        if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
-            arm = sf_arm.copy()
-            arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
-            arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
-            out = out.merge(arm, on="_deal_key", how="left")
-            out["Active RM"] = out["CAF Originator"].fillna("")
-            out = out.drop(columns=["CAF Originator"], errors="ignore")
-
-    # Asset Manager from AM Assignments (role = Asset Manager)
-    if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
-        am = sf_am.copy()
-        am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
-        am["_dt"] = pd.to_datetime(am.get("Date Assigned"), errors="coerce")
-        am = am.sort_values(["_deal_key", "Team Role", "_dt"]).drop_duplicates(["_deal_key", "Team Role"], keep="last")
-
-        if "Team Role" in am.columns and "Team Member Name" in am.columns:
-            am1 = am[am["Team Role"].astype("string").str.strip().eq("Asset Manager")][["_deal_key", "Team Member Name"]]
-            am1 = am1.drop_duplicates("_deal_key")
-            out = out.merge(am1, on="_deal_key", how="left")
-            out["Asset Manager"] = out["Team Member Name"].fillna("")
-            out = out.drop(columns=["Team Member Name"], errors="ignore")
-        else:
-            out["Asset Manager"] = ""
-    else:
-        out["Asset Manager"] = ""
-
-    # REO Date carry-forward from last week's report
-    out["REO Date"] = ""
-    if "term_loan_reo" in prev_maps:
-        reo = prev_maps["term_loan_reo"][["_deal_key", "REO Date"]].copy()
-        out = out.merge(reo, on="_deal_key", how="left", suffixes=("", "_prev"))
-        out["REO Date"] = out["REO Date_prev"].fillna("")
-        out = out.drop(columns=["REO Date_prev"], errors="ignore")
-
-    # Portfolio/Segment left blank for now
-    out.setdefault("Portfolio", "")
-    out.setdefault("Segment", "")
-
-    return out
-
-
-# =============================================================================
-# BUILD: TERM ASSET (ALA-weight UPB from Term Loan)
-# =============================================================================
-
-def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
-    out = pd.DataFrame()
-
-    for col, label in TERM_ASSET_FROM_TERM_ASSET_REPORT.items():
-        out[col] = sf_term_asset[label] if label in sf_term_asset.columns else None
-
-    out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
-    out["CPP JV"] = ""  # N/A for now
-
-    # allocate UPB from Term Loan across assets by ALA
-    tl = term_loan.copy()
-    tl["_deal_key"] = norm_id_series(tl.get("Deal Number", pd.Series([None] * len(tl))))
-
-    if upb_col in tl.columns:
-        tl = tl[["_deal_key", upb_col]].drop_duplicates("_deal_key")
-        out = out.merge(tl, on="_deal_key", how="left")
-
-        ala = pd.to_numeric(out.get("Property ALA", np.nan), errors="coerce")
-        ala_sum = ala.groupby(out["_deal_key"]).transform("sum")
-        out[upb_col] = np.where(ala_sum > 0, out[upb_col] * (ala / ala_sum), out[upb_col])
-
-    return out
-
-
-# =============================================================================
-# BUILD: BRIDGE LOAN (roll-up Bridge Asset + a few SF fields)
-# =============================================================================
 
 def build_bridge_loan(
     bridge_asset: pd.DataFrame,
     sf_spine: pd.DataFrame,
     upb_col: str,
+    as_of: date,
     prev_maps: dict,
 ) -> pd.DataFrame:
     ba = bridge_asset.copy()
 
-    # roll-up per Deal
+    ba["_sf_funded_calc"] = (
+        pd.to_numeric(ba.get("Initial Disbursement Funded", 0), errors="coerce").fillna(0)
+        + pd.to_numeric(ba.get("Renovation Holdback Funded", 0), errors="coerce").fillna(0)
+        + pd.to_numeric(ba.get("Interest Allocation Funded", 0), errors="coerce").fillna(0)
+    )
+
+    if "_deal_key" not in ba.columns:
+        ba["_deal_key"] = norm_id_series(ba.get("Deal Number", pd.Series([None] * len(ba))))
+
     g = ba.groupby("_deal_key", dropna=True)
-
-    def _first(series: pd.Series):
-        s = series.dropna()
-        return s.iloc[0] if len(s) else ""
-
-    def _max_dt(series: pd.Series):
-        s = pd.to_datetime(series, errors="coerce")
-        s = s.dropna()
-        return s.max() if len(s) else ""
-
-    def _min_dt(series: pd.Series):
-        s = pd.to_datetime(series, errors="coerce")
-        s = s.dropna()
-        return s.min() if len(s) else ""
 
     out = pd.DataFrame(
         {
             "Deal Number": g["Deal Number"].first(),
-            "Portfolio": g["Portfolio"].apply(_first) if "Portfolio" in ba.columns else "",
+            "Portfolio": g["Portfolio"].first() if "Portfolio" in ba.columns else "",
             "Loan Buyer": g["Loan Buyer"].first() if "Loan Buyer" in ba.columns else "",
             "Financing": g["Financing"].first() if "Financing" in ba.columns else "",
             "Servicer ID": g["Servicer ID"].first() if "Servicer ID" in ba.columns else "",
-            "Servicer": g["Servicer"].apply(_first) if "Servicer" in ba.columns else "",
+            "Servicer": g["Servicer"].first() if "Servicer" in ba.columns else "",
             "Deal Name": g["Deal Name"].first() if "Deal Name" in ba.columns else "",
             "Borrower Name": g["Borrower Entity"].first() if "Borrower Entity" in ba.columns else "",
-            "Account": g["Account Name"].first() if "Account Name" in ba.columns else "",
-            "Do Not Lend (Y/N)": g["Do Not Lend (Y/N)"].max() if "Do Not Lend (Y/N)" in ba.columns else "",
+            "Account ": g["Account Name"].first() if "Account Name" in ba.columns else "",
+            "Do Not Lend (Y/N)": g["Do Not Lend (Y/N)"].max() if "Do Not Lend (Y/N)" in ba.columns else "N",
             "Primary Contact": g["Primary Contact"].first() if "Primary Contact" in ba.columns else "",
             "Number of Assets": g["Asset ID"].nunique() if "Asset ID" in ba.columns else 0,
             "# of Units": pd.to_numeric(g["# of Units"].sum(min_count=1), errors="coerce") if "# of Units" in ba.columns else np.nan,
-            "State(s)": g["State"].apply(
-                lambda s: ", ".join(sorted({str(x).strip() for x in s.dropna() if str(x).strip() != ""}))
-            )
-            if "State" in ba.columns
-            else "",
-            "Origination Date": g["Origination Date"].apply(_min_dt) if "Origination Date" in ba.columns else "",
-            "Last Funding Date": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else "",
+            "State(s)": g["State"].apply(lambda s: ", ".join(sorted({str(x).strip() for x in s.dropna() if str(x).strip()}))) if "State" in ba.columns else "",
+            "Origination Date": g["Origination Date"].min() if "Origination Date" in ba.columns else "",
+            "Last Funding Date": g["Last Funding Date"].max() if "Last Funding Date" in ba.columns else "",
             "Original Maturity Date": g["Original Loan Maturity date"].first() if "Original Loan Maturity date" in ba.columns else "",
             "Current Maturity Date": g["Current Loan Maturity date"].first() if "Current Loan Maturity date" in ba.columns else "",
-            # This matches your workbook behavior: Next Advance Maturity Date comes from servicer-side maturity
+            # matches Completed workbook: Bridge Loan Next Advance Maturity Date = Bridge Asset Servicer Maturity Date
             "Next Advance Maturity Date": g["Servicer Maturity Date"].first() if "Servicer Maturity Date" in ba.columns else "",
-            "Next Payment Date": g["Next Payment Date"].apply(_min_dt) if "Next Payment Date" in ba.columns else "",
-            "Loan Level Delinquency": "",  # manual/carry-forward
-            "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce")
-            if "SF Funded Amount" in ba.columns
-            else np.nan,
+            "Next Payment Date": g["Next Payment Date"].min() if "Next Payment Date" in ba.columns else "",
+            "Active Funded Amount": pd.to_numeric(g["_sf_funded_calc"].sum(min_count=1), errors="coerce"),
             upb_col: pd.to_numeric(g[upb_col].sum(min_count=1), errors="coerce") if upb_col in ba.columns else np.nan,
             "Suspense Balance": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
-            "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce")
-            if "Initial Disbursement Funded" in ba.columns
-            else np.nan,
+            "Most Recent Valuation Date": pd.to_datetime(g["Updated Valuation Date"].max(), errors="coerce") if "Updated Valuation Date" in ba.columns else "",
+            "Most Recent As-Is Value": pd.to_numeric(g["Updated As-Is Value"].sum(min_count=1), errors="coerce") if "Updated As-Is Value" in ba.columns else np.nan,
+            "Most Recent ARV": pd.to_numeric(g["Updated ARV"].sum(min_count=1), errors="coerce") if "Updated ARV" in ba.columns else np.nan,
+            "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
             "Renovation Holdback": pd.to_numeric(g["Renovation Holdback"].sum(min_count=1), errors="coerce") if "Renovation Holdback" in ba.columns else np.nan,
-            "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce")
-            if "Renovation Holdback Funded" in ba.columns
-            else np.nan,
-            "Renovation HB Remaining": pd.to_numeric(g["Renovation Holdback Remaining"].sum(min_count=1), errors="coerce")
-            if "Renovation Holdback Remaining" in ba.columns
-            else np.nan,
+            "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce") if "Renovation Holdback Funded" in ba.columns else np.nan,
+            "Renovation HB Remaining": pd.to_numeric(g["Renovation Holdback Remaining"].sum(min_count=1), errors="coerce") if "Renovation Holdback Remaining" in ba.columns else np.nan,
             "Interest Allocation": pd.to_numeric(g["Interest Allocation"].sum(min_count=1), errors="coerce") if "Interest Allocation" in ba.columns else np.nan,
-            "Interest Allocation Funded": pd.to_numeric(g["Interest Allocation Funded"].sum(min_count=1), errors="coerce")
-            if "Interest Allocation Funded" in ba.columns
-            else np.nan,
+            "Interest Allocation Funded": pd.to_numeric(g["Interest Allocation Funded"].sum(min_count=1), errors="coerce") if "Interest Allocation Funded" in ba.columns else np.nan,
             "Loan Stage": g["Loan Stage"].first() if "Loan Stage" in ba.columns else "",
-            "Segment": g["Segment"].apply(_first) if "Segment" in ba.columns else "",
+            "Segment": g["Segment"].first() if "Segment" in ba.columns else "",
             "Product Type": g["Product Type"].first() if "Product Type" in ba.columns else "",
             "Product Sub Type": g["Product Sub-Type"].first() if "Product Sub-Type" in ba.columns else "",
             "Transaction Type": g["Transaction Type"].first() if "Transaction Type" in ba.columns else "",
             "Project Strategy": g["Project Strategy"].first() if "Project Strategy" in ba.columns else "",
-            "Strategy Grouping": g["Strategy Grouping"].apply(_first) if "Strategy Grouping" in ba.columns else "",
-            "CV Originator": g["Originator"].first() if "Originator" in ba.columns else "",
-            "Active RM": g["Active RM"].apply(_first) if "Active RM" in ba.columns else "",
+            "Strategy Grouping": g["Strategy Grouping"].first() if "Strategy Grouping" in ba.columns else "",
+            "CV Originator": "",
+            "Active RM": g["Active RM"].first() if "Active RM" in ba.columns else "",
             "Deal Intro Sub-Source": g["Deal Intro Sub-Source"].first() if "Deal Intro Sub-Source" in ba.columns else "",
             "Referral Source Account": g["Referral Source Account"].first() if "Referral Source Account" in ba.columns else "",
             "Referral Source Contact": g["Referral Source Contact"].first() if "Referral Source Contact" in ba.columns else "",
             "3/31 NPL": "",
             "Needs NPL Value": "",
-            "Special Focus (Y/N)": "",  # manual/carry-forward
-            "Asset Manager 1": g["Asset Manager 1"].apply(_first) if "Asset Manager 1" in ba.columns else "",
-            "AM 1 Assigned Date": g["AM 1 Assigned Date"].apply(_first) if "AM 1 Assigned Date" in ba.columns else "",
-            "Asset Manager 2": g["Asset Manager 2"].apply(_first) if "Asset Manager 2" in ba.columns else "",
-            "AM 2 Assigned Date": g["AM 2 Assigned Date"].apply(_first) if "AM 2 Assigned Date" in ba.columns else "",
-            "Construction Mgr.": g["Construction Mgr."].apply(_first) if "Construction Mgr." in ba.columns else "",
-            "CM Assigned Date": g["CM Assigned Date"].apply(_first) if "CM Assigned Date" in ba.columns else "",
+            "Special Focus (Y/N)": (g["Is Special Asset (Y/N)"] .max().astype(str).eq("Y")).map(lambda b: "Y" if bool(b) else "N") if "Is Special Asset (Y/N)" in ba.columns else "N",
+            "Asset Manager 1": g["Asset Manager 1"].first() if "Asset Manager 1" in ba.columns else "",
+            "AM 1 Assigned Date": g["AM 1 Assigned Date"].first() if "AM 1 Assigned Date" in ba.columns else "",
+            "Asset Manager 2": g["Asset Manager 2"].first() if "Asset Manager 2" in ba.columns else "",
+            "AM 2 Assigned Date": g["AM 2 Assigned Date"].first() if "AM 2 Assigned Date" in ba.columns else "",
+            "Construction Mgr.": g["Construction Mgr."].first() if "Construction Mgr." in ba.columns else "",
+            "CM Assigned Date": g["CM Assigned Date"].first() if "CM Assigned Date" in ba.columns else "",
         }
-    ).reset_index(drop=True)
+    ).reset_index()
 
-    # Loan Commitment + Remaining Commitment + AM Commentary from SF Bridge Maturity report
+    # compute Loan Level Delinquency if missing (then override from last week if provided)
+    if "Loan Level Delinquency" not in out.columns:
+        out["Loan Level Delinquency"] = ""
+
+    if "Next Payment Date" in out.columns:
+        npd = pd.to_datetime(out["Next Payment Date"], errors="coerce")
+        dpd = (pd.to_datetime(as_of) - npd).dt.days.clip(lower=0)
+        out.loc[out["Loan Level Delinquency"].astype(str).str.strip().eq(""), "Loan Level Delinquency"] = dpd.apply(dq_bucket)
+
+    # deal-level fields from Bridge Maturity export
     if "Deal Loan Number" in sf_spine.columns:
         deal = sf_spine.copy()
         deal["_deal_key"] = norm_id_series(deal["Deal Loan Number"])
         keep = ["_deal_key"]
+        for c in ["Loan Commitment", "Total Remaining Commitment Amount", "Comments AM"]:
+            if c in deal.columns:
+                keep.append(c)
+        if len(keep) > 1:
+            deal = deal[keep].drop_duplicates("_deal_key")
+            out = out.merge(deal, left_on="_deal_key", right_on="_deal_key", how="left")
+            if "Total Remaining Commitment Amount" in out.columns and "Remaining Commitment" not in out.columns:
+                out["Remaining Commitment"] = out["Total Remaining Commitment Amount"]
+            if "Comments AM" in out.columns and "AM Commentary" not in out.columns:
+                out["AM Commentary"] = out["Comments AM"]
+                out = out.drop(columns=["Comments AM"], errors="ignore")
 
-        if "Loan Commitment" in deal.columns:
-            keep.append("Loan Commitment")
-        if "Total Remaining Commitment Amount" in deal.columns:
-            keep.append("Total Remaining Commitment Amount")
-        if "Comments AM" in deal.columns:
-            keep.append("Comments AM")
-
-        deal = deal[keep].drop_duplicates("_deal_key")
-        out = out.merge(deal, on="_deal_key", how="left")
-
-        if "Total Remaining Commitment Amount" in out.columns:
-            out["Remaining Commitment"] = out["Total Remaining Commitment Amount"]
-
-        if "Comments AM" in out.columns:
-            out["AM Commentary"] = out["Comments AM"]
-
-        out = out.drop(columns=["Total Remaining Commitment Amount", "Comments AM"], errors="ignore")
-
-    # Carry-forward optional manual columns from last week (if present)
+    # carry-forward manual columns
     if "bridge_loan_manual" in prev_maps:
         man = prev_maps["bridge_loan_manual"].copy()
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
@@ -1268,12 +806,135 @@ def build_bridge_loan(
     return out.drop(columns=["_deal_key"], errors="ignore")
 
 
+def build_term_loan(
+    sf_term: pd.DataFrame,
+    sf_sold: pd.DataFrame,
+    sf_am: pd.DataFrame,
+    sf_arm: pd.DataFrame,
+    serv_lookup: pd.DataFrame,
+    upb_col: str,
+    prev_maps: dict,
+) -> pd.DataFrame:
+    out = pd.DataFrame()
+
+    for col, label in TERM_LOAN_FROM_TERM_EXPORT.items():
+        out[col] = sf_term[label] if label in sf_term.columns else None
+
+    out["_deal_key"] = norm_id_series(out["Deal Number"])
+
+    # Do Not Lend -> Y/N
+    if "Do Not Lend (Y/N)" in out.columns:
+        out["Do Not Lend (Y/N)"] = out["Do Not Lend (Y/N)"].fillna(False).map(lambda x: "Y" if bool(x) else "N")
+
+    # Sold Term
+    if not sf_sold.empty and "Deal Loan Number" in sf_sold.columns and "Sold Loan: Sold To" in sf_sold.columns:
+        sold = sf_sold.copy()
+        sold["_deal_key"] = norm_id_series(sold["Deal Loan Number"])
+        sold = sold[["_deal_key", "Sold Loan: Sold To"]].drop_duplicates("_deal_key")
+        out = out.merge(sold, on="_deal_key", how="left")
+        out["Loan Buyer"] = out["Sold Loan: Sold To"]
+        out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
+
+    # Servicer ID + Servicer from Term Export (if present)
+    if "Servicer Commitment Id" in sf_term.columns:
+        out["Servicer ID"] = sf_term["Servicer Commitment Id"]
+    if "Servicer Name" in sf_term.columns:
+        out["Servicer"] = sf_term["Servicer Name"]
+
+    out["_serv_id_key"] = norm_id_series(out.get("Servicer ID", pd.Series([None] * len(out))))
+
+    # Active RM from Term Export if present, else from Active RM export
+    if "Active RM" in sf_term.columns:
+        out["Active RM"] = sf_term["Active RM"]
+    elif not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
+        arm = sf_arm.copy()
+        arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
+        arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
+        out = out.merge(arm, on="_deal_key", how="left")
+        out["Active RM"] = out["CAF Originator"].fillna("")
+        out = out.drop(columns=["CAF Originator"], errors="ignore")
+    else:
+        out["Active RM"] = ""
+
+    # Asset Manager from AM Assignments
+    if not sf_am.empty and "Deal Loan Number" in sf_am.columns and "Team Role" in sf_am.columns and "Team Member Name" in sf_am.columns:
+        am = sf_am.copy()
+        am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
+        am["_dt"] = pd.to_datetime(am.get("Date Assigned"), errors="coerce")
+        am = am.sort_values(["_deal_key", "Team Role", "_dt"]).drop_duplicates(["_deal_key", "Team Role"], keep="last")
+        am1 = am[am["Team Role"].astype("string").str.strip().eq("Asset Manager")][["_deal_key", "Team Member Name"]].drop_duplicates("_deal_key")
+        out = out.merge(am1, on="_deal_key", how="left")
+        out["Asset Manager"] = out["Team Member Name"].fillna("")
+        out = out.drop(columns=["Team Member Name"], errors="ignore")
+    else:
+        out["Asset Manager"] = ""
+
+    # Join servicer lookup for UPB + dates
+    if not serv_lookup.empty:
+        s = serv_lookup.dropna(subset=["servicer_id"]).copy()
+        out["_serv_id_key_mid"] = out["_serv_id_key"].astype("string").str.lstrip("0")
+
+        s2 = s.rename(
+            columns={
+                "servicer_id": "_sid",
+                "servicer": "_servicer_file",
+                "upb": upb_col,
+                "next_payment_date": "Next Payment Date",
+                "maturity_date": "Maturity Date",
+            }
+        )[["_sid", "_servicer_file", upb_col, "Next Payment Date", "Maturity Date"]]
+
+        out = out.merge(s2, left_on=out["_serv_id_key_mid"], right_on="_sid", how="left").drop(columns=["_sid", "key_0"], errors="ignore")
+
+        if "Servicer" not in out.columns:
+            out["Servicer"] = out["_servicer_file"]
+        else:
+            out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"])
+        out = out.drop(columns=["_servicer_file"], errors="ignore")
+
+    # REO carry-forward
+    out["REO Date"] = ""
+    if "term_loan_reo" in prev_maps:
+        reo = prev_maps["term_loan_reo"][["_deal_key", "REO Date"]].copy()
+        out = out.merge(reo, on="_deal_key", how="left", suffixes=("", "_prev"))
+        out["REO Date"] = out["REO Date_prev"].fillna("")
+        out = out.drop(columns=["REO Date_prev"], errors="ignore")
+
+    for c in ["Portfolio", "Segment"]:
+        if c not in out.columns:
+            out[c] = ""
+
+    return out
+
+
+def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    out = pd.DataFrame()
+
+    for col, label in TERM_ASSET_FROM_TERM_ASSET_REPORT.items():
+        out[col] = sf_term_asset[label] if label in sf_term_asset.columns else None
+
+    out["_deal_key"] = norm_id_series(out["Deal Number"])
+
+    tl = term_loan.copy()
+    tl["_deal_key"] = norm_id_series(tl["Deal Number"])
+
+    if upb_col in tl.columns:
+        tl = tl[["_deal_key", upb_col]].drop_duplicates("_deal_key")
+        out = out.merge(tl, on="_deal_key", how="left")
+
+        ala = pd.to_numeric(out.get("Property ALA", np.nan), errors="coerce")
+        ala_sum = ala.groupby(out["_deal_key"]).transform("sum")
+        out[upb_col] = np.where(ala_sum > 0, out[upb_col] * (ala / ala_sum), out[upb_col])
+
+    out["CPP JV"] = ""
+    return out
+
+
 # =============================================================================
-# EXCEL OUTPUT (template-based; preserve formulas; dynamic UPB header)
+# EXCEL OUTPUT — preserve formulas
 # =============================================================================
 
 def header_tuples_from_ws(ws_values, header_row: int = 4) -> List[Tuple[int, str]]:
-    """Read header display-values (cached) by column index from a data_only=True workbook."""
     out: List[Tuple[int, str]] = []
     for col_idx, cell in enumerate(ws_values[header_row], start=1):
         v = cell.value
@@ -1284,7 +945,6 @@ def header_tuples_from_ws(ws_values, header_row: int = 4) -> List[Tuple[int, str
 
 
 def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4) -> Set[int]:
-    """Detect which columns contain formulas on the first data row so we can preserve them."""
     fcols: Set[int] = set()
     for col_idx, _cell in enumerate(ws_formula[header_row], start=1):
         v = ws_formula.cell(start_row, col_idx).value
@@ -1293,18 +953,46 @@ def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4) -> 
     return fcols
 
 
-def normalize_header_name(h: str, upb_header: str) -> str:
-    # Replace any "M/D UPB" header with the chosen upb_header
+def normalize_header_name(h: str, upb_col: str) -> str:
     if isinstance(h, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", h):
-        return upb_header
-    if h.strip().upper().endswith("UPB") and "UPB" in upb_header:
-        # catch formula headers that cache as an UPB string
-        if re.search(r"\b\d{1,2}/\d{1,2}\b", h):
-            return upb_header
+        return upb_col
+    if h.strip() == "2/28 UPB":
+        return upb_col
     return h.strip()
 
 
-def clear_columns(ws, col_indices: List[int], start_row: int = 5):
+def set_upb_header_cell(ws_formula, ws_values, upb_col: str, header_row: int = 4):
+    for col_idx, cell in enumerate(ws_values[header_row], start=1):
+        v = cell.value
+        if isinstance(v, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", v):
+            ws_formula.cell(header_row, col_idx).value = upb_col
+            return
+
+
+def update_as_of_cells(ws_formula, ws_values, as_of: date, header_row: int = 4, date_row: int = 3):
+    md = None
+    for cell in ws_values[header_row]:
+        v = cell.value
+        if isinstance(v, str):
+            m = re.search(r"\b(\d{1,2})/(\d{1,2})\s*UPB\b", v)
+            if m:
+                md = (int(m.group(1)), int(m.group(2)))
+                break
+    if md is None:
+        md = (as_of.month, as_of.day)
+
+    for cell in ws_values[date_row]:
+        v = cell.value
+        if isinstance(v, (date, datetime)):
+            if v.month == md[0] and v.day == md[1]:
+                ws_formula.cell(date_row, cell.column).value = as_of
+        elif isinstance(v, str):
+            d = _extract_date_from_text(v)
+            if d and d.month == md[0] and d.day == md[1]:
+                ws_formula.cell(date_row, cell.column).value = as_of
+
+
+def clear_columns(ws, col_indices: Sequence[int], start_row: int = 5):
     max_r = ws.max_row
     for r in range(start_row, max_r + 1):
         for c in col_indices:
@@ -1317,12 +1005,18 @@ def write_df_to_sheet_preserve_formulas(
     header_tuples: List[Tuple[int, str]],
     formula_cols: Set[int],
     start_row: int = 5,
+    force_overwrite_headers: Optional[Set[str]] = None,
 ):
-    """Writes only NON-formula columns; leaves formula columns intact in the template."""
+    force_overwrite_headers = force_overwrite_headers or set()
 
-    write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
-    col_indices = [c for c, _h in write_cols]
-    headers = [h for _c, h in write_cols]
+    write_cols: List[Tuple[int, str]] = []
+    for col_idx, header in header_tuples:
+        if col_idx in formula_cols and header not in force_overwrite_headers:
+            continue
+        write_cols.append((col_idx, header))
+
+    col_indices = [c for c, _ in write_cols]
+    headers = [h for _, h in write_cols]
 
     df_out = df.copy()
     for h in headers:
@@ -1338,21 +1032,18 @@ def write_df_to_sheet_preserve_formulas(
             ws_formula.cell(r, c).value = val
 
 
-def set_upb_header_in_sheet(ws_formula, ws_values, new_upb_header: str, header_row: int = 4):
-    """Update the UPB header cell in sheets where the header is a literal string.
+def build_single_sheet_workbook(template_bytes: bytes, sheet_name: str):
+    wb_f = load_workbook(BytesIO(template_bytes), data_only=False)
+    wb_v = load_workbook(BytesIO(template_bytes), data_only=True)
 
-    If the UPB header is a formula (common in Bridge Loan / Term Asset), we leave it alone.
-    Excel will recalc when the user opens the file.
-    """
-    hdr = header_tuples_from_ws(ws_values, header_row=header_row)
-    for col_idx, h in hdr:
-        if isinstance(h, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", h):
-            cur = ws_formula.cell(header_row, col_idx).value
-            if isinstance(cur, str) and cur.startswith("="):
-                # keep formula
-                return
-            ws_formula.cell(header_row, col_idx).value = new_upb_header
-            return
+    for sn in list(wb_f.sheetnames):
+        if sn != sheet_name:
+            del wb_f[sn]
+    for sn in list(wb_v.sheetnames):
+        if sn != sheet_name:
+            del wb_v[sn]
+
+    return wb_f, wb_v
 
 
 # =============================================================================
@@ -1364,58 +1055,46 @@ st.title("Active Loans Report Builder")
 
 st.markdown(
     """
-**Inputs**
-1) Upload the Active Loans template workbook (.xlsx)
-2) Upload last week's Active Loans report (optional) — used for REO Date carry-forward
-3) Upload current servicer files (csv/xlsx)
-4) Log in to Salesforce to pull the reports
+Upload the template + servicer files + Salesforce exports, then build the sheet(s) you want.
 
-**UPB header**
-The UPB column header is labeled as **M/D UPB**, where M/D is the **report run date**.
-By default, we detect this date from your uploaded servicer files (latest date found).
+- **Fast mode**: output one file per sheet.
+- UPB column header defaults to the **latest date in your servicer filenames**.
 """
 )
 
-template_upload = st.file_uploader("Upload Active Loans TEMPLATE (.xlsx)", type=["xlsx"])
-prev_upload = st.file_uploader(
-    "Upload LAST WEEK'S Active Loans report (.xlsx) for REO Date carry-forward (optional)", type=["xlsx"]
-)
+# Inputs
+
+template_upload = st.file_uploader("Upload Active Loans TEMPLATE (.xlsx)", type=["xlsx"], key="tmpl")
+prev_upload = st.file_uploader("Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward", type=["xlsx"], key="prev")
 servicer_uploads = st.file_uploader(
-    "Upload current servicer files (csv/xlsx) — any filenames (Statebridge/Berkadia/FCI/Midland/CHL)",
-    type=["csv", "xlsx"],
-    accept_multiple_files=True,
+    "Upload current servicer files (csv/xlsx) — any names", type=["csv", "xlsx"], accept_multiple_files=True, key="serv"
 )
 
-use_sf = st.checkbox("Pull Salesforce via API (required for full automation)", value=True)
+st.subheader("Salesforce report exports")
+col1, col2 = st.columns(2)
+with col1:
+    exp_bridge_maturity = st.file_uploader("Bridge Maturity Report v3 export (.xlsx)", type=["xlsx"], key="exp_bridge")
+    exp_valuation = st.file_uploader("Valuation v4 export (.xlsx) (optional)", type=["xlsx"], key="exp_val")
+    exp_am = st.file_uploader("AM Assignments export (.xlsx) (optional)", type=["xlsx"], key="exp_am")
+    exp_active_rm = st.file_uploader("Active RM export (.xlsx) (optional)", type=["xlsx"], key="exp_arm")
 
-sf = None
-if use_sf:
-    sf = ensure_sf_session()
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        inst = (st.session_state.get("sf_token") or {}).get("instance_url", "")
-        st.success("✅ Logged in to Salesforce")
-        if inst:
-            st.caption(f"Connected to: {inst}")
-    with c2:
-        if st.button("Log out"):
-            st.session_state.sf_token = None
-            st.rerun()
+with col2:
+    exp_dnl = st.file_uploader("Do Not Lend export (.xlsx) (optional)", type=["xlsx"], key="exp_dnl")
+    exp_term = st.file_uploader("Term Data Export (.xlsx)", type=["xlsx"], key="exp_term")
+    exp_sold = st.file_uploader("Sold Term Loans (.xlsx) (optional)", type=["xlsx"], key="exp_sold")
+    exp_term_asset = st.file_uploader("Term Asset Level - By Deal (.xlsx) (optional unless building Term Asset)", type=["xlsx"], key="exp_ta")
 
-# Quick guess for default (filename-based only) — cheap, before full parse
-name_guess = date.today()
-if servicer_uploads:
-    dts = [date_from_filename(u.name) for u in servicer_uploads]
-    dts = [d for d in dts if d]
-    if dts:
-        name_guess = max(dts)
+st.subheader("Build options")
 
-use_detected_run_date = st.checkbox(
-    "Use report run date detected from servicer files (recommended)", value=True
+sheets_requested = st.multiselect(
+    "Sheets to build",
+    options=["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"],
+    default=["Bridge Asset"],
 )
-manual_run_date = st.date_input("Report run date (UPB column header)", value=name_guess, disabled=use_detected_run_date)
 
-build_btn = st.button("Build Active Loans", type="primary")
+single_sheet_files = st.checkbox("Output separate file per sheet (faster)", value=True)
+
+build_btn = st.button("Build", type="primary")
 
 if build_btn:
     if not template_upload:
@@ -1423,135 +1102,175 @@ if build_btn:
         st.stop()
 
     if not servicer_uploads:
-        st.error("Upload the servicer files. UPB/Next Payment/Maturity/Status come from them.")
+        st.error("Upload the servicer files (UPB/Next Payment/Maturity/Status come from them).")
         st.stop()
 
-    if use_sf and sf is None:
-        st.error("Salesforce login is required (or uncheck Salesforce option).")
+    need_bridge_asset = ("Bridge Asset" in sheets_requested) or ("Bridge Loan" in sheets_requested)
+    need_bridge_loan = "Bridge Loan" in sheets_requested
+    need_term_loan = ("Term Loan" in sheets_requested) or ("Term Asset" in sheets_requested)
+    need_term_asset = "Term Asset" in sheets_requested
+
+    if need_bridge_asset and exp_bridge_maturity is None:
+        st.error("Bridge Maturity export is required for Bridge Asset / Bridge Loan.")
         st.stop()
 
-    # Parse last week maps
+    if need_term_loan and exp_term is None:
+        st.error("Term Data Export is required for Term Loan / Term Asset.")
+        st.stop()
+
+    if need_term_asset and exp_term_asset is None:
+        st.error("Term Asset export is required for Term Asset.")
+        st.stop()
+
     prev_maps = {}
     if prev_upload:
-        with st.spinner("Reading last week's report (carry-forward)..."):
-            prev_maps = build_prev_maps(prev_upload.getvalue())
+        prev_maps = build_prev_maps(prev_upload.getvalue())
 
-    # Parse servicer files
     with st.spinner("Parsing servicer files..."):
-        serv_lookup, detected_run_date = build_servicer_lookup(servicer_uploads)
+        serv_lookup, as_of_file_dt, as_of_embedded_dt = build_servicer_lookup(servicer_uploads)
 
-    # Choose run date for UPB header
-    run_dt = detected_run_date if use_detected_run_date else manual_run_date
-    upb_col = make_upb_header(run_dt)
-
-    st.markdown("### Servicer lookup preview (standardized)")
-    st.caption(f"Detected report run date from servicer files: **{detected_run_date.isoformat()}**")
-    st.caption(f"UPB column header to be used: **{upb_col}**")
-    st.dataframe(serv_lookup.head(25), use_container_width=True)
-
-    # Pull Salesforce reports
-    dfs: Dict[str, pd.DataFrame] = {}
-    if use_sf:
-        for key, (nm, rid) in REPORTS.items():
-            with st.spinner(f"Pulling Salesforce report: {nm} ({rid})"):
-                dfs[key] = run_report_all_rows(sf, rid, page_size=2000)
-    else:
-        st.error("This version expects Salesforce API pulls.")
+    if serv_lookup.empty:
+        st.error("Could not parse any servicer rows. Check file formats.")
         st.stop()
 
-    # Build sheets
-    with st.spinner("Building Bridge Asset..."):
-        bridge_asset = build_bridge_asset(
-            dfs.get("bridge_maturity", pd.DataFrame()),
-            dfs.get("do_not_lend", pd.DataFrame()),
-            dfs.get("valuation", pd.DataFrame()),
-            dfs.get("am_assignments", pd.DataFrame()),
-            dfs.get("active_rm", pd.DataFrame()),
-            serv_lookup,
-            upb_col,
-        )
+    if as_of_file_dt is None:
+        as_of_file_dt = date.today()
 
-    with st.spinner("Building Term Loan..."):
-        term_loan = build_term_loan(
-            dfs.get("term_export", pd.DataFrame()),
-            dfs.get("sold_term", pd.DataFrame()),
-            dfs.get("am_assignments", pd.DataFrame()),
-            dfs.get("active_rm", pd.DataFrame()),
-            serv_lookup,
-            upb_col,
-            run_dt,
-            prev_maps,
-        )
+    st.write("Detected UPB as-of date from **servicer filenames**:", as_of_file_dt)
+    if as_of_embedded_dt:
+        st.caption(f"(For reference: latest embedded run date found inside files = {as_of_embedded_dt})")
 
-    with st.spinner("Building Term Asset..."):
-        term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
+    as_of = st.date_input("UPB 'as-of' date (controls the UPB column header)", value=as_of_file_dt)
+    upb_col = make_upb_header(as_of)
 
-    with st.spinner("Building Bridge Loan..."):
-        bridge_loan = build_bridge_loan(bridge_asset, dfs.get("bridge_maturity", pd.DataFrame()), upb_col, prev_maps)
+    st.write("Servicer lookup preview (standardized):")
+    st.dataframe(serv_lookup.head(50), use_container_width=True)
 
-    # Diagnostics
+    with st.spinner("Loading Salesforce exports..."):
+        sf_bridge = load_sf_export(exp_bridge_maturity, list(BRIDGE_ASSET_FROM_BRIDGE_MATURITY.values())) if exp_bridge_maturity else pd.DataFrame()
+        sf_dnl = load_sf_export(exp_dnl, ["Deal Loan Number", "Do Not Lend"]) if exp_dnl else pd.DataFrame()
+        sf_val = load_sf_export(exp_valuation, ["Asset ID"] + list(BRIDGE_ASSET_FROM_VALUATION.values())) if exp_valuation else pd.DataFrame()
+        sf_am = load_sf_export(exp_am, ["Deal Loan Number", "Team Role", "Team Member Name"]) if exp_am else pd.DataFrame()
+        sf_arm = load_sf_export(exp_active_rm, ["Deal Loan Number", "CAF Originator"]) if exp_active_rm else pd.DataFrame()
+        sf_term = load_sf_export(exp_term, list(TERM_LOAN_FROM_TERM_EXPORT.values()) + ["Deal Loan Number"]) if exp_term else pd.DataFrame()
+        sf_sold = load_sf_export(exp_sold, ["Deal Loan Number", "Sold Loan: Sold To"]) if exp_sold else pd.DataFrame()
+        sf_term_asset = load_sf_export(exp_term_asset, list(TERM_ASSET_FROM_TERM_ASSET_REPORT.values()) + ["Deal Loan Number"]) if exp_term_asset else pd.DataFrame()
+
+    bridge_asset = pd.DataFrame()
+    bridge_loan = pd.DataFrame()
+    term_loan = pd.DataFrame()
+    term_asset = pd.DataFrame()
+
+    if need_bridge_asset:
+        with st.spinner("Building Bridge Asset..."):
+            bridge_asset = build_bridge_asset(sf_bridge, sf_dnl, sf_val, sf_am, sf_arm, serv_lookup, upb_col)
+
+    if need_bridge_loan:
+        with st.spinner("Building Bridge Loan..."):
+            bridge_loan = build_bridge_loan(bridge_asset, sf_bridge, upb_col, as_of, prev_maps)
+
+    if need_term_loan:
+        with st.spinner("Building Term Loan..."):
+            term_loan = build_term_loan(sf_term, sf_sold, sf_am, sf_arm, serv_lookup, upb_col, prev_maps)
+
+    if need_term_asset:
+        with st.spinner("Building Term Asset..."):
+            term_asset = build_term_asset(sf_term_asset, term_loan, upb_col)
+
     st.subheader("Diagnostics")
+    if not bridge_asset.empty and "_loan_upb" in bridge_asset.columns:
+        st.write(f"Bridge Asset servicer-join match rate: {bridge_asset['_loan_upb'].notna().mean():.1%}")
+    if not term_loan.empty and upb_col in term_loan.columns:
+        st.write(f"Term Loan servicer-join match rate: {term_loan[upb_col].notna().mean():.1%}")
 
-    if "_loan_upb" in bridge_asset.columns:
-        matched = bridge_asset["_loan_upb"].notna().mean()
-        st.write(f"Bridge Asset servicer-join match rate (UPB): {matched:.1%}")
-
-    if upb_col in term_loan.columns:
-        matched = term_loan[upb_col].notna().mean()
-        st.write(f"Term Loan servicer-join match rate (UPB): {matched:.1%}")
-
-    if "_loan_upb" in bridge_asset.columns and upb_col in bridge_asset.columns:
-        rec = (
-            bridge_asset.dropna(subset=["_serv_id_key"])
-            .groupby("_serv_id_key")
-            .agg(loan_upb=("_loan_upb", "max"), sum_asset_upb=(upb_col, "sum"), n_assets=("Asset ID", "nunique"))
-            .reset_index()
-        )
-        rec["diff"] = rec["sum_asset_upb"] - rec["loan_upb"]
-        st.write("Bridge Asset UPB reconciliation (top diffs):")
-        st.dataframe(rec.sort_values("diff", key=lambda s: s.abs(), ascending=False).head(20), use_container_width=True)
-
-    # Write output workbook (preserve formulas)
     tmpl_bytes = template_upload.getvalue()
 
-    wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
-    wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
+    def _sheet_df(sheet_name: str) -> pd.DataFrame:
+        return {
+            "Bridge Asset": bridge_asset,
+            "Bridge Loan": bridge_loan,
+            "Term Loan": term_loan,
+            "Term Asset": term_asset,
+        }.get(sheet_name, pd.DataFrame())
 
-    # Update UPB header where it is a literal string
-    for sheet in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]:
-        if sheet in wb.sheetnames and sheet in wb_vals.sheetnames:
-            set_upb_header_in_sheet(wb[sheet], wb_vals[sheet], upb_col, header_row=4)
+    outputs: List[Tuple[str, bytes]] = []
 
-    # Write data preserving formulas
-    sheet_to_df = {
-        "Bridge Asset": bridge_asset,
-        "Bridge Loan": bridge_loan,
-        "Term Loan": term_loan,
-        "Term Asset": term_asset,
-    }
+    if single_sheet_files:
+        for sheet_name in sheets_requested:
+            df_sheet = _sheet_df(sheet_name)
+            if df_sheet.empty:
+                st.warning(f"No rows for {sheet_name}.")
+                continue
 
-    for sheet_name, df in sheet_to_df.items():
-        if sheet_name not in wb.sheetnames or sheet_name not in wb_vals.sheetnames:
-            continue
+            wb_f, wb_v = build_single_sheet_workbook(tmpl_bytes, sheet_name)
+            ws = wb_f[sheet_name]
+            ws_v = wb_v[sheet_name]
 
-        ws = wb[sheet_name]
-        ws_v = wb_vals[sheet_name]
+            hdr = header_tuples_from_ws(ws_v, header_row=4)
+            hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
 
-        hdr = header_tuples_from_ws(ws_v, header_row=4)
-        hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
-        fcols = formula_col_indices(ws, start_row=5, header_row=4)
+            # Update row-3 as-of cells and UPB header
+            update_as_of_cells(ws, ws_v, as_of, header_row=4, date_row=3)
+            set_upb_header_cell(ws, ws_v, upb_col, header_row=4)
 
-        write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
+            # Term Asset sheet has cross-sheet formulas; overwrite those columns when exporting as a single sheet
+            force_headers: Set[str] = set()
+            if sheet_name == "Term Asset":
+                force_headers = {upb_col, "CPP JV"}
 
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
+            fcols = formula_col_indices(ws, start_row=5, header_row=4)
+            write_df_to_sheet_preserve_formulas(ws, df_sheet, hdr, fcols, start_row=5, force_overwrite_headers=force_headers)
 
-    st.success("Built Active Loans workbook.")
-    st.download_button(
-        "Download Active Loans Output",
-        data=out.getvalue(),
-        file_name=f"Active Loans_{run_dt.isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+            out_buf = BytesIO()
+            wb_f.save(out_buf)
+            out_buf.seek(0)
+            outputs.append((sheet_name, out_buf.getvalue()))
+
+        st.success("Built requested sheet file(s).")
+        for sheet_name, bts in outputs:
+            st.download_button(
+                f"Download {sheet_name}",
+                data=bts,
+                file_name=f"Active Loans - {sheet_name} - {as_of.isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    else:
+        wb_f = load_workbook(BytesIO(tmpl_bytes), data_only=False)
+        wb_v = load_workbook(BytesIO(tmpl_bytes), data_only=True)
+
+        for sheet_name in sheets_requested:
+            if sheet_name not in wb_f.sheetnames:
+                continue
+            df_sheet = _sheet_df(sheet_name)
+            if df_sheet.empty:
+                continue
+
+            ws = wb_f[sheet_name]
+            ws_v = wb_v[sheet_name]
+
+            hdr = header_tuples_from_ws(ws_v, header_row=4)
+            hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
+
+            update_as_of_cells(ws, ws_v, as_of, header_row=4, date_row=3)
+
+            # Update UPB header on the "source" sheets (others reference via formulas)
+            if sheet_name in ("Bridge Asset", "Term Loan"):
+                set_upb_header_cell(ws, ws_v, upb_col, header_row=4)
+
+            fcols = formula_col_indices(ws, start_row=5, header_row=4)
+            write_df_to_sheet_preserve_formulas(ws, df_sheet, hdr, fcols, start_row=5)
+
+        out_buf = BytesIO()
+        wb_f.save(out_buf)
+        out_buf.seek(0)
+
+        st.success("Built workbook.")
+        st.download_button(
+            "Download Active Loans Output",
+            data=out_buf.getvalue(),
+            file_name=f"Active Loans_{as_of.isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
