@@ -17,7 +17,7 @@
 #   client_id = "..."
 #   redirect_uri = "https://<your-app>/"   # MUST match Connected App callback EXACTLY
 #   # optional
-#   auth_host = "https://login.salesforce.com"
+#   auth_host = "https://cvest.my.salesforce.com"
 #   client_secret = "..."   # only if your connected app requires it
 # ============================================================
 
@@ -299,7 +299,7 @@ def ensure_sf_session() -> Salesforce:
 
     client_id = cfg["client_id"]
     client_secret = cfg.get("client_secret")
-    auth_host = cfg.get("auth_host", "https://login.salesforce.com").rstrip("/")
+    auth_host = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
 
     # Keep redirect URI EXACT as provided (this is often the root cause of callback weirdness).
     redirect_uri = cfg["redirect_uri"]
