@@ -1,25 +1,13 @@
 # ============================================================
-# Active Loans Report Builder — ONE FILE (Streamlit) — LOGIN FIXED (HUD STYLE)
+# Active Loans Report Builder — ONE FILE (Streamlit)
 #
-# Updates in this version:
-# ✅ Servicer file logic tightened to match Hayden's weekly workflow
-#    - Supports the standard weekly servicer files:
-#        1) FCI_CVMaster (Account -> Next Due Date)
-#        2) FCI_v1805510 (Account -> Next Due Date)
-#        3) CoreVestLoanData (Loan Number -> Due Date, pad loan # with 4 leading zeros)
-#        4) CoreVest_Data_Tape (BCM Loan# -> Next Payment Due Date)
-#        5) CHL Streamline (Servicer Loan ID -> Next Due Date; servicer from "Servicing Company")
-#        7) Midland (ServicerLoanNumber -> NextPaymentDate)
-#        9) FCI_2012632 (Account -> Next Due Date)
+# Update in this version:
+# ✅ Stop asking Hayden to upload a template.
+# ✅ Always build from the "Active Loan Report Template.xlsx" file that lives in this repo.
 #
-# ✅ Active-loan validation (UPB > 0):
-#    - Shows conflicts across servicer uploads (same loan ID with different UPB / dates)
-#    - Shows servicer-active loans missing from the output
-#    - Shows mismatches between selected servicer values and the built workbook
-#
-# ✅ REO fallback:
-#    - If Loan Stage == REO and servicer UPB is missing/0, carry forward prior-week UPB
-#      (or 0.00 if prior week not provided)
+# IMPORTANT:
+# - Put "Active Loan Report Template.xlsx" in the SAME folder as this app.py
+#   (or in ./templates/ or ./assets/ — this code will find it).
 #
 # Secrets required in .streamlit/secrets.toml
 #   [salesforce]
@@ -37,6 +25,7 @@ import time
 import urllib.parse
 from datetime import date, datetime
 from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -55,6 +44,45 @@ PRIMARY_USER_NAME = "Hayden"
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
     return f"Hi {name} 👋"
+
+
+# =============================================================================
+# TEMPLATE (FROM REPO — NO UPLOAD)
+# =============================================================================
+TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
+
+
+@st.cache_data(show_spinner=False)
+def load_default_template_bytes() -> Tuple[bytes, str]:
+    """
+    Finds the template file in the repo and returns (bytes, path_used).
+    Looks in:
+      - same folder as this script
+      - ./templates/
+      - ./assets/
+      - current working dir
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / TEMPLATE_FILENAME,
+        here / "templates" / TEMPLATE_FILENAME,
+        here / "assets" / TEMPLATE_FILENAME,
+        Path.cwd() / TEMPLATE_FILENAME,
+        Path(TEMPLATE_FILENAME),
+    ]
+
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                return p.read_bytes(), str(p)
+        except Exception:
+            continue
+
+    tried = "\n".join([str(p) for p in candidates])
+    raise FileNotFoundError(
+        f"Could not find '{TEMPLATE_FILENAME}' in the repo.\n\nTried:\n{tried}\n\n"
+        f"Fix: Add '{TEMPLATE_FILENAME}' to your repo (same folder as app.py is best)."
+    )
 
 
 # =============================================================================
@@ -187,7 +215,6 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 # =============================================================================
 # NORMALIZATION
 # =============================================================================
-
 def norm_id_series(s: pd.Series) -> pd.Series:
     return (
         s.astype("string")
@@ -199,7 +226,6 @@ def norm_id_series(s: pd.Series) -> pd.Series:
 
 
 def id_key_no_leading_zeros(s: pd.Series) -> pd.Series:
-    """Normalized join key: alnum only, then lstrip(0)."""
     out = norm_id_series(s)
     out = out.astype("string").str.lstrip("0")
     return out.replace({"": pd.NA})
@@ -250,9 +276,8 @@ def date_only(x):
 
 
 # =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE) — EXACTLY HUD STYLE
+# SALESFORCE AUTH (OAuth + PKCE) — HUD STYLE
 # =============================================================================
-
 def b64url_no_pad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
 
@@ -300,7 +325,6 @@ def ensure_sf_session() -> Salesforce:
 
     CLIENT_ID = cfg["client_id"]
     AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
-    # ✅ THIS IS THE BIG FIX: match HUD behavior exactly
     REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
     CLIENT_SECRET = cfg.get("client_secret")
 
@@ -324,7 +348,7 @@ def ensure_sf_session() -> Salesforce:
 
     store = pkce_store()
 
-    # TTL cleanup (HUD behavior)
+    # TTL cleanup
     now = time.time()
     TTL = 900
     for s, (_v, t0) in list(store.items()):
@@ -364,7 +388,6 @@ def ensure_sf_session() -> Salesforce:
         st.info("Step 1: Log in to Salesforce.")
         st.link_button("Login", login_url)
 
-        # Debug view that will immediately show if you’re accidentally using a different redirect_uri
         with st.expander("Debug (OAuth values being used)"):
             st.write("AUTH_HOST:")
             st.code(AUTH_HOST)
@@ -391,7 +414,6 @@ def ensure_sf_session() -> Salesforce:
 # =============================================================================
 # SALESFORCE REPORT PULL (REST)
 # =============================================================================
-
 def _is_perm_error(msg: str) -> bool:
     m = (msg or "").lower()
     needles = [
@@ -525,7 +547,6 @@ def run_report_all_rows(sf: Salesforce, report_id: str, page_size: int = 2000, m
 # =============================================================================
 # SERVICER FILE PARSING
 # =============================================================================
-
 def date_from_filename(name: str) -> Optional[date]:
     m = re.search(r"(20\d{2})(\d{2})(\d{2})", name)
     if m:
@@ -575,7 +596,6 @@ def sniff_excel_header(
 def _corevest_pad_loan_number(raw: pd.Series) -> pd.Series:
     s = norm_id_series(raw)
     s = s.fillna(pd.NA).astype("string")
-    # add four leading zeros unless already present
     s = s.apply(lambda x: x if pd.isna(x) else (x if x.startswith("0000") else f"0000{x}"))
     return s.replace({"": pd.NA})
 
@@ -587,9 +607,7 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
     d_file = date_from_filename(name)
     as_of_file = pd.to_datetime(d_file) if d_file else pd.NaT
 
-    # ----------------------------
     # CSV: CHL Streamline
-    # ----------------------------
     if name.lower().endswith(".csv"):
         df = pd.read_csv(BytesIO(b))
         req = {"Servicer Loan ID", "UPB"}
@@ -612,9 +630,7 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # ----------------------------
     # XLSX: detect by columns
-    # ----------------------------
     checks: List[Tuple[str, Set[str], Optional[Sequence[str]]]] = [
         ("CHL", {"Servicer Loan ID", "UPB"}, None),
         ("CoreVestLoanData", {"Loan Number", "Current UPB", "Due Date", "Maturity Date", "Loan Status"}, None),
@@ -657,10 +673,8 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVestLoanData (Statebridge style)
+    # CoreVestLoanData
     if detected == "CoreVestLoanData":
-        # Hayden rule: add four leading zeros in front of Loan Number for matching.
-        # We only apply padding when the file looks like the CoreVestLoanData export.
         needs_pad = (
             ("corevestloandata" in name.lower())
             or ("Investor ID" in df.columns)
@@ -682,7 +696,7 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVest Data Tape (Berkadia style)
+    # CoreVest Data Tape
     if detected == "CoreVest_Data_Tape":
         status = df.get("Loan Status", pd.Series(["Active"] * len(df))).astype("string")
         out = pd.DataFrame(
@@ -700,7 +714,7 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # FCI (all variants)
+    # FCI
     if detected == "FCI":
         out = pd.DataFrame(
             {
@@ -779,8 +793,6 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_has_npd"] = full["next_payment_date"].notna().astype(int)
         full["_has_mat"] = full["maturity_date"].notna().astype(int)
 
-        # Choose "best" row per loan:
-        #   latest as_of, most complete fields, then highest UPB (stable tie-break)
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_upb", "_has_npd", "_has_mat", "upb"],
             ascending=[True, True, True, True, True, True],
@@ -799,11 +811,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
 # =============================================================================
 # LAST WEEK REPORT CARRY-FORWARD
-#   - REO Date (already)
-#   - Bridge Loan manual columns (already)
-#   - Prior UPB values for REO fallback (NEW)
 # =============================================================================
-
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
     df = df.dropna(how="all")
@@ -821,7 +829,6 @@ def _find_upb_col(cols: Sequence[str]) -> Optional[str]:
 def build_prev_maps(prev_bytes: bytes) -> dict:
     out: dict = {}
 
-    # Term Loan: carry forward REO Date and (NEW) previous UPB
     try:
         tl = read_tab_df_from_active_loans(prev_bytes, "Term Loan")
         if "Deal Number" in tl.columns and "REO Date" in tl.columns:
@@ -838,7 +845,6 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    # Bridge Loan: carry forward manual columns and (NEW) previous UPB
     try:
         bl = read_tab_df_from_active_loans(prev_bytes, "Bridge Loan")
         keep = [c for c in ["Deal Number", "State(s)", "Loan Level Delinquency", "Special Focus (Y/N)"] if c in bl.columns]
@@ -862,7 +868,6 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 # =============================================================================
 # BUILD HELPERS
 # =============================================================================
-
 def _yn_from_bool_series(s: pd.Series) -> pd.Series:
     return s.fillna(False).map(lambda x: "Y" if bool(x) else "N")
 
@@ -870,7 +875,6 @@ def _yn_from_bool_series(s: pd.Series) -> pd.Series:
 # =============================================================================
 # BUILD: BRIDGE ASSET
 # =============================================================================
-
 def build_bridge_asset(
     sf_spine: pd.DataFrame,
     sf_dnl: pd.DataFrame,
@@ -890,7 +894,6 @@ def build_bridge_asset(
     out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
 
-    # Do Not Lend
     if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
         dnl = sf_dnl.copy()
         dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
@@ -900,7 +903,6 @@ def build_bridge_asset(
             out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend"])
             out = out.drop(columns=["Do Not Lend"], errors="ignore")
 
-    # Valuation
     if not sf_val.empty and "Asset ID" in sf_val.columns:
         v = sf_val.copy()
         v["_asset_key"] = norm_id_series(v["Asset ID"])
@@ -912,7 +914,6 @@ def build_bridge_asset(
                 out[tcol] = out[vlabel]
                 out = out.drop(columns=[vlabel], errors="ignore")
 
-    # AM assignments
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
@@ -939,7 +940,6 @@ def build_bridge_asset(
         out = out.merge(piv_name, on="_deal_key", how="left")
         out = out.merge(piv_date, on="_deal_key", how="left")
 
-    # Active RM fallback
     if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
         arm = sf_arm.copy()
         arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
@@ -951,7 +951,6 @@ def build_bridge_asset(
             out["Active RM"] = out["Active RM"].fillna(out["CAF Originator"])
         out = out.drop(columns=["CAF Originator"], errors="ignore")
 
-    # Servicer join (loan-level values)
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy()
         s = s.rename(
@@ -971,8 +970,6 @@ def build_bridge_asset(
             how="left",
         )
 
-        # ✅ REO fallback (Hayden rule)
-        # If Loan Stage == REO and servicer UPB missing/0, use last week's UPB (or 0.00).
         if "bridge_loan_upb" in prev_maps:
             prev_upb = prev_maps["bridge_loan_upb"].copy()
             out = out.merge(prev_upb, on="_deal_key", how="left")
@@ -987,7 +984,6 @@ def build_bridge_asset(
         fill_val = prev_upb_vals.fillna(0.0)
         out["_loan_upb"] = np.where(reo_mask & ((loan_upb.isna()) | (loan_upb <= 0)), fill_val, loan_upb)
 
-        # Allocation weights
         w = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
         out["_w"] = w
         out["_w_sum"] = out.groupby("_sid_key")["_w"].transform("sum")
@@ -1007,7 +1003,6 @@ def build_bridge_asset(
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
 
-    # Funded amount
     if "Approved Advance Amount Funded" in sf_spine.columns:
         out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
     else:
@@ -1017,7 +1012,6 @@ def build_bridge_asset(
             + pd.to_numeric(out.get("Interest Allocation Funded", 0), errors="coerce").fillna(0)
         )
 
-    # Ensure required text columns exist
     if "Portfolio" not in out.columns:
         out["Portfolio"] = ""
     if "Segment" not in out.columns:
@@ -1034,7 +1028,6 @@ def build_bridge_asset(
 # =============================================================================
 # BUILD: TERM LOAN
 # =============================================================================
-
 def build_term_loan(
     sf_term: pd.DataFrame,
     sf_sold: pd.DataFrame,
@@ -1054,7 +1047,6 @@ def build_term_loan(
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
 
-    # Sold-to
     if not sf_sold.empty and "Deal Loan Number" in sf_sold.columns:
         sold = sf_sold.copy()
         sold["_deal_key"] = norm_id_series(sold["Deal Loan Number"])
@@ -1064,7 +1056,6 @@ def build_term_loan(
             out["Loan Buyer"] = out["Sold Loan: Sold To"]
             out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
 
-    # Active RM fallback
     if "Active RM" not in out.columns:
         out["Active RM"] = ""
     if out["Active RM"].isna().all():
@@ -1076,7 +1067,6 @@ def build_term_loan(
             out["Active RM"] = out["Active RM"].fillna(out["CAF Originator"]).fillna("")
             out = out.drop(columns=["CAF Originator"], errors="ignore")
 
-    # Asset Manager
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
@@ -1093,11 +1083,9 @@ def build_term_loan(
     else:
         out["Asset Manager"] = ""
 
-    # Servicer ID from SF term export
     out["Servicer ID"] = sf_term["Servicer Commitment Id"] if "Servicer Commitment Id" in sf_term.columns else None
     out["_sid_key"] = id_key_no_leading_zeros(out["Servicer ID"].astype("string"))
 
-    # Join servicer values: UPB / Next Pay / Maturity
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy()
         s2 = s.rename(
@@ -1115,7 +1103,6 @@ def build_term_loan(
         out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"]).fillna("")
         out = out.drop(columns=["_servicer_file"], errors="ignore")
 
-    # Carry forward REO Date
     out["REO Date"] = ""
     if "term_loan_reo" in prev_maps:
         reo = prev_maps["term_loan_reo"][["_deal_key", "REO Date"]].copy()
@@ -1123,7 +1110,6 @@ def build_term_loan(
         out["REO Date"] = out["REO Date_prev"].fillna("")
         out = out.drop(columns=["REO Date_prev"], errors="ignore")
 
-    # ✅ REO balance fallback (if REO Date exists and servicer UPB is missing/0)
     if "term_loan_upb" in prev_maps and upb_col in out.columns:
         prevu = prev_maps["term_loan_upb"].copy()
         out = out.merge(prevu, on="_deal_key", how="left")
@@ -1146,7 +1132,6 @@ def build_term_loan(
 # =============================================================================
 # BUILD: TERM ASSET (ALA-weight UPB from Term Loan)
 # =============================================================================
-
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
     out = pd.DataFrame()
 
@@ -1172,7 +1157,6 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 # =============================================================================
 # BUILD: BRIDGE LOAN (roll-up Bridge Asset)
 # =============================================================================
-
 def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict) -> pd.DataFrame:
     ba = bridge_asset.copy()
     g = ba.groupby("_deal_key", dropna=True)
@@ -1252,7 +1236,6 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
         }
     ).reset_index(drop=True)
 
-    # Carry forward manual cols
     if "bridge_loan_manual" in prev_maps and not out.empty:
         man = prev_maps["bridge_loan_manual"].copy()
         out2 = out.copy()
@@ -1272,7 +1255,6 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
 # =============================================================================
 # EXCEL OUTPUT HELPERS
 # =============================================================================
-
 def header_tuples_from_ws(ws_values, header_row: int = 4) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
     row = list(ws_values.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
@@ -1377,7 +1359,6 @@ def update_run_date_in_row3(ws_formula, ws_values, run_dt: date, header_row: int
 # =============================================================================
 # REPORT SELECTION / CACHING
 # =============================================================================
-
 def required_report_keys(target: str) -> Set[str]:
     need: Set[str] = set()
     if target in ("Bridge Asset", "Bridge Loan", "All"):
@@ -1410,187 +1391,48 @@ def pull_reports(sf: Salesforce, keys: Set[str]) -> Dict[str, pd.DataFrame]:
 
 
 # =============================================================================
-# VALIDATION HELPERS (servicer vs built)
-# =============================================================================
-
-def _normalize_id_list(series: pd.Series) -> pd.Series:
-    return id_key_no_leading_zeros(series)
-
-
-def summarize_servicer_conflicts(serv_full: pd.DataFrame) -> pd.DataFrame:
-    if serv_full is None or serv_full.empty:
-        return pd.DataFrame()
-
-    d = serv_full.copy()
-    d = d.dropna(subset=["_sid_key"]).copy()
-
-    def _uniq(vals):
-        v = [x for x in vals if has_any_value(x)]
-        # normalize dates
-        out = []
-        for x in v:
-            if isinstance(x, (datetime, date)):
-                out.append(pd.to_datetime(x).date().isoformat())
-            else:
-                out.append(str(x))
-        return sorted(set(out))
-
-    agg = (
-        d.groupby("_sid_key")
-        .agg(
-            servicer=("servicer", lambda s: ", ".join(sorted(set([str(x) for x in s.dropna().unique()])))),
-            sources=("source_file", lambda s: ", ".join(sorted(set([str(x) for x in s.dropna().unique()])))),
-            n_sources=("source_file", "nunique"),
-            upb_values=("upb", lambda s: _uniq([round(float(x), 2) for x in s.dropna().tolist() if pd.notna(x)])),
-            next_payment_dates=("next_payment_date", lambda s: _uniq(s.tolist())),
-            maturity_dates=("maturity_date", lambda s: _uniq(s.tolist())),
-            statuses=("status", lambda s: _uniq(s.tolist())),
-            max_upb=("upb", "max"),
-        )
-        .reset_index()
-    )
-
-    # Conflicts = more than one unique value in any field (for active-ish loans)
-    def _has_conflict(row) -> bool:
-        if row.get("n_sources", 0) <= 1:
-            return False
-        fields = ["upb_values", "next_payment_dates", "maturity_dates", "statuses"]
-        return any(isinstance(row[f], list) and len(row[f]) > 1 for f in fields)
-
-    agg["has_conflict"] = agg.apply(_has_conflict, axis=1)
-    # Only show where max_upb > 0 OR there is conflict
-    agg = agg[(agg["has_conflict"]) | (pd.to_numeric(agg["max_upb"], errors="coerce").fillna(0) > 0)].copy()
-
-    # Make list columns printable
-    for c in ["upb_values", "next_payment_dates", "maturity_dates", "statuses"]:
-        agg[c] = agg[c].apply(lambda x: "; ".join(x) if isinstance(x, list) else "")
-
-    return agg.sort_values(["has_conflict", "max_upb"], ascending=[False, False])
-
-
-def compare_expected_vs_actual(
-    expected: pd.DataFrame,
-    actual: pd.DataFrame,
-    id_col_expected: str,
-    id_col_actual: str,
-    cols_map: Dict[str, str],
-    active_only: bool = True,
-    upb_col_expected: str = "upb",
-    upb_tolerance: float = 1.0,
-) -> pd.DataFrame:
-    """Return mismatches between expected(servicer) and actual(output) at loan level."""
-    if expected is None or expected.empty or actual is None or actual.empty:
-        return pd.DataFrame()
-
-    e = expected.copy()
-    a = actual.copy()
-
-    e["_id"] = _normalize_id_list(e[id_col_expected])
-    a["_id"] = _normalize_id_list(a[id_col_actual])
-
-    e = e.dropna(subset=["_id"]).copy()
-    a = a.dropna(subset=["_id"]).copy()
-
-    if active_only and upb_col_expected in e.columns:
-        e = e[pd.to_numeric(e[upb_col_expected], errors="coerce").fillna(0) > 0].copy()
-
-    # Prepare expected fields
-    keep_e = ["_id", "servicer", upb_col_expected]
-    for e_col in cols_map.keys():
-        if e_col in e.columns and e_col not in keep_e:
-            keep_e.append(e_col)
-    e2 = e[keep_e].drop_duplicates("_id")
-
-    # Prepare actual fields
-    keep_a = ["_id"]
-    for a_col in cols_map.values():
-        if a_col in a.columns and a_col not in keep_a:
-            keep_a.append(a_col)
-    a2 = a[keep_a].drop_duplicates("_id")
-
-    m = e2.merge(a2, on="_id", how="left", suffixes=("_exp", "_act"))
-
-    # Compute mismatches
-    mism = []
-    for _, row in m.iterrows():
-        # UPB compare
-        exp_upb = pd.to_numeric(row.get(upb_col_expected), errors="coerce")
-        act_upb = pd.to_numeric(row.get(cols_map.get(upb_col_expected, "")), errors="coerce")
-        if pd.notna(exp_upb) and pd.notna(act_upb):
-            if abs(float(exp_upb) - float(act_upb)) > upb_tolerance:
-                mism.append(True)
-                continue
-        elif pd.notna(exp_upb) and pd.isna(act_upb):
-            # expected active but missing in output
-            mism.append(True)
-            continue
-
-        # other fields (dates/strings)
-        diff_found = False
-        for e_col, a_col in cols_map.items():
-            if e_col == upb_col_expected:
-                continue
-            exp = row.get(e_col)
-            act = row.get(a_col)
-
-            if "date" in e_col.lower() or "date" in a_col.lower():
-                exp_d = date_only(exp)
-                act_d = date_only(act)
-                if (pd.isna(exp_d) and pd.isna(act_d)):
-                    continue
-                if exp_d != act_d:
-                    diff_found = True
-                    break
-            else:
-                exp_s = "" if exp is None or (isinstance(exp, float) and np.isnan(exp)) else str(exp).strip()
-                act_s = "" if act is None or (isinstance(act, float) and np.isnan(act)) else str(act).strip()
-                if exp_s != act_s:
-                    diff_found = True
-                    break
-
-        mism.append(diff_found)
-
-    m["mismatch"] = mism
-
-    # Build a tidy output
-    if not m["mismatch"].any():
-        return pd.DataFrame()
-
-    show_cols = ["_id", "servicer", upb_col_expected]
-    for e_col, a_col in cols_map.items():
-        if e_col != upb_col_expected:
-            show_cols += [e_col, a_col]
-    show_cols = [c for c in show_cols if c in m.columns]
-
-    out = m[m["mismatch"]].copy()
-    out = out[show_cols]
-    out = out.rename(columns={"_id": "servicer_id_key"})
-    return out
-
-
-# =============================================================================
 # STREAMLIT UI
 # =============================================================================
-
 st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
 st.subheader(hey())
 
 st.markdown(
-    """
+    f"""
 Welcome! This tool builds the **Active Loans** workbook using **Salesforce report pulls** and **servicer uploads**.
 
 ### What you’ll do
-1) Upload the **Active Loans TEMPLATE** workbook  
-2) Upload the **current servicer files**  
+1) Upload the **current servicer files**  
+2) (Optional) Upload **last week’s Active Loans report** for carry-forward  
 3) Log in to **Salesforce** when prompted  
 4) Choose **which sheet to build** (fast) or **All** (slower)
+
+### Template
+This app uses the built-in template file in the repo:
+**{TEMPLATE_FILENAME}**
 """
 )
 
+# Show template status + allow download of the built-in template (no upload required)
+try:
+    _tmpl_bytes_preview, _tmpl_path_used = load_default_template_bytes()
+    st.success(f"✅ Template found in repo: {_tmpl_path_used}")
+    with st.expander("Template details"):
+        st.caption("If anything looks off, confirm you committed the right file name + location in GitHub.")
+        st.code(_tmpl_path_used)
+        st.download_button(
+            "Download the built-in template",
+            data=_tmpl_bytes_preview,
+            file_name=TEMPLATE_FILENAME,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
 colA, colB = st.columns([1.3, 1.0])
 with colA:
-    template_upload = st.file_uploader("Upload Active Loans TEMPLATE (.xlsx)", type=["xlsx"])
     prev_upload = st.file_uploader(
         "Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)", type=["xlsx"]
     )
@@ -1637,10 +1479,6 @@ if st.button("Clear cached Salesforce reports", type="secondary"):
 build_btn = st.button("Build", type="primary")
 
 if build_btn:
-    if not template_upload:
-        st.error("Upload the template workbook first.")
-        st.stop()
-
     if not servicer_uploads:
         st.error("Upload the servicer files. UPB/Next Payment/Maturity/Status come from them.")
         st.stop()
@@ -1731,150 +1569,15 @@ if build_btn:
         with st.spinner("Building Term Asset..."):
             term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
 
-    # -----------------------------
-    # Diagnostics + validation
-    # -----------------------------
     st.subheader("Diagnostics")
-
     if bridge_asset is not None and "_loan_upb" in bridge_asset.columns:
         st.write(f"Bridge Asset servicer-join match rate (UPB): {bridge_asset['_loan_upb'].notna().mean():.1%}")
     if term_loan is not None and upb_col in term_loan.columns:
         st.write(f"Term Loan servicer-join match rate (UPB): {term_loan[upb_col].notna().mean():.1%}")
 
-    with st.expander("Servicer validation (Active loans: UPB > 0)"):
-        # 1) Conflicts across servicer uploads
-        conflicts = summarize_servicer_conflicts(serv_full)
-        if conflicts.empty:
-            st.success("No multi-source conflicts detected (or no active loans in servicer uploads).")
-        else:
-            st.warning(f"Found {len(conflicts)} loan IDs with multiple sources and/or conflicts.")
-            st.dataframe(conflicts.head(200), use_container_width=True)
-            st.download_button(
-                "Download conflicts CSV",
-                data=conflicts.to_csv(index=False).encode("utf-8"),
-                file_name=f"servicer_conflicts_{run_dt.isoformat()}.csv",
-                mime="text/csv",
-            )
+    # ✅ Template now comes from repo (no upload)
+    tmpl_bytes, tmpl_path_used = load_default_template_bytes()
 
-        # 2) Active loans missing from the output (Bridge Loan + Term Loan)
-        expected_active = serv_join.copy()
-        expected_active = expected_active[pd.to_numeric(expected_active.get("upb", 0), errors="coerce").fillna(0) > 0].copy()
-        expected_active["_id"] = _normalize_id_list(expected_active["servicer_id"]) if "servicer_id" in expected_active.columns else expected_active.get("_sid_key")
-
-        built_ids = []
-        if bridge_loan is not None and "Servicer ID" in bridge_loan.columns:
-            built_ids.append(_normalize_id_list(bridge_loan["Servicer ID"]))
-        if term_loan is not None and "Servicer ID" in term_loan.columns:
-            built_ids.append(_normalize_id_list(term_loan["Servicer ID"]))
-
-        built_union = pd.Series([], dtype="string")
-        if built_ids:
-            built_union = pd.concat(built_ids, ignore_index=True).dropna().drop_duplicates()
-
-        missing = expected_active.dropna(subset=["_id"]).copy()
-        missing = missing[~missing["_id"].isin(set(built_union.tolist()))].copy()
-
-        if missing.empty:
-            st.success("All active servicer loans appear in the built Bridge/Term loan tabs (by Servicer ID).")
-        else:
-            st.error(f"{len(missing)} active servicer loans did NOT appear in Bridge Loan or Term Loan outputs.")
-            show = missing[["servicer", "servicer_id", "upb", "next_payment_date", "maturity_date", "source_file"]].copy()
-            st.dataframe(show.head(300), use_container_width=True)
-            st.download_button(
-                "Download missing-active-loans CSV",
-                data=show.to_csv(index=False).encode("utf-8"),
-                file_name=f"missing_active_servicer_loans_{run_dt.isoformat()}.csv",
-                mime="text/csv",
-            )
-
-        # 2b) Hayden's weekly check: FCI Master loans with balance should be in the report
-        st.markdown("#### FCI Master check (loans with UPB > 0)")
-        if serv_full is None or serv_full.empty:
-            st.info("No servicer rows to validate.")
-        else:
-            fci_master = serv_full[serv_full["source_file"].astype("string").str.contains("cvmaster", case=False, na=False)].copy()
-            fci_master = fci_master[pd.to_numeric(fci_master.get("upb", 0), errors="coerce").fillna(0) > 0].copy()
-            if fci_master.empty:
-                st.info("No FCI Master file detected (or no loans with UPB > 0 in that file).")
-            else:
-                fci_master = fci_master.dropna(subset=["_sid_key"]).drop_duplicates("_sid_key")
-                missing_fci = fci_master[~fci_master["_sid_key"].isin(set(built_union.tolist()))].copy()
-                if missing_fci.empty:
-                    st.success("FCI Master: all loans with balance appear in Bridge Loan or Term Loan outputs.")
-                else:
-                    st.error(f"FCI Master: {len(missing_fci)} loans with UPB > 0 are missing from the output.")
-                    show_fci = missing_fci[["servicer_id", "upb", "next_payment_date", "maturity_date", "status", "source_file"]].copy()
-                    st.dataframe(show_fci.head(300), use_container_width=True)
-                    st.download_button(
-                        "Download FCI Master missing CSV",
-                        data=show_fci.to_csv(index=False).encode("utf-8"),
-                        file_name=f"missing_fci_master_loans_{run_dt.isoformat()}.csv",
-                        mime="text/csv",
-                    )
-
-        # 3) Value mismatches (expected servicer vs built)
-        if bridge_loan is not None:
-            # Build expected vs actual for Bridge Loan
-            # expected uses serv_join (upb/next/maturity). actual uses Bridge Loan tab.
-            cols_map = {
-                "upb": upb_col,
-                "next_payment_date": "Next Payment Date",
-                "maturity_date": "Next Advance Maturity Date",
-            }
-            mism_bl = compare_expected_vs_actual(
-                expected=serv_join,
-                actual=bridge_loan,
-                id_col_expected="servicer_id",
-                id_col_actual="Servicer ID",
-                cols_map=cols_map,
-                active_only=True,
-                upb_col_expected="upb",
-                upb_tolerance=1.0,
-            )
-            if mism_bl.empty:
-                st.success("Bridge Loan: no mismatches vs selected servicer values (for active loans).")
-            else:
-                st.warning(f"Bridge Loan mismatches: {len(mism_bl)}")
-                st.dataframe(mism_bl.head(200), use_container_width=True)
-                st.download_button(
-                    "Download Bridge Loan mismatches CSV",
-                    data=mism_bl.to_csv(index=False).encode("utf-8"),
-                    file_name=f"bridge_loan_mismatches_{run_dt.isoformat()}.csv",
-                    mime="text/csv",
-                )
-
-        if term_loan is not None:
-            cols_map = {
-                "upb": upb_col,
-                "next_payment_date": "Next Payment Date",
-                "maturity_date": "Maturity Date",
-            }
-            mism_tl = compare_expected_vs_actual(
-                expected=serv_join,
-                actual=term_loan,
-                id_col_expected="servicer_id",
-                id_col_actual="Servicer ID",
-                cols_map=cols_map,
-                active_only=True,
-                upb_col_expected="upb",
-                upb_tolerance=1.0,
-            )
-            if mism_tl.empty:
-                st.success("Term Loan: no mismatches vs selected servicer values (for active loans).")
-            else:
-                st.warning(f"Term Loan mismatches: {len(mism_tl)}")
-                st.dataframe(mism_tl.head(200), use_container_width=True)
-                st.download_button(
-                    "Download Term Loan mismatches CSV",
-                    data=mism_tl.to_csv(index=False).encode("utf-8"),
-                    file_name=f"term_loan_mismatches_{run_dt.isoformat()}.csv",
-                    mime="text/csv",
-                )
-
-    # -----------------------------
-    # Write workbook
-    # -----------------------------
-    tmpl_bytes = template_upload.getvalue()
     wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
     wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
 
@@ -1918,6 +1621,7 @@ if build_btn:
 
     fname_target = build_target.replace(" ", "_")
     st.success("✅ Workbook built")
+    st.caption(f"Built using template from: {tmpl_path_used}")
     st.download_button(
         "Download",
         data=out_bytes.getvalue(),
