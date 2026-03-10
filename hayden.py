@@ -1,23 +1,23 @@
 # ============================================================
-# Active Loans Report Builder — ONE FILE (Streamlit) — SF LOGIN FIX
+# Active Loans Report Builder — ONE FILE (Streamlit) — MYDOMAIN AUTH FIX
 #
-# Key change (per your request):
-# ✅ Replaced the Salesforce OAuth (PKCE) login flow with the SAME pattern/methods
-#    you’re using successfully in your HUD Generator app:
-#    - pkce_store() via @st.cache_resource
-#    - shared in-memory store with TTL cleanup
-#    - same query_params handling + exchange_code_for_token approach
+# ✅ Uses the SAME PKCE OAuth pattern as your HUD Generator app
+# ✅ Defaults auth_host to your My Domain:
+#       https://cvest.my.salesforce.com
+# ✅ Also shows a fallback login link to:
+#       https://login.salesforce.com
+#    (helpful if a user’s org/network blocks My Domain auth endpoints)
 #
-# Also included:
-# ✅ Hayden-first personalization (welcoming UI copy)
-# ✅ Same report-pull + servicer parsing + template-preserving output logic you had
+# IMPORTANT (this is usually the root cause):
+# - In Salesforce Connected App, the "Callback URL" must EXACTLY match
+#   st.secrets["salesforce"]["redirect_uri"] (including trailing slash or not).
 #
 # Secrets required in .streamlit/secrets.toml
 #   [salesforce]
 #   client_id = "..."
-#   redirect_uri = "https://<your-app>/"   # MUST match Connected App callback EXACTLY
+#   redirect_uri = "https://active-loan-report.streamlit.app/"   # EXACT match to Connected App
 #   # optional
-#   auth_host = "https://cvest.my.salesforce.com"
+#   auth_host = "https://cvest.my.salesforce.com"                # defaulted in code if omitted
 #   client_secret = "..."   # only if your connected app requires it
 # ============================================================
 
@@ -122,7 +122,7 @@ BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
     "Project Strategy": "Project Strategy",
     "Property Type": "Property Type",
     "Originator": "Originator: Originating Company",
-    "Active RM": "CAF Originator: Full Name",  # from Bridge Maturity report
+    "Active RM": "CAF Originator: Full Name",
     "Deal Intro Sub-Source": "Deal Intro Sub-Source",
     "Referral Source Account": "Referral Source Account: Account Name",
     "Referral Source Contact": "Referral Source Contact: Full Name",
@@ -151,12 +151,11 @@ TERM_LOAN_FROM_TERM_EXPORT = {
     "Loan Amount": "Loan Amount",
     "Origination Date": "Close Date",
     "Originator": "CAF Originator",
-    "Active RM": "Active RM",  # may not exist in the report export; we fall back to Active RM report
+    "Active RM": "Active RM",
     "Deal Intro Sub-Source": "Deal Intro Sub-Source",
     "Referral Source Account": "Referral Source Account",
     "Referral Source Contact": "Referral Source Contact",
     "AM Commentary": "Comments AM",
-    # Servicer fields are filled from servicer files
 }
 
 TERM_LOAN_FROM_SOLD_TERM = {
@@ -180,15 +179,6 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 # =============================================================================
 # NORMALIZATION
 # =============================================================================
-def norm_text(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    s = str(x).strip()
-    s = re.sub(r"\.0$", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s or None
-
-
 def norm_id_series(s: pd.Series) -> pd.Series:
     return (
         s.astype("string")
@@ -218,7 +208,7 @@ def make_upb_header(run_dt: date) -> str:
 
 
 # =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE) — HUD-GENERATOR STYLE (WORKING PATTERN)
+# SALESFORCE AUTH (OAuth + PKCE) — HUD-GENERATOR STYLE + MYDOMAIN DEFAULT
 # =============================================================================
 def b64url_no_pad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
@@ -235,8 +225,7 @@ def make_challenge(verifier: str) -> str:
 
 @st.cache_resource
 def pkce_store():
-    # NOTE: this mirrors your HUD Generator approach that’s working for users.
-    # TTL cleanup below keeps it from growing unbounded.
+    # Mirrors your HUD Generator approach.
     return {}
 
 
@@ -284,14 +273,23 @@ def _exchange_code_for_token(
     return resp.json()
 
 
-def ensure_sf_session() -> Salesforce:
-    """
-    HUD-Generator-style PKCE auth flow.
+def _build_login_url(auth_host: str, client_id: str, redirect_uri: str, state: str, challenge: str) -> str:
+    auth_host = (auth_host or "").rstrip("/")
+    auth_url = f"{auth_host}/services/oauth2/authorize"
+    login_params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "prompt": "login",
+        "scope": "api refresh_token",
+    }
+    return auth_url + "?" + urllib.parse.urlencode(login_params)
 
-    Important practical note:
-    - REDIRECT_URI in secrets MUST exactly match the Connected App callback URL.
-    - Avoid “sometimes slash sometimes no slash” mismatches between app + SF config.
-    """
+
+def ensure_sf_session() -> Salesforce:
     cfg = st.secrets.get("salesforce")
     if not cfg:
         st.error("Missing Salesforce secrets. Add a [salesforce] section to .streamlit/secrets.toml")
@@ -299,12 +297,13 @@ def ensure_sf_session() -> Salesforce:
 
     client_id = cfg["client_id"]
     client_secret = cfg.get("client_secret")
+
+    # ✅ Default to your My Domain host if not provided
     auth_host = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
 
-    # Keep redirect URI EXACT as provided (this is often the root cause of callback weirdness).
+    # DO NOT strip/normalize; callback matching is picky
     redirect_uri = cfg["redirect_uri"]
 
-    auth_url = f"{auth_host}/services/oauth2/authorize"
     token_url = f"{auth_host}/services/oauth2/token"
 
     qp = st.query_params
@@ -322,15 +321,16 @@ def ensure_sf_session() -> Salesforce:
     if "sf_token" not in st.session_state:
         st.session_state.sf_token = None
 
-    # TTL cleanup on shared store (HUD Generator pattern)
     store = pkce_store()
+
+    # TTL cleanup
     now = time.time()
     ttl = 900
     for s, (_v, t0) in list(store.items()):
         if now - t0 > ttl:
             store.pop(s, None)
 
-    # OAuth callback handler
+    # OAuth callback
     if code:
         if not state or state not in store:
             st.error("Login link expired. Click login again.")
@@ -342,27 +342,32 @@ def ensure_sf_session() -> Salesforce:
         st.query_params.clear()
         st.rerun()
 
-    # Not logged in -> show login link
+    # Not logged in => show login links
     if not st.session_state.sf_token:
         new_state = secrets.token_urlsafe(24)
         verifier = make_verifier()
         challenge = make_challenge(verifier)
         store[new_state] = (verifier, time.time())
 
-        login_params = {
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": new_state,
-            "prompt": "login",
-            "scope": "api refresh_token",
-        }
-        login_url = auth_url + "?" + urllib.parse.urlencode(login_params)
+        # Primary: My Domain
+        login_url_primary = _build_login_url(auth_host, client_id, redirect_uri, new_state, challenge)
+
+        # Fallback: login.salesforce.com (some environments behave better here)
+        fallback_host = "https://login.salesforce.com"
+        login_url_fallback = _build_login_url(fallback_host, client_id, redirect_uri, new_state, challenge)
 
         st.info("Step 1: Log in to Salesforce to pull reports.")
-        st.link_button("Login to Salesforce", login_url)
+        st.link_button("Login (My Domain: cvest.my.salesforce.com)", login_url_primary)
+        st.caption("If the My Domain button doesn’t load for you, try the fallback login:")
+        st.link_button("Login (Fallback: login.salesforce.com)", login_url_fallback)
+
+        with st.expander("Troubleshooting: what must match"):
+            st.write("**redirect_uri from secrets:**")
+            st.code(str(redirect_uri))
+            st.write("**auth_host being used:**")
+            st.code(str(auth_host))
+            st.write("Make sure Connected App Callback URL matches redirect_uri EXACTLY (including trailing slash).")
+
         st.stop()
 
     tok = st.session_state.sf_token
@@ -380,7 +385,6 @@ def ensure_sf_session() -> Salesforce:
 # SALESFORCE REPORT PULL (REST)
 # =============================================================================
 def sf_restful_safe(sf: Salesforce, path: str, method: str = "GET") -> dict:
-    """Return {} on permission/report-access errors instead of crashing the app."""
     try:
         return sf.restful(path, method=method)
     except Exception as e:
@@ -436,7 +440,6 @@ def report_json_to_df(report_json: dict) -> pd.DataFrame:
 
     df = pd.DataFrame(data_rows, columns=labels)
 
-    # De-dupe duplicate label columns
     if df.columns.duplicated().any():
         seen: Dict[str, int] = {}
         new_cols: List[str] = []
@@ -1313,21 +1316,22 @@ Welcome! This tool builds the **Active Loans** workbook using **Salesforce repor
 2) Upload the **current servicer files**  
 3) Log in to **Salesforce** when prompted  
 4) Choose **which sheet to build** (fast) or **All** (slower)
-
-### Speed tip
-If you’re in a hurry, build **one sheet at a time** — you’ll get a download immediately for just that tab.
 """
 )
 
 st.info(
-    f"{PRIMARY_USER_NAME}, if anything looks off (missing rows, weird dates, UPB blank), "
-    "download the single-sheet file and we’ll diagnose that tab first."
+    f"{PRIMARY_USER_NAME}, if you ever see **Login link expired**, it almost always means the callback URL "
+    "doesn’t match exactly, or the app reran and generated a new state before the callback returned."
 )
 
+# Inputs
 colA, colB = st.columns([1.3, 1.0])
 with colA:
     template_upload = st.file_uploader("Upload Active Loans TEMPLATE (.xlsx)", type=["xlsx"])
-    prev_upload = st.file_uploader("Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)", type=["xlsx"])
+    prev_upload = st.file_uploader(
+        "Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)",
+        type=["xlsx"],
+    )
 with colB:
     servicer_uploads = st.file_uploader(
         "Upload current servicer files (csv/xlsx)",
@@ -1341,6 +1345,7 @@ build_target = st.selectbox(
     index=0,
 )
 
+# Salesforce login
 use_sf = st.checkbox("Use Salesforce (recommended)", value=True)
 sf = None
 if use_sf:
@@ -1356,6 +1361,7 @@ if use_sf:
             st.session_state.sf_token = None
             st.rerun()
 
+# Run-date for UPB header (default = max filename date)
 name_guess = date.today()
 if servicer_uploads:
     dts = [date_from_filename(u.name) for u in servicer_uploads]
@@ -1385,11 +1391,13 @@ if build_btn:
         st.error("Salesforce login is required (or uncheck the Salesforce option).")
         st.stop()
 
+    # Prev maps
     prev_maps: dict = {}
     if prev_upload:
         with st.spinner("Reading last week's report (carry-forward)..."):
             prev_maps = build_prev_maps(prev_upload.getvalue())
 
+    # Servicer parse
     with st.spinner("Parsing servicer files..."):
         serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
 
@@ -1401,6 +1409,7 @@ if build_btn:
     st.caption(f"UPB column header to be used: **{upb_col}**")
     st.dataframe(serv_full.head(30), use_container_width=True)
 
+    # Pull only needed reports
     if use_sf:
         need = required_report_keys(build_target)
         dfs = pull_reports(sf, need)
@@ -1408,6 +1417,7 @@ if build_btn:
         st.error("This version requires Salesforce API pulls.")
         st.stop()
 
+    # Build required DFs
     bridge_asset = None
     bridge_loan = None
     term_loan = None
@@ -1470,12 +1480,14 @@ if build_btn:
         with st.spinner("Building Term Asset..."):
             term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
 
+    # Diagnostics
     st.subheader("Diagnostics")
     if bridge_asset is not None and "_loan_upb" in bridge_asset.columns:
         st.write(f"Bridge Asset servicer-join match rate (UPB): {bridge_asset['_loan_upb'].notna().mean():.1%}")
     if term_loan is not None and upb_col in term_loan.columns:
         st.write(f"Term Loan servicer-join match rate (UPB): {term_loan[upb_col].notna().mean():.1%}")
 
+    # Output workbook
     tmpl_bytes = template_upload.getvalue()
     wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
     wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
@@ -1492,6 +1504,7 @@ if build_btn:
         "Term Asset": term_asset,
     }
 
+    targets: List[str]
     if build_target == "All":
         targets = ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
     else:
