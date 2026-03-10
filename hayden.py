@@ -1,13 +1,15 @@
 # ============================================================
 # Active Loans Report Builder — ONE FILE (Streamlit)
 #
-# Update in this version:
-# ✅ Stop asking Hayden to upload a template.
-# ✅ Always build from the "Active Loan Report Template.xlsx" file that lives in this repo.
+# Updates in this version:
+# ✅ No template upload. The app ALWAYS uses the repo template file:
+#    "Active Loan Report Template.xlsx"
+# ✅ UPB header ALWAYS uses TODAY'S date (America/New_York).
 #
-# IMPORTANT:
-# - Put "Active Loan Report Template.xlsx" in the SAME folder as this app.py
-#   (or in ./templates/ or ./assets/ — this code will find it).
+# Put the template in your GitHub repo at ONE of these locations:
+#   - same folder as this file (recommended)
+#   - ./templates/Active Loan Report Template.xlsx
+#   - ./assets/Active Loan Report Template.xlsx
 #
 # Secrets required in .streamlit/secrets.toml
 #   [salesforce]
@@ -27,6 +29,7 @@ from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -53,14 +56,9 @@ TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
 
 
 @st.cache_data(show_spinner=False)
-def load_default_template_bytes() -> Tuple[bytes, str]:
+def load_repo_template_bytes() -> Tuple[bytes, str]:
     """
-    Finds the template file in the repo and returns (bytes, path_used).
-    Looks in:
-      - same folder as this script
-      - ./templates/
-      - ./assets/
-      - current working dir
+    Loads the template workbook from the repository (no user upload).
     """
     here = Path(__file__).resolve().parent
     candidates = [
@@ -80,9 +78,13 @@ def load_default_template_bytes() -> Tuple[bytes, str]:
 
     tried = "\n".join([str(p) for p in candidates])
     raise FileNotFoundError(
-        f"Could not find '{TEMPLATE_FILENAME}' in the repo.\n\nTried:\n{tried}\n\n"
-        f"Fix: Add '{TEMPLATE_FILENAME}' to your repo (same folder as app.py is best)."
+        f"Could not find '{TEMPLATE_FILENAME}' in your repo.\n\nTried:\n{tried}\n\n"
+        f"Fix: Commit '{TEMPLATE_FILENAME}' to your GitHub repo (same folder as this app.py is best)."
     )
+
+
+def today_et() -> date:
+    return datetime.now(ZoneInfo("America/New_York")).date()
 
 
 # =============================================================================
@@ -673,13 +675,9 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVestLoanData
+    # CoreVestLoanData (Statebridge style)
     if detected == "CoreVestLoanData":
-        needs_pad = (
-            ("corevestloandata" in name.lower())
-            or ("Investor ID" in df.columns)
-            or (str(sheet_name).lower().find("corevest") >= 0)
-        )
+        needs_pad = "corevestloandata" in name.lower()
         sid = _corevest_pad_loan_number(df["Loan Number"]) if needs_pad else norm_id_series(df["Loan Number"])
         out = pd.DataFrame(
             {
@@ -696,7 +694,7 @@ def parse_servicer_upload(upload) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVest Data Tape
+    # CoreVest Data Tape (Berkadia style)
     if detected == "CoreVest_Data_Tape":
         status = df.get("Loan Status", pd.Series(["Active"] * len(df))).astype("string")
         out = pd.DataFrame(
@@ -793,6 +791,8 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_has_npd"] = full["next_payment_date"].notna().astype(int)
         full["_has_mat"] = full["maturity_date"].notna().astype(int)
 
+        # Choose "best" row per loan:
+        #   latest as_of, most complete fields, then highest UPB (stable tie-break)
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_upb", "_has_npd", "_has_mat", "upb"],
             ascending=[True, True, True, True, True, True],
@@ -810,7 +810,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
 
 # =============================================================================
-# LAST WEEK REPORT CARRY-FORWARD
+# LAST WEEK REPORT CARRY-FORWARD (REO DATE + manual cols + previous UPB)
 # =============================================================================
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
@@ -829,6 +829,7 @@ def _find_upb_col(cols: Sequence[str]) -> Optional[str]:
 def build_prev_maps(prev_bytes: bytes) -> dict:
     out: dict = {}
 
+    # Term Loan: carry forward REO Date and previous UPB
     try:
         tl = read_tab_df_from_active_loans(prev_bytes, "Term Loan")
         if "Deal Number" in tl.columns and "REO Date" in tl.columns:
@@ -845,6 +846,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     except Exception:
         pass
 
+    # Bridge Loan: manual columns and previous UPB
     try:
         bl = read_tab_df_from_active_loans(prev_bytes, "Bridge Loan")
         keep = [c for c in ["Deal Number", "State(s)", "Loan Level Delinquency", "Special Focus (Y/N)"] if c in bl.columns]
@@ -894,6 +896,7 @@ def build_bridge_asset(
     out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
 
+    # Do Not Lend
     if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
         dnl = sf_dnl.copy()
         dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
@@ -903,6 +906,7 @@ def build_bridge_asset(
             out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend"])
             out = out.drop(columns=["Do Not Lend"], errors="ignore")
 
+    # Valuation
     if not sf_val.empty and "Asset ID" in sf_val.columns:
         v = sf_val.copy()
         v["_asset_key"] = norm_id_series(v["Asset ID"])
@@ -914,6 +918,7 @@ def build_bridge_asset(
                 out[tcol] = out[vlabel]
                 out = out.drop(columns=[vlabel], errors="ignore")
 
+    # AM assignments
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
@@ -940,6 +945,7 @@ def build_bridge_asset(
         out = out.merge(piv_name, on="_deal_key", how="left")
         out = out.merge(piv_date, on="_deal_key", how="left")
 
+    # Active RM fallback
     if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
         arm = sf_arm.copy()
         arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
@@ -951,6 +957,7 @@ def build_bridge_asset(
             out["Active RM"] = out["Active RM"].fillna(out["CAF Originator"])
         out = out.drop(columns=["CAF Originator"], errors="ignore")
 
+    # Servicer join
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy()
         s = s.rename(
@@ -970,6 +977,7 @@ def build_bridge_asset(
             how="left",
         )
 
+        # REO fallback: if stage is REO and servicer UPB missing/0, carry forward last week's UPB (or 0)
         if "bridge_loan_upb" in prev_maps:
             prev_upb = prev_maps["bridge_loan_upb"].copy()
             out = out.merge(prev_upb, on="_deal_key", how="left")
@@ -980,10 +988,10 @@ def build_bridge_asset(
         reo_mask = stage_series.apply(is_reo_stage)
         loan_upb = pd.to_numeric(out.get("_loan_upb", np.nan), errors="coerce")
         prev_upb_vals = pd.to_numeric(out.get("_prev_upb", np.nan), errors="coerce")
-
         fill_val = prev_upb_vals.fillna(0.0)
         out["_loan_upb"] = np.where(reo_mask & ((loan_upb.isna()) | (loan_upb <= 0)), fill_val, loan_upb)
 
+        # allocate loan-level UPB/suspense to assets by SF "Current UPB" weight
         w = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
         out["_w"] = w
         out["_w_sum"] = out.groupby("_sid_key")["_w"].transform("sum")
@@ -1003,6 +1011,7 @@ def build_bridge_asset(
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
 
+    # Funded amount
     if "Approved Advance Amount Funded" in sf_spine.columns:
         out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
     else:
@@ -1047,6 +1056,7 @@ def build_term_loan(
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
 
+    # Sold-to
     if not sf_sold.empty and "Deal Loan Number" in sf_sold.columns:
         sold = sf_sold.copy()
         sold["_deal_key"] = norm_id_series(sold["Deal Loan Number"])
@@ -1056,6 +1066,7 @@ def build_term_loan(
             out["Loan Buyer"] = out["Sold Loan: Sold To"]
             out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
 
+    # Active RM fallback
     if "Active RM" not in out.columns:
         out["Active RM"] = ""
     if out["Active RM"].isna().all():
@@ -1067,6 +1078,7 @@ def build_term_loan(
             out["Active RM"] = out["Active RM"].fillna(out["CAF Originator"]).fillna("")
             out = out.drop(columns=["CAF Originator"], errors="ignore")
 
+    # Asset Manager
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
@@ -1083,6 +1095,7 @@ def build_term_loan(
     else:
         out["Asset Manager"] = ""
 
+    # Servicer join (loan-level values)
     out["Servicer ID"] = sf_term["Servicer Commitment Id"] if "Servicer Commitment Id" in sf_term.columns else None
     out["_sid_key"] = id_key_no_leading_zeros(out["Servicer ID"].astype("string"))
 
@@ -1103,6 +1116,7 @@ def build_term_loan(
         out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"]).fillna("")
         out = out.drop(columns=["_servicer_file"], errors="ignore")
 
+    # Carry forward REO Date
     out["REO Date"] = ""
     if "term_loan_reo" in prev_maps:
         reo = prev_maps["term_loan_reo"][["_deal_key", "REO Date"]].copy()
@@ -1110,6 +1124,7 @@ def build_term_loan(
         out["REO Date"] = out["REO Date_prev"].fillna("")
         out = out.drop(columns=["REO Date_prev"], errors="ignore")
 
+    # REO balance fallback (if REO Date exists and servicer UPB missing/0)
     if "term_loan_upb" in prev_maps and upb_col in out.columns:
         prevu = prev_maps["term_loan_upb"].copy()
         out = out.merge(prevu, on="_deal_key", how="left")
@@ -1236,6 +1251,7 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
         }
     ).reset_index(drop=True)
 
+    # Carry forward manual cols
     if "bridge_loan_manual" in prev_maps and not out.empty:
         man = prev_maps["bridge_loan_manual"].copy()
         out2 = out.copy()
@@ -1397,6 +1413,10 @@ st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
 st.subheader(hey())
 
+# Always use today's date for UPB header
+run_dt = today_et()
+upb_col = make_upb_header(run_dt)
+
 st.markdown(
     f"""
 Welcome! This tool builds the **Active Loans** workbook using **Salesforce report pulls** and **servicer uploads**.
@@ -1407,26 +1427,18 @@ Welcome! This tool builds the **Active Loans** workbook using **Salesforce repor
 3) Log in to **Salesforce** when prompted  
 4) Choose **which sheet to build** (fast) or **All** (slower)
 
-### Template
-This app uses the built-in template file in the repo:
-**{TEMPLATE_FILENAME}**
+### Template (from GitHub repo)
+This app always uses: **{TEMPLATE_FILENAME}**
+
+### UPB header date
+This run will use **today's date** (ET): **{run_dt.isoformat()}** → header **{upb_col}**
 """
 )
 
-# Show template status + allow download of the built-in template (no upload required)
+# Validate template presence early, and show path for clarity
 try:
-    _tmpl_bytes_preview, _tmpl_path_used = load_default_template_bytes()
-    st.success(f"✅ Template found in repo: {_tmpl_path_used}")
-    with st.expander("Template details"):
-        st.caption("If anything looks off, confirm you committed the right file name + location in GitHub.")
-        st.code(_tmpl_path_used)
-        st.download_button(
-            "Download the built-in template",
-            data=_tmpl_bytes_preview,
-            file_name=TEMPLATE_FILENAME,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+    _tmpl_bytes_preview, _tmpl_path_used = load_repo_template_bytes()
+    st.success(f"✅ Using repo template: {_tmpl_path_used}")
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -1462,16 +1474,6 @@ if use_sf:
             st.session_state.sf_token = None
             st.rerun()
 
-name_guess = date.today()
-if servicer_uploads:
-    dts = [date_from_filename(u.name) for u in servicer_uploads]
-    dts = [d for d in dts if d]
-    if dts:
-        name_guess = max(dts)
-
-use_filename_date = st.checkbox("Use filename date for UPB header (recommended)", value=True)
-manual_run_date = st.date_input("UPB header date (M/D UPB)", value=name_guess, disabled=use_filename_date)
-
 if st.button("Clear cached Salesforce reports", type="secondary"):
     st.session_state.report_cache = {}
     st.success("Cleared Salesforce report cache for this session.")
@@ -1495,12 +1497,9 @@ if build_btn:
     with st.spinner("Parsing servicer files..."):
         serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
 
-    run_dt = detected_run_date if use_filename_date else manual_run_date
-    upb_col = make_upb_header(run_dt)
-
     st.markdown("### Servicer lookup preview")
-    st.caption(f"Detected run date from filenames: **{detected_run_date.isoformat()}**")
-    st.caption(f"UPB column header to be used: **{upb_col}**")
+    st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
+    st.caption(f"UPB header (always today): **{upb_col}**")
     st.dataframe(serv_full.head(30), use_container_width=True)
 
     if use_sf:
@@ -1575,12 +1574,13 @@ if build_btn:
     if term_loan is not None and upb_col in term_loan.columns:
         st.write(f"Term Loan servicer-join match rate (UPB): {term_loan[upb_col].notna().mean():.1%}")
 
-    # ✅ Template now comes from repo (no upload)
-    tmpl_bytes, tmpl_path_used = load_default_template_bytes()
+    # Load template from repo (no upload)
+    tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
 
     wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
     wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
 
+    # Update UPB header + date row for each relevant sheet
     for sheet in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]:
         if sheet in wb.sheetnames and sheet in wb_vals.sheetnames:
             set_upb_header_in_sheet(wb[sheet], wb_vals[sheet], upb_col, header_row=4)
@@ -1621,7 +1621,7 @@ if build_btn:
 
     fname_target = build_target.replace(" ", "_")
     st.success("✅ Workbook built")
-    st.caption(f"Built using template from: {tmpl_path_used}")
+    st.caption(f"Built from repo template: {tmpl_path_used}")
     st.download_button(
         "Download",
         data=out_bytes.getvalue(),
