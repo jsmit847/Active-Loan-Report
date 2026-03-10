@@ -299,7 +299,7 @@ def ensure_sf_session() -> Salesforce:
     client_secret = cfg.get("client_secret")
 
     # ✅ Default to your My Domain host if not provided
-    auth_host = cfg.get("auth_host", https://active-loan-report.streamlit.app/").rstrip("/")
+    auth_host = cfg.get("auth_host", "https://active-loan-report.streamlit.app/").rstrip("/")
 
     # DO NOT strip/normalize; callback matching is picky
     redirect_uri = cfg["redirect_uri"]
