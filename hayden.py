@@ -1,24 +1,21 @@
 # ============================================================
-# Active Loans Report Builder — ONE FILE (Streamlit) — MYDOMAIN AUTH FIX
+# Active Loans Report Builder — ONE FILE (Streamlit) — LOGIN FIXED (HUD STYLE)
 #
-# ✅ Uses the SAME PKCE OAuth pattern as your HUD Generator app
-# ✅ Defaults auth_host to your My Domain:
-#       https://cvest.my.salesforce.com
-# ✅ Also shows a fallback login link to:
-#       https://login.salesforce.com
-#    (helpful if a user’s org/network blocks My Domain auth endpoints)
+# Fix:
+# ✅ Make redirect_uri behave EXACTLY like the HUD app:
+#    - redirect_uri is normalized with rstrip("/")
+#    - same normalized redirect used for BOTH authorize + token exchange
 #
-# IMPORTANT (this is usually the root cause):
-# - In Salesforce Connected App, the "Callback URL" must EXACTLY match
-#   st.secrets["salesforce"]["redirect_uri"] (including trailing slash or not).
+# Why this matters:
+# - Salesforce Connected App callback URL must match redirect_uri EXACTLY.
+# - Trailing slash mismatch commonly causes state mismatch -> "login link expired".
 #
 # Secrets required in .streamlit/secrets.toml
 #   [salesforce]
 #   client_id = "..."
-#   redirect_uri = "https://active-loan-report.streamlit.app/"   # EXACT match to Connected App
-#   # optional
-#   auth_host = "https://cvest.my.salesforce.com"                # defaulted in code if omitted
-#   client_secret = "..."   # only if your connected app requires it
+#   auth_host  = "https://cvest.my.salesforce.com"   # ok
+#   redirect_uri = "https://active-loan-report.streamlit.app/"  # ok (we normalize)
+#   client_secret = "..."   # only if connected app requires it
 # ============================================================
 
 import base64
@@ -208,7 +205,7 @@ def make_upb_header(run_dt: date) -> str:
 
 
 # =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE) — HUD-GENERATOR STYLE + MYDOMAIN DEFAULT
+# SALESFORCE AUTH (OAuth + PKCE) — EXACTLY HUD STYLE
 # =============================================================================
 def b64url_no_pad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
@@ -225,10 +222,122 @@ def make_challenge(verifier: str) -> str:
 
 @st.cache_resource
 def pkce_store():
-    # Mirrors your HUD Generator approach.
     return {}
 
 
+def exchange_code_for_token(token_url: str, code: str, verifier: str, client_id: str, redirect_uri: str, client_secret: Optional[str]):
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code": code,
+        "code_verifier": verifier,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+
+    resp = requests.post(token_url, data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
+def ensure_sf_session() -> Salesforce:
+    cfg = st.secrets["salesforce"]
+
+    CLIENT_ID = cfg["client_id"]
+    AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
+    # ✅ THIS IS THE BIG FIX: match HUD behavior exactly
+    REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
+    CLIENT_SECRET = cfg.get("client_secret")
+
+    AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
+    TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
+
+    qp = st.query_params
+    code = qp.get("code")
+    state = qp.get("state")
+    err = qp.get("error")
+    err_desc = qp.get("error_description")
+
+    if err:
+        st.error(f"Login error: {err}")
+        if err_desc:
+            st.code(err_desc)
+        st.stop()
+
+    if "sf_token" not in st.session_state:
+        st.session_state.sf_token = None
+
+    store = pkce_store()
+
+    # TTL cleanup (HUD behavior)
+    now = time.time()
+    TTL = 900
+    for s, (_v, t0) in list(store.items()):
+        if now - t0 > TTL:
+            store.pop(s, None)
+
+    # Callback
+    if code:
+        if not state or state not in store:
+            st.error("Login link expired. Click login again.")
+            st.stop()
+        verifier, _t0 = store.pop(state)
+        tok = exchange_code_for_token(TOKEN_URL, code, verifier, CLIENT_ID, REDIRECT_URI, CLIENT_SECRET)
+        st.session_state.sf_token = tok
+        st.query_params.clear()
+        st.rerun()
+
+    # Not logged in -> show login link
+    if not st.session_state.sf_token:
+        new_state = secrets.token_urlsafe(24)
+        new_verifier = make_verifier()
+        new_challenge = make_challenge(new_verifier)
+        store[new_state] = (new_verifier, time.time())
+
+        login_params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": new_challenge,
+            "code_challenge_method": "S256",
+            "state": new_state,
+            "prompt": "login",
+            "scope": "api refresh_token",
+        }
+        login_url = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
+
+        st.info("Step 1: Log in to Salesforce.")
+        st.link_button("Login", login_url)
+
+        # Debug view that will immediately show if you’re accidentally using a different redirect_uri
+        with st.expander("Debug (OAuth values being used)"):
+            st.write("AUTH_HOST:")
+            st.code(AUTH_HOST)
+            st.write("REDIRECT_URI (normalized):")
+            st.code(REDIRECT_URI)
+            st.write("AUTH_URL:")
+            st.code(AUTH_URL)
+            st.write("TOKEN_URL:")
+            st.code(TOKEN_URL)
+
+        st.stop()
+
+    tok = st.session_state.sf_token
+    access_token = tok.get("access_token")
+    instance_url = tok.get("instance_url")
+
+    if not access_token or not instance_url:
+        st.error("Login token missing needed values.")
+        st.stop()
+
+    return Salesforce(instance_url=instance_url, session_id=access_token)
+
+
+# =============================================================================
+# SALESFORCE REPORT PULL (REST)
+# =============================================================================
 def _is_perm_error(msg: str) -> bool:
     m = (msg or "").lower()
     needles = [
@@ -249,141 +358,6 @@ def _is_perm_error(msg: str) -> bool:
     return any(n in m for n in needles)
 
 
-def _exchange_code_for_token(
-    token_url: str,
-    code: str,
-    verifier: str,
-    client_id: str,
-    redirect_uri: str,
-    client_secret: Optional[str] = None,
-) -> dict:
-    data = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code": code,
-        "code_verifier": verifier,
-    }
-    if client_secret:
-        data["client_secret"] = client_secret
-
-    resp = requests.post(token_url, data=data, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
-    return resp.json()
-
-
-def _build_login_url(auth_host: str, client_id: str, redirect_uri: str, state: str, challenge: str) -> str:
-    auth_host = (auth_host or "").rstrip("/")
-    auth_url = f"{auth_host}/services/oauth2/authorize"
-    login_params = {
-        "response_type": "code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "state": state,
-        "prompt": "login",
-        "scope": "api refresh_token",
-    }
-    return auth_url + "?" + urllib.parse.urlencode(login_params)
-
-
-def ensure_sf_session() -> Salesforce:
-    cfg = st.secrets.get("salesforce")
-    if not cfg:
-        st.error("Missing Salesforce secrets. Add a [salesforce] section to .streamlit/secrets.toml")
-        st.stop()
-
-    client_id = cfg["client_id"]
-    client_secret = cfg.get("client_secret")
-
-    # ✅ Default to your My Domain host if not provided
-    auth_host = cfg.get("auth_host","https://login.salesforce.com").rstrip("/")
-
-    # DO NOT strip/normalize; callback matching is picky
-    redirect_uri = cfg["redirect_uri"]
-
-    token_url = f"{auth_host}/services/oauth2/token"
-
-    qp = st.query_params
-    code = qp.get("code")
-    state = qp.get("state")
-    err = qp.get("error")
-    err_desc = qp.get("error_description")
-
-    if err:
-        st.error(f"Login error: {err}")
-        if err_desc:
-            st.code(err_desc)
-        st.stop()
-
-    if "sf_token" not in st.session_state:
-        st.session_state.sf_token = None
-
-    store = pkce_store()
-
-    # TTL cleanup
-    now = time.time()
-    ttl = 900
-    for s, (_v, t0) in list(store.items()):
-        if now - t0 > ttl:
-            store.pop(s, None)
-
-    # OAuth callback
-    if code:
-        if not state or state not in store:
-            st.error("Login link expired. Click login again.")
-            st.stop()
-
-        verifier, _t0 = store.pop(state)
-        tok = _exchange_code_for_token(token_url, code, verifier, client_id, redirect_uri, client_secret)
-        st.session_state.sf_token = tok
-        st.query_params.clear()
-        st.rerun()
-
-    # Not logged in => show login links
-    if not st.session_state.sf_token:
-        new_state = secrets.token_urlsafe(24)
-        verifier = make_verifier()
-        challenge = make_challenge(verifier)
-        store[new_state] = (verifier, time.time())
-
-        # Primary: My Domain
-        login_url_primary = _build_login_url(auth_host, client_id, redirect_uri, new_state, challenge)
-
-        # Fallback: login.salesforce.com (some environments behave better here)
-        fallback_host = "https://login.salesforce.com"
-        login_url_fallback = _build_login_url(fallback_host, client_id, redirect_uri, new_state, challenge)
-
-        st.info("Step 1: Log in to Salesforce to pull reports.")
-        st.link_button("Login (My Domain: cvest.my.salesforce.com)", login_url_primary)
-        st.caption("If the My Domain button doesn’t load for you, try the fallback login:")
-        st.link_button("Login (Fallback: login.salesforce.com)", login_url_fallback)
-
-        with st.expander("Troubleshooting: what must match"):
-            st.write("**redirect_uri from secrets:**")
-            st.code(str(redirect_uri))
-            st.write("**auth_host being used:**")
-            st.code(str(auth_host))
-            st.write("Make sure Connected App Callback URL matches redirect_uri EXACTLY (including trailing slash).")
-
-        st.stop()
-
-    tok = st.session_state.sf_token
-    access_token = tok.get("access_token")
-    instance_url = tok.get("instance_url")
-
-    if not access_token or not instance_url:
-        st.error("Login token missing needed values.")
-        st.stop()
-
-    return Salesforce(instance_url=instance_url, session_id=access_token)
-
-
-# =============================================================================
-# SALESFORCE REPORT PULL (REST)
-# =============================================================================
 def sf_restful_safe(sf: Salesforce, path: str, method: str = "GET") -> dict:
     try:
         return sf.restful(path, method=method)
@@ -1135,38 +1109,11 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, sf_spine: pd.DataFrame, upb_co
     ).reset_index(drop=True)
 
     out["Special Focus (Y/N)"] = out["Special Focus (Y/N)"].replace({"": "N"}).fillna("N")
-
-    if "Deal Loan Number" in sf_spine.columns:
-        deal = sf_spine.copy()
-        deal["_deal_key"] = norm_id_series(deal["Deal Loan Number"])
-        keep = ["_deal_key"]
-        for c in ["Loan Commitment", "Total Remaining Commitment Amount", "Comments AM"]:
-            if c in deal.columns:
-                keep.append(c)
-        if len(keep) > 1:
-            deal = deal[keep].drop_duplicates("_deal_key")
-            out = out.merge(deal, on="_deal_key", how="left")
-            if "Total Remaining Commitment Amount" in out.columns:
-                out["Remaining Commitment"] = out["Total Remaining Commitment Amount"]
-            if "Comments AM" in out.columns:
-                out["AM Commentary"] = out["Comments AM"]
-            out = out.drop(columns=["Total Remaining Commitment Amount", "Comments AM"], errors="ignore")
-
-    if "bridge_loan_manual" in prev_maps:
-        man = prev_maps["bridge_loan_manual"].copy()
-        out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
-        for c in ["State(s)", "Loan Level Delinquency", "Special Focus (Y/N)"]:
-            if f"{c}_prev" in out.columns:
-                out[c] = out[f"{c}_prev"].fillna(out.get(c, ""))
-                out = out.drop(columns=[f"{c}_prev"], errors="ignore")
-
-    out["Special Focus (Y/N)"] = out["Special Focus (Y/N)"].replace({"": "N"}).fillna("N")
-
     return out.drop(columns=["_deal_key"], errors="ignore")
 
 
 # =============================================================================
-# EXCEL OUTPUT (template-based; preserve formulas; dynamic UPB header + run date)
+# EXCEL OUTPUT HELPERS
 # =============================================================================
 def header_tuples_from_ws(ws_values, header_row: int = 4) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
@@ -1319,25 +1266,12 @@ Welcome! This tool builds the **Active Loans** workbook using **Salesforce repor
 """
 )
 
-st.info(
-    f"{PRIMARY_USER_NAME}, if you ever see **Login link expired**, it almost always means the callback URL "
-    "doesn’t match exactly, or the app reran and generated a new state before the callback returned."
-)
-
-# Inputs
 colA, colB = st.columns([1.3, 1.0])
 with colA:
     template_upload = st.file_uploader("Upload Active Loans TEMPLATE (.xlsx)", type=["xlsx"])
-    prev_upload = st.file_uploader(
-        "Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)",
-        type=["xlsx"],
-    )
+    prev_upload = st.file_uploader("Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)", type=["xlsx"])
 with colB:
-    servicer_uploads = st.file_uploader(
-        "Upload current servicer files (csv/xlsx)",
-        type=["csv", "xlsx"],
-        accept_multiple_files=True,
-    )
+    servicer_uploads = st.file_uploader("Upload current servicer files (csv/xlsx)", type=["csv", "xlsx"], accept_multiple_files=True)
 
 build_target = st.selectbox(
     "Which sheet do you want to build right now?",
@@ -1345,7 +1279,6 @@ build_target = st.selectbox(
     index=0,
 )
 
-# Salesforce login
 use_sf = st.checkbox("Use Salesforce (recommended)", value=True)
 sf = None
 if use_sf:
@@ -1361,7 +1294,6 @@ if use_sf:
             st.session_state.sf_token = None
             st.rerun()
 
-# Run-date for UPB header (default = max filename date)
 name_guess = date.today()
 if servicer_uploads:
     dts = [date_from_filename(u.name) for u in servicer_uploads]
@@ -1391,13 +1323,11 @@ if build_btn:
         st.error("Salesforce login is required (or uncheck the Salesforce option).")
         st.stop()
 
-    # Prev maps
     prev_maps: dict = {}
     if prev_upload:
         with st.spinner("Reading last week's report (carry-forward)..."):
             prev_maps = build_prev_maps(prev_upload.getvalue())
 
-    # Servicer parse
     with st.spinner("Parsing servicer files..."):
         serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
 
@@ -1409,7 +1339,6 @@ if build_btn:
     st.caption(f"UPB column header to be used: **{upb_col}**")
     st.dataframe(serv_full.head(30), use_container_width=True)
 
-    # Pull only needed reports
     if use_sf:
         need = required_report_keys(build_target)
         dfs = pull_reports(sf, need)
@@ -1417,7 +1346,6 @@ if build_btn:
         st.error("This version requires Salesforce API pulls.")
         st.stop()
 
-    # Build required DFs
     bridge_asset = None
     bridge_loan = None
     term_loan = None
@@ -1447,12 +1375,7 @@ if build_btn:
                 upb_col,
             )
         with st.spinner("Building Bridge Loan..."):
-            bridge_loan = build_bridge_loan(
-                bridge_asset,
-                dfs.get("bridge_maturity", pd.DataFrame()),
-                upb_col,
-                prev_maps,
-            )
+            bridge_loan = build_bridge_loan(bridge_asset, dfs.get("bridge_maturity", pd.DataFrame()), upb_col, prev_maps)
 
     if build_target in ("Term Loan", "Term Asset", "All"):
         with st.spinner("Building Term Loan..."):
@@ -1480,14 +1403,12 @@ if build_btn:
         with st.spinner("Building Term Asset..."):
             term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
 
-    # Diagnostics
     st.subheader("Diagnostics")
     if bridge_asset is not None and "_loan_upb" in bridge_asset.columns:
         st.write(f"Bridge Asset servicer-join match rate (UPB): {bridge_asset['_loan_upb'].notna().mean():.1%}")
     if term_loan is not None and upb_col in term_loan.columns:
         st.write(f"Term Loan servicer-join match rate (UPB): {term_loan[upb_col].notna().mean():.1%}")
 
-    # Output workbook
     tmpl_bytes = template_upload.getvalue()
     wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
     wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
