@@ -37,6 +37,16 @@ from simple_salesforce import Salesforce
 
 
 # =============================================================================
+# PERSONALIZATION (Primary user)
+# =============================================================================
+PRIMARY_USER_NAME = "Hayden"
+
+
+def hey(name: str = PRIMARY_USER_NAME) -> str:
+    return f"Hi {name} 👋"
+
+
+# =============================================================================
 # SALESFORCE REPORTS (IDs you gave)
 # =============================================================================
 REPORTS: Dict[str, Tuple[str, str]] = {
@@ -915,7 +925,17 @@ def build_bridge_asset(
                     "maturity_date": "Servicer Maturity Date",
                     "status": "Servicer Status",
                 }
-            )[["_serv_id_key", "Servicer", "_loan_upb", "_loan_suspense", "Next Payment Date", "Servicer Maturity Date", "Servicer Status"]],
+            )[
+                [
+                    "_serv_id_key",
+                    "Servicer",
+                    "_loan_upb",
+                    "_loan_suspense",
+                    "Next Payment Date",
+                    "Servicer Maturity Date",
+                    "Servicer Status",
+                ]
+            ],
             on="_serv_id_key",
             how="left",
         )
@@ -1043,7 +1063,10 @@ def build_term_loan(
             }
         )[["_sid", "_servicer_file", upb_col, "Next Payment Date", "Maturity Date"]]
 
-        out = out.merge(s2, left_on=out["_serv_id_key_mid"], right_on="_sid", how="left").drop(columns=["_sid", "key_0"], errors="ignore")
+        out = (
+            out.merge(s2, left_on=out["_serv_id_key_mid"], right_on="_sid", how="left")
+            .drop(columns=["_sid", "key_0"], errors="ignore")
+        )
 
         out["Servicer"] = out.get("Servicer", pd.Series(["" for _ in range(len(out))], dtype="string"))
         out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"]).fillna("")
@@ -1353,17 +1376,26 @@ def pull_reports(sf: Salesforce, keys: Set[str]) -> Dict[str, pd.DataFrame]:
 # =============================================================================
 st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
+st.subheader(hey())
 
 st.markdown(
-    """
-**How this app works**
-- Upload the Active Loans TEMPLATE workbook (.xlsx)
-- Upload current servicer files (csv/xlsx)
-- Log in to Salesforce and the app will pull the reports by ID
+    f"""
+Welcome! This tool builds the **Active Loans** workbook for you using **Salesforce report pulls** and (optionally) **servicer uploads**.
 
-**Speed mode**
-Build **one sheet at a time** (Bridge Asset / Bridge Loan / Term Loan / Term Asset). This avoids writing 4 huge sheets every run.
+### What you’ll do
+1) Upload the **Active Loans TEMPLATE** workbook  
+2) Upload the **current servicer files** (if you have them)  
+3) Log in to **Salesforce** when prompted  
+4) Choose **which sheet to build** (fast) or build **all sheets** (slower)
+
+### Speed tip
+If you’re in a hurry, build **one sheet at a time** — you’ll get a download immediately for just that tab.
 """
+)
+
+st.info(
+    f"{PRIMARY_USER_NAME}, if anything looks off (missing rows, weird dates, UPB blank), "
+    "download the single-sheet file and we’ll diagnose that tab first."
 )
 
 # Inputs
@@ -1381,7 +1413,7 @@ build_target = st.selectbox(
 )
 
 # Salesforce login
-use_sf = st.checkbox("Pull Salesforce via API", value=True)
+use_sf = st.checkbox("Use Salesforce (recommended)", value=True)
 sf = None
 if use_sf:
     sf = ensure_sf_session()
