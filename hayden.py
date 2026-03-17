@@ -1953,6 +1953,11 @@ def write_df_to_sheet_preserve_formulas(
             df_out[h] = None
     df_out = df_out[headers]
 
+    # EXACT FIX:
+    # Convert pandas missing values like pd.NA / NaT to plain Python None
+    # before iterating into openpyxl, because openpyxl cannot write <NA>.
+    df_out = df_out.astype(object).where(pd.notna(df_out), None)
+
     clear_columns(ws_formula, col_indices, start_row=start_row)
 
     for r_offset, row in enumerate(df_out.itertuples(index=False, name=None), start=0):
