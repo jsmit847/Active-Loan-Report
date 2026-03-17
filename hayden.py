@@ -1,17 +1,17 @@
 # ============================================================
 # Active Loans Report Builder — ONE FILE (Streamlit)
 #
-# Update in this version:
-# ✅ Cache parsed servicer results with st.cache_data so reruns / repeat Builds are MUCH faster.
-#    - Cache key = (filename + file_hash) as requested.
-# ✅ Still uses repo template (NO upload): "Active Loan Report Template.xlsx"
-# ✅ UPB header ALWAYS uses TODAY'S date (America/New_York).
-#
-# Requirements.txt: ✅ nothing new required for caching (built into Streamlit)
+# Features
+# - Salesforce OAuth (PKCE) login
+# - Salesforce Bulk API 2.0 for large pulls
+# - Optional servicer file parsing (can be skipped)
+# - Repo template workbook (no template upload)
+# - Uses today's ET date for UPB header
 # ============================================================
 
 import base64
 import hashlib
+import io
 import re
 import secrets
 import time
@@ -30,9 +30,8 @@ import streamlit as st
 from openpyxl import load_workbook
 from simple_salesforce import Salesforce
 
-
 # =============================================================================
-# PERSONALIZATION (Primary user)
+# PERSONALIZATION
 # =============================================================================
 PRIMARY_USER_NAME = "Hayden"
 
@@ -42,16 +41,15 @@ def hey(name: str = PRIMARY_USER_NAME) -> str:
 
 
 # =============================================================================
-# TEMPLATE (FROM REPO — NO UPLOAD)
+# TEMPLATE / REFERENCE FILES
 # =============================================================================
 TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
+REFERENCE_WORKBOOK_FILENAME = "20260302 Active Loans_Bridge Asset Column Mapping.xlsx"
+API_VERSION = "v66.0"
 
 
 @st.cache_data(show_spinner=False)
 def load_repo_template_bytes() -> Tuple[bytes, str]:
-    """
-    Loads the template workbook from the repository (no user upload).
-    """
     here = Path(__file__).resolve().parent
     candidates = [
         here / TEMPLATE_FILENAME,
@@ -68,20 +66,77 @@ def load_repo_template_bytes() -> Tuple[bytes, str]:
         except Exception:
             continue
 
-    tried = "\n".join([str(p) for p in candidates])
+    tried = "\n".join(str(p) for p in candidates)
     raise FileNotFoundError(
-        f"Could not find '{TEMPLATE_FILENAME}' in your repo.\n\nTried:\n{tried}\n\n"
-        f"Fix: Commit '{TEMPLATE_FILENAME}' to your GitHub repo (same folder as this app.py is best)."
+        f"Could not find '{TEMPLATE_FILENAME}' in your repo.\n\n"
+        f"Tried:\n{tried}\n\n"
+        f"Fix: Commit '{TEMPLATE_FILENAME}' to your GitHub repo."
     )
+
+
+@st.cache_data(show_spinner=False)
+def load_reference_workbook_tables() -> dict:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / REFERENCE_WORKBOOK_FILENAME,
+        here / "assets" / REFERENCE_WORKBOOK_FILENAME,
+        here / "templates" / REFERENCE_WORKBOOK_FILENAME,
+        Path.cwd() / REFERENCE_WORKBOOK_FILENAME,
+        Path(REFERENCE_WORKBOOK_FILENAME),
+    ]
+
+    path = None
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                path = p
+                break
+        except Exception:
+            continue
+
+    if path is None:
+        return {
+            "source_path": None,
+            "strategy_grouping_map": {},
+            "legacy_term_keys": set(),
+        }
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    try:
+        strategy_grouping_map: Dict[str, str] = {}
+        legacy_term_keys: Set[str] = set()
+
+        if "Strategy Groupings" in wb.sheetnames:
+            ws = wb["Strategy Groupings"]
+            for row in ws.iter_rows(min_row=5, values_only=True):
+                strategy = row[1] if len(row) > 1 else None
+                grouping = row[2] if len(row) > 2 else None
+                if strategy and grouping:
+                    strategy_grouping_map[str(strategy).strip()] = str(grouping).strip()
+
+        if "Legacy" in wb.sheetnames:
+            ws = wb["Legacy"]
+            for row in ws.iter_rows(min_row=6, values_only=True):
+                term_deal = row[6] if len(row) > 6 else None
+                if term_deal is not None and str(term_deal).strip() != "":
+                    legacy_term_keys.add(str(term_deal).strip().replace(".0", ""))
+
+        return {
+            "source_path": str(path),
+            "strategy_grouping_map": strategy_grouping_map,
+            "legacy_term_keys": legacy_term_keys,
+        }
+    finally:
+        wb.close()
 
 
 def today_et() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
-API_VERSION = "v66.0"
-REFERENCE_WORKBOOK_FILENAME = "20260302 Active Loans_Bridge Asset Column Mapping.xlsx"
-
+# =============================================================================
+# REPORTS / LABEL MAPS
+# =============================================================================
 REPORTS: Dict[str, Tuple[str, str]] = {
     "bridge_maturity": ("Bridge Maturity Report v3", "00O5b000005s0aFEAQ"),
     "do_not_lend": ("Do Not Lend", "00OPK000005tu3V2AQ"),
@@ -93,7 +148,7 @@ REPORTS: Dict[str, Tuple[str, str]] = {
     "term_asset": ("Term Asset Level - By Deal", "00OPK00000DRwy52AD"),
 }
 
-# Active RM intentionally removed here. It comes from separate dataset.
+# Active RM intentionally NOT here; merged separately from its own dataset
 BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
@@ -199,6 +254,109 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 }
 
 
+# =============================================================================
+# NORMALIZATION
+# =============================================================================
+def norm_id_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.replace(r"[^0-9A-Za-z]", "", regex=True)
+        .replace({"": pd.NA})
+    )
+
+
+def id_key_no_leading_zeros(s: pd.Series) -> pd.Series:
+    out = norm_id_series(s)
+    out = out.astype("string").str.lstrip("0")
+    return out.replace({"": pd.NA})
+
+
+def money_to_float(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    s = str(x)
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def to_dt(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return pd.NaT
+    return pd.to_datetime(x, errors="coerce")
+
+
+def make_upb_header(run_dt: date) -> str:
+    return f"{run_dt.month}/{run_dt.day} UPB"
+
+
+def is_reo_stage(val) -> bool:
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return "reo" in s and s != ""
+
+
+def has_any_value(val) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, float) and np.isnan(val):
+        return False
+    if isinstance(val, str) and val.strip() == "":
+        return False
+    return True
+
+
+def _yn_from_bool_series(s: pd.Series) -> pd.Series:
+    return s.fillna(False).map(lambda x: "Y" if bool(x) else "N")
+
+
+# =============================================================================
+# SALESFORCE AUTH (OAuth + PKCE)
+# =============================================================================
+def b64url_no_pad(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
+
+
+def make_verifier() -> str:
+    v = secrets.token_urlsafe(96)
+    return v[:128]
+
+
+def make_challenge(verifier: str) -> str:
+    return b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
+
+
+@st.cache_resource
+def pkce_store():
+    return {}
+
+
+def exchange_code_for_token(
+    token_url: str,
+    code: str,
+    verifier: str,
+    client_id: str,
+    redirect_uri: str,
+    client_secret: Optional[str],
+):
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code": code,
+        "code_verifier": verifier,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+
+    resp = requests.post(token_url, data=data, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
 def show_salesforce_login_helper():
     st.info(
         "Step 1: Log in to Salesforce.\n\n"
@@ -207,6 +365,85 @@ def show_salesforce_login_helper():
     )
 
 
+def ensure_sf_session() -> Salesforce:
+    cfg = st.secrets["salesforce"]
+
+    CLIENT_ID = cfg["client_id"]
+    AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
+    REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
+    CLIENT_SECRET = cfg.get("client_secret")
+
+    AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
+    TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
+
+    qp = st.query_params
+    code = qp.get("code")
+    state = qp.get("state")
+    err = qp.get("error")
+    err_desc = qp.get("error_description")
+
+    if err:
+        st.error(f"Login error: {err}")
+        if err_desc:
+            st.code(err_desc)
+        st.stop()
+
+    if "sf_token" not in st.session_state:
+        st.session_state.sf_token = None
+
+    store = pkce_store()
+
+    now = time.time()
+    TTL = 900
+    for s, (_v, t0) in list(store.items()):
+        if now - t0 > TTL:
+            store.pop(s, None)
+
+    if code:
+        if not state or state not in store:
+            st.error("Login link expired. Click login again.")
+            st.stop()
+        verifier, _t0 = store.pop(state)
+        tok = exchange_code_for_token(TOKEN_URL, code, verifier, CLIENT_ID, REDIRECT_URI, CLIENT_SECRET)
+        st.session_state.sf_token = tok
+        st.query_params.clear()
+        st.rerun()
+
+    if not st.session_state.sf_token:
+        new_state = secrets.token_urlsafe(24)
+        new_verifier = make_verifier()
+        new_challenge = make_challenge(new_verifier)
+        store[new_state] = (new_verifier, time.time())
+
+        login_params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+            "code_challenge": new_challenge,
+            "code_challenge_method": "S256",
+            "state": new_state,
+            "prompt": "login",
+            "scope": "api refresh_token",
+        }
+        login_url = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
+
+        st.link_button("Login to Salesforce", login_url)
+        st.stop()
+
+    tok = st.session_state.sf_token
+    access_token = tok.get("access_token")
+    instance_url = tok.get("instance_url")
+
+    if not access_token or not instance_url:
+        st.error("Login token missing needed values.")
+        st.stop()
+
+    return Salesforce(instance_url=instance_url, session_id=access_token)
+
+
+# =============================================================================
+# BULK API 2.0 HELPERS
+# =============================================================================
 def _session_cache(bucket: str) -> dict:
     if bucket not in st.session_state:
         st.session_state[bucket] = {}
@@ -555,62 +792,9 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner=False)
-def load_reference_workbook_tables() -> dict:
-    base_dir = Path(__file__).resolve().parent
-    candidates = [
-        base_dir / REFERENCE_WORKBOOK_FILENAME,
-        base_dir / "assets" / REFERENCE_WORKBOOK_FILENAME,
-        base_dir / "templates" / REFERENCE_WORKBOOK_FILENAME,
-        Path.cwd() / REFERENCE_WORKBOOK_FILENAME,
-        Path("/mnt/data") / REFERENCE_WORKBOOK_FILENAME,
-    ]
-
-    path = None
-    for p in candidates:
-        if p.exists() and p.is_file():
-            path = p
-            break
-
-    if path is None:
-        return {
-            "source_path": None,
-            "strategy_grouping_map": {},
-            "special_asset_officers": set(),
-            "ssp_deal_keys": set(),
-            "legacy_bridge_keys": set(),
-            "legacy_term_keys": set(),
-        }
-
-    wb = load_workbook(path, data_only=True, read_only=True)
-    try:
-        strategy_grouping_map: Dict[str, str] = {}
-        legacy_term_keys: Set[str] = set()
-
-        if "Strategy Groupings" in wb.sheetnames:
-            ws = wb["Strategy Groupings"]
-            for row in ws.iter_rows(min_row=5, values_only=True):
-                strategy = row[1] if len(row) > 1 else None
-                grouping = row[2] if len(row) > 2 else None
-                if strategy and grouping:
-                    strategy_grouping_map[str(strategy).strip()] = str(grouping).strip()
-
-        if "Legacy" in wb.sheetnames:
-            ws = wb["Legacy"]
-            for row in ws.iter_rows(min_row=6, values_only=True):
-                term_deal = row[6] if len(row) > 6 else None
-                if term_deal is not None and str(term_deal).strip() != "":
-                    legacy_term_keys.add(str(term_deal).strip().replace(".0", ""))
-
-        return {
-            "source_path": str(path),
-            "strategy_grouping_map": strategy_grouping_map,
-            "legacy_term_keys": legacy_term_keys,
-        }
-    finally:
-        wb.close()
-
-
+# =============================================================================
+# BULK API DATA BUILDERS
+# =============================================================================
 def _build_bridge_maturity_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
@@ -803,34 +987,6 @@ def _build_am_assignments_like() -> pd.DataFrame:
     return df
 
 
-def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
-    if opp.empty:
-        return pd.DataFrame()
-
-    if which == "do_not_lend":
-        cols = [c for c in ["Deal Loan Number", "Do Not Lend", "Account Name"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "active_rm":
-        cols = [c for c in ["Deal Loan Number", "Deal Name", "CAF Originator"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "term_export":
-        cols = [c for c in [
-            "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name", "Do Not Lend",
-            "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator", "Deal Intro Sub-Source",
-            "Referral Source Account", "Referral Source Contact", "Comments AM", "Servicer Commitment Id",
-            "Current Servicer UPB", "Stage", "Type"
-        ] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "sold_term":
-        cols = [c for c in ["Deal Loan Number", "Deal Name", "Servicer Commitment Id", "Yardi ID", "Type", "Sold Loan: Sold To"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    raise KeyError(f"Unhandled opp-slice key: {which}")
-
-
 def _build_term_asset_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
@@ -857,6 +1013,34 @@ def _build_term_asset_like() -> pd.DataFrame:
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
     return df
+
+
+def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
+    if opp.empty:
+        return pd.DataFrame()
+
+    if which == "do_not_lend":
+        cols = [c for c in ["Deal Loan Number", "Do Not Lend", "Account Name"] if c in opp.columns]
+        return opp[cols].drop_duplicates()
+
+    if which == "active_rm":
+        cols = [c for c in ["Deal Loan Number", "Deal Name", "CAF Originator"] if c in opp.columns]
+        return opp[cols].drop_duplicates()
+
+    if which == "term_export":
+        cols = [c for c in [
+            "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name", "Do Not Lend",
+            "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator", "Deal Intro Sub-Source",
+            "Referral Source Account", "Referral Source Contact", "Comments AM", "Servicer Commitment Id",
+            "Current Servicer UPB", "Stage", "Type"
+        ] if c in opp.columns]
+        return opp[cols].drop_duplicates()
+
+    if which == "sold_term":
+        cols = [c for c in ["Deal Loan Number", "Deal Name", "Servicer Commitment Id", "Yardi ID", "Type", "Sold Loan: Sold To"] if c in opp.columns]
+        return opp[cols].drop_duplicates()
+
+    raise KeyError(f"Unhandled opp-slice key: {which}")
 
 
 def pull_reports(sf, keys: Set[str]) -> Dict[str, pd.DataFrame]:
@@ -912,332 +1096,8 @@ def pull_reports(sf, keys: Set[str]) -> Dict[str, pd.DataFrame]:
 
 
 # =============================================================================
-# NORMALIZATION
-# =============================================================================
-def norm_id_series(s: pd.Series) -> pd.Series:
-    return (
-        s.astype("string")
-        .str.strip()
-        .str.replace(r"\.0$", "", regex=True)
-        .str.replace(r"[^0-9A-Za-z]", "", regex=True)
-        .replace({"": pd.NA})
-    )
-
-
-def id_key_no_leading_zeros(s: pd.Series) -> pd.Series:
-    out = norm_id_series(s)
-    out = out.astype("string").str.lstrip("0")
-    return out.replace({"": pd.NA})
-
-
-def money_to_float(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return np.nan
-    s = str(x)
-    s = re.sub(r"[^0-9\.\-]", "", s)
-    return pd.to_numeric(s, errors="coerce")
-
-
-def to_dt(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return pd.NaT
-    return pd.to_datetime(x, errors="coerce")
-
-
-def make_upb_header(run_dt: date) -> str:
-    return f"{run_dt.month}/{run_dt.day} UPB"
-
-
-def is_reo_stage(val) -> bool:
-    if val is None:
-        return False
-    s = str(val).strip().lower()
-    return "reo" in s and s != ""
-
-
-def has_any_value(val) -> bool:
-    if val is None:
-        return False
-    if isinstance(val, float) and np.isnan(val):
-        return False
-    if isinstance(val, str) and val.strip() == "":
-        return False
-    return True
-
-
-# =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE) — HUD STYLE
-# =============================================================================
-def b64url_no_pad(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
-
-
-def make_verifier() -> str:
-    v = secrets.token_urlsafe(96)
-    return v[:128]
-
-
-def make_challenge(verifier: str) -> str:
-    return b64url_no_pad(hashlib.sha256(verifier.encode("utf-8")).digest())
-
-
-@st.cache_resource
-def pkce_store():
-    return {}
-
-
-def exchange_code_for_token(
-    token_url: str,
-    code: str,
-    verifier: str,
-    client_id: str,
-    redirect_uri: str,
-    client_secret: Optional[str],
-):
-    data = {
-        "grant_type": "authorization_code",
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "code": code,
-        "code_verifier": verifier,
-    }
-    if client_secret:
-        data["client_secret"] = client_secret
-
-    resp = requests.post(token_url, data=data, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
-    return resp.json()
-
-
-def ensure_sf_session() -> Salesforce:
-    cfg = st.secrets["salesforce"]
-
-    CLIENT_ID = cfg["client_id"]
-    AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
-    REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
-    CLIENT_SECRET = cfg.get("client_secret")
-
-    AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
-    TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
-
-    qp = st.query_params
-    code = qp.get("code")
-    state = qp.get("state")
-    err = qp.get("error")
-    err_desc = qp.get("error_description")
-
-    if err:
-        st.error(f"Login error: {err}")
-        if err_desc:
-            st.code(err_desc)
-        st.stop()
-
-    if "sf_token" not in st.session_state:
-        st.session_state.sf_token = None
-
-    store = pkce_store()
-
-    # TTL cleanup
-    now = time.time()
-    TTL = 900
-    for s, (_v, t0) in list(store.items()):
-        if now - t0 > TTL:
-            store.pop(s, None)
-
-    # Callback
-    if code:
-        if not state or state not in store:
-            st.error("Login link expired. Click login again.")
-            st.stop()
-        verifier, _t0 = store.pop(state)
-        tok = exchange_code_for_token(TOKEN_URL, code, verifier, CLIENT_ID, REDIRECT_URI, CLIENT_SECRET)
-        st.session_state.sf_token = tok
-        st.query_params.clear()
-        st.rerun()
-
-    # Not logged in -> show login link
-    if not st.session_state.sf_token:
-        new_state = secrets.token_urlsafe(24)
-        new_verifier = make_verifier()
-        new_challenge = make_challenge(new_verifier)
-        store[new_state] = (new_verifier, time.time())
-
-        login_params = {
-            "response_type": "code",
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
-            "code_challenge": new_challenge,
-            "code_challenge_method": "S256",
-            "state": new_state,
-            "prompt": "login",
-            "scope": "api refresh_token",
-        }
-        login_url = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
-
-        st.info("Step 1: Log in to Salesforce.")
-        st.link_button("Login", login_url)
-
-        with st.expander("Debug (OAuth values being used)"):
-            st.write("AUTH_HOST:")
-            st.code(AUTH_HOST)
-            st.write("REDIRECT_URI (normalized):")
-            st.code(REDIRECT_URI)
-            st.write("AUTH_URL:")
-            st.code(AUTH_URL)
-            st.write("TOKEN_URL:")
-            st.code(TOKEN_URL)
-
-        st.stop()
-
-    tok = st.session_state.sf_token
-    access_token = tok.get("access_token")
-    instance_url = tok.get("instance_url")
-
-    if not access_token or not instance_url:
-        st.error("Login token missing needed values.")
-        st.stop()
-
-    return Salesforce(instance_url=instance_url, session_id=access_token)
-
-
-# =============================================================================
-# SALESFORCE REPORT PULL (REST)
-# =============================================================================
-def _is_perm_error(msg: str) -> bool:
-    m = (msg or "").lower()
-    needles = [
-        "insufficient",
-        "permission",
-        "not authorized",
-        "not permitted",
-        "invalid_type",
-        "insufficient_access",
-        "insufficient access",
-        "insufficient_privileges",
-        "insufficient_access_on_cross_reference_entity",
-        "entity is not accessible",
-        "field is not accessible",
-        "no access",
-        "access denied",
-    ]
-    return any(n in m for n in needles)
-
-
-def sf_restful_safe(sf: Salesforce, path: str, method: str = "GET") -> dict:
-    try:
-        return sf.restful(path, method=method)
-    except Exception as e:
-        if _is_perm_error(str(e)):
-            st.warning(f"⚠️ Salesforce access issue for: {path}. Returning empty results for this item.")
-            return {}
-        raise
-
-
-def get_report_metadata(sf: Salesforce, report_id: str) -> dict:
-    return sf_restful_safe(sf, f"analytics/reports/{report_id}", method="GET")
-
-
-def run_report_page(sf: Salesforce, report_id: str, page: int, page_size: int) -> dict:
-    return sf_restful_safe(
-        sf,
-        f"analytics/reports/{report_id}?includeDetails=true&pageSize={page_size}&page={page}",
-        method="GET",
-    )
-
-
-def report_json_to_df(report_json: dict) -> pd.DataFrame:
-    if not report_json:
-        return pd.DataFrame()
-
-    rm = report_json.get("reportMetadata") or {}
-    em = report_json.get("reportExtendedMetadata") or {}
-    colinfo = em.get("detailColumnInfo") or {}
-    detail_cols = rm.get("detailColumns") or []
-
-    labels: List[str] = []
-    for col_key in detail_cols:
-        info = colinfo.get(col_key, {}) or {}
-        lbl = info.get("label") or col_key
-        labels.append(lbl)
-
-    factmap = report_json.get("factMap") or {}
-    block = factmap.get("T!T") or {}
-    rows = block.get("rows") or []
-
-    data_rows = []
-    for r in rows:
-        cells = r.get("dataCells") or []
-        vals = []
-        for c in cells:
-            v = c.get("label")
-            if v is None:
-                v = c.get("value")
-            vals.append(v)
-        if len(vals) < len(labels):
-            vals += [None] * (len(labels) - len(vals))
-        data_rows.append(vals[: len(labels)])
-
-    df = pd.DataFrame(data_rows, columns=labels)
-
-    if df.columns.duplicated().any():
-        seen: Dict[str, int] = {}
-        new_cols: List[str] = []
-        for c in df.columns:
-            if c not in seen:
-                seen[c] = 1
-                new_cols.append(c)
-            else:
-                seen[c] += 1
-                new_cols.append(f"{c} ({seen[c]})")
-        df.columns = new_cols
-
-    return df
-
-
-def run_report_all_rows(sf: Salesforce, report_id: str, page_size: int = 2000, max_pages: int = 5000) -> pd.DataFrame:
-    meta = get_report_metadata(sf, report_id)
-    if not meta:
-        return pd.DataFrame()
-
-    total_rows = (meta.get("attributes") or {}).get("reportTotalRows") or (meta.get("reportMetadata") or {}).get(
-        "reportTotalRows"
-    )
-
-    chunks: List[pd.DataFrame] = []
-    page = 0
-    total_seen = 0
-
-    while page < max_pages:
-        js = run_report_page(sf, report_id, page=page, page_size=page_size)
-        if not js:
-            break
-
-        df = report_json_to_df(js)
-        n = len(df)
-        if n == 0:
-            break
-
-        chunks.append(df)
-        total_seen += n
-
-        if isinstance(total_rows, int) and total_rows > 0 and total_seen >= total_rows:
-            break
-        if n < page_size:
-            break
-
-        page += 1
-
-    if not chunks:
-        return pd.DataFrame()
-
-    return pd.concat(chunks, ignore_index=True).drop_duplicates()
-
-
-# =============================================================================
 # SERVICER FILE PARSING (CACHED)
 # =============================================================================
-
 @dataclass(frozen=True)
 class UploadBlob:
     filename: str
@@ -1250,9 +1110,6 @@ def _md5_hex(b: bytes) -> str:
 
 
 def make_upload_blob(upload) -> UploadBlob:
-    """
-    UploadedFile -> UploadBlob (cache key uses filename + md5 hash).
-    """
     b = upload.getvalue()
     return UploadBlob(filename=upload.name, file_hash=_md5_hex(b), data=b)
 
@@ -1311,14 +1168,10 @@ def _corevest_pad_loan_number(raw: pd.Series) -> pd.Series:
 
 
 def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
-    """
-    Deterministic parser: input is just (filename, bytes).
-    """
     name = filename
     d_file = date_from_filename(name)
     as_of_file = pd.to_datetime(d_file) if d_file else pd.NaT
 
-    # CSV: CHL Streamline
     if name.lower().endswith(".csv"):
         df = pd.read_csv(BytesIO(b))
         req = {"Servicer Loan ID", "UPB"}
@@ -1341,7 +1194,6 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # XLSX: detect by columns (still works, but now cached so you only pay once per file)
     checks: List[Tuple[str, Set[str], Optional[Sequence[str]]]] = [
         ("CHL", {"Servicer Loan ID", "UPB"}, None),
         ("CoreVestLoanData", {"Loan Number", "Current UPB", "Due Date", "Maturity Date", "Loan Status"}, None),
@@ -1360,13 +1212,10 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             break
 
     if detected is None or sheet_name is None or header_row is None:
-        raise ValueError(
-            "Could not detect servicer file type from columns (FCI / CoreVestLoanData / CoreVest_Data_Tape / Midland / CHL Streamline)."
-        )
+        raise ValueError("Could not detect servicer file type.")
 
     df = pd.read_excel(BytesIO(b), sheet_name=sheet_name, header=header_row - 1)
 
-    # CHL Streamline (xlsx)
     if detected == "CHL":
         servicer = df.get("Servicing Company", pd.Series(["CHL Streamline"] * len(df))).astype("string")
         out = pd.DataFrame(
@@ -1384,7 +1233,6 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVestLoanData (Statebridge style)
     if detected == "CoreVestLoanData":
         needs_pad = "corevestloandata" in name.lower()
         sid = _corevest_pad_loan_number(df["Loan Number"]) if needs_pad else norm_id_series(df["Loan Number"])
@@ -1403,7 +1251,6 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # CoreVest Data Tape (Berkadia style)
     if detected == "CoreVest_Data_Tape":
         status = df.get("Loan Status", pd.Series(["Active"] * len(df))).astype("string")
         out = pd.DataFrame(
@@ -1421,7 +1268,6 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # FCI
     if detected == "FCI":
         out = pd.DataFrame(
             {
@@ -1438,7 +1284,6 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         )
         return out.dropna(subset=["servicer_id"])
 
-    # Midland
     if detected == "Midland":
         raw = df["ServicerLoanNumber"].astype("string").str.strip()
         raw = raw.str.replace(r"COM$", "", regex=True)
@@ -1462,10 +1307,9 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     raise ValueError("Unhandled servicer type.")
 
 
-# ✅ Cached parse: cache key is (filename + file_hash) exactly.
 @st.cache_data(
     show_spinner=False,
-    ttl=6 * 60 * 60,       # 6 hours
+    ttl=6 * 60 * 60,
     max_entries=128,
     hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"},
 )
@@ -1512,7 +1356,6 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_has_npd"] = full["next_payment_date"].notna().astype(int)
         full["_has_mat"] = full["maturity_date"].notna().astype(int)
 
-        # Choose best row per loan: latest as_of + most complete + (tie-break) higher UPB
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_upb", "_has_npd", "_has_mat", "upb"],
             ascending=[True, True, True, True, True, True],
@@ -1530,7 +1373,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
 
 # =============================================================================
-# LAST WEEK REPORT CARRY-FORWARD (REO DATE + manual cols + previous UPB)
+# LAST WEEK REPORT CARRY-FORWARD
 # =============================================================================
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
@@ -1561,9 +1404,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             tmpu = tl[["Deal Number", upb_col_prev]].copy()
             tmpu["_deal_key"] = norm_id_series(tmpu["Deal Number"])
             tmpu["_prev_upb"] = tmpu[upb_col_prev].apply(money_to_float)
-            out["term_loan_upb"] = tmpu.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key")[
-                ["_deal_key", "_prev_upb"]
-            ]
+            out["term_loan_upb"] = tmpu.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key")[["_deal_key", "_prev_upb"]]
     except Exception:
         pass
 
@@ -1580,9 +1421,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             tmpu = bl[["Deal Number", upb_col_prev]].copy()
             tmpu["_deal_key"] = norm_id_series(tmpu["Deal Number"])
             tmpu["_prev_upb"] = tmpu[upb_col_prev].apply(money_to_float)
-            out["bridge_loan_upb"] = tmpu.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key")[
-                ["_deal_key", "_prev_upb"]
-            ]
+            out["bridge_loan_upb"] = tmpu.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key")[["_deal_key", "_prev_upb"]]
     except Exception:
         pass
 
@@ -1590,7 +1429,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
 
 # =============================================================================
-# BUILD HELPERS
+# BUILDERS
 # =============================================================================
 def build_bridge_asset(
     sf_spine: pd.DataFrame,
@@ -1722,6 +1561,17 @@ def build_bridge_asset(
         )
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
+    else:
+        # Salesforce-only fallback
+        if "Current UPB" in sf_spine.columns:
+            out[upb_col] = pd.to_numeric(sf_spine["Current UPB"], errors="coerce")
+        else:
+            out[upb_col] = np.nan
+        out["Servicer"] = ""
+        out["Next Payment Date"] = pd.NaT
+        out["Servicer Maturity Date"] = pd.NaT
+        out["Servicer Status"] = ""
+        out["Suspense Balance"] = np.nan
 
     if "Approved Advance Amount Funded" in sf_spine.columns:
         out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
@@ -1819,6 +1669,14 @@ def build_term_loan(
         out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"]).fillna("")
         out["Servicer ID"] = out["_matched_servicer_id"].fillna(out["Servicer ID"])
         out = out.drop(columns=["_servicer_file", "_matched_servicer_id"], errors="ignore")
+    else:
+        out["Servicer"] = ""
+        out["Maturity Date"] = pd.NaT
+        out["Next Payment Date"] = pd.NaT
+        if "Current Servicer UPB" in sf_term.columns:
+            out[upb_col] = pd.to_numeric(sf_term["Current Servicer UPB"], errors="coerce")
+        else:
+            out[upb_col] = np.nan
 
     out["REO Date"] = ""
     if "term_loan_reo" in prev_maps:
@@ -1849,9 +1707,8 @@ def build_term_loan(
         out["Segment"] = np.where(out["_deal_key"].isin(legacy_term_keys), "Legacy", out["Segment"])
 
     return out
-# =============================================================================
-# BUILD: TERM ASSET (ALA-weight UPB from Term Loan)
-# =============================================================================
+
+
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
     out = pd.DataFrame()
 
@@ -1874,9 +1731,6 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     return out
 
 
-# =============================================================================
-# BUILD: BRIDGE LOAN (roll-up Bridge Asset)
-# =============================================================================
 def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict) -> pd.DataFrame:
     ba = bridge_asset.copy()
     g = ba.groupby("_deal_key", dropna=True)
@@ -2102,12 +1956,12 @@ upb_col = make_upb_header(run_dt)
 
 st.markdown(
     f"""
-Welcome! This tool builds the **Active Loans** workbook using **Salesforce report pulls** and **servicer uploads**.
+Welcome! This tool builds the **Active Loans** workbook using **Salesforce** and optional **servicer uploads**.
 
 ### What you’ll do
-1) Upload the **current servicer files**  
-2) (Optional) Upload **last week’s Active Loans report** for carry-forward  
-3) Log in to **Salesforce** when prompted  
+1) Upload the **current servicer files** or skip them
+2) (Optional) Upload **last week’s Active Loans report** for carry-forward
+3) Log in to **Salesforce**
 4) Choose **which sheet to build** or **All**
 
 ### Template (from GitHub repo)
@@ -2115,14 +1969,9 @@ This app always uses: **{TEMPLATE_FILENAME}**
 
 ### UPB header
 Always uses today's date (ET): **{run_dt.isoformat()}** → **{upb_col}**
-
-### Speed note
-Servicer parsing is cached by **(filename + file hash)**, so if you re-run Build with the same uploads,
-it should be dramatically faster.
 """
 )
 
-# Validate template presence early
 try:
     _tmpl_bytes_preview, _tmpl_path_used = load_repo_template_bytes()
     st.success(f"✅ Using repo template: {_tmpl_path_used}")
@@ -2130,11 +1979,30 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
+ref_tables = load_reference_workbook_tables()
+if ref_tables.get("source_path"):
+    st.caption(f"Optional mapping workbook found: {ref_tables['source_path']}")
+else:
+    st.caption("Optional mapping workbook not found. Strategy Grouping / Legacy helpers will be skipped.")
+
 colA, colB = st.columns([1.3, 1.0])
 with colA:
-    prev_upload = st.file_uploader("Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)", type=["xlsx"])
+    prev_upload = st.file_uploader(
+        "Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)",
+        type=["xlsx"],
+    )
 with colB:
-    servicer_uploads = st.file_uploader("Upload current servicer files (csv/xlsx)", type=["csv", "xlsx"], accept_multiple_files=True)
+    servicer_uploads = st.file_uploader(
+        "Upload current servicer files (csv/xlsx) (optional if skipped below)",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+    )
+
+skip_servicer_files = st.checkbox(
+    "Skip servicer files and build Salesforce-only version",
+    value=False,
+    help="Leaves servicer-driven columns blank or Salesforce-fallback where available.",
+)
 
 build_target = st.selectbox(
     "Which sheet do you want to build right now?",
@@ -2161,21 +2029,22 @@ if use_sf:
 
 if st.button("Clear cached Salesforce reports", type="secondary"):
     st.session_state.report_cache = {}
-    st.success("Cleared Salesforce report cache for this session.")
+    st.session_state.sobject_describe_cache = {}
+    st.success("Cleared Salesforce caches for this session.")
 
 if st.button("Clear cached servicer parsing", type="secondary"):
     st.cache_data.clear()
-    st.success("Cleared Streamlit data cache (servicer parsing + template bytes).")
+    st.success("Cleared Streamlit data cache.")
 
 build_btn = st.button("Build", type="primary")
 
 if build_btn:
-    if not servicer_uploads:
-        st.error("Upload the servicer files. UPB/Next Payment/Maturity/Status come from them.")
+    if not skip_servicer_files and not servicer_uploads:
+        st.error("Upload the servicer files, or check 'Skip servicer files and build Salesforce-only version'.")
         st.stop()
 
     if use_sf and sf is None:
-        st.error("Salesforce login is required (or uncheck the Salesforce option).")
+        st.error("Salesforce login is required.")
         st.stop()
 
     prev_maps: dict = {}
@@ -2183,13 +2052,25 @@ if build_btn:
         with st.spinner("Reading last week's report (carry-forward)..."):
             prev_maps = build_prev_maps(prev_upload.getvalue())
 
-    with st.spinner("Parsing servicer files (cached)..."):
-        serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
+    if skip_servicer_files:
+        serv_join = pd.DataFrame(columns=[
+            "source_file", "servicer", "servicer_id", "upb", "suspense",
+            "next_payment_date", "maturity_date", "status", "as_of", "_sid_key",
+        ])
+        detected_run_date = run_dt
+        serv_full = serv_join.copy()
 
-    st.markdown("### Servicer lookup preview")
-    st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
-    st.caption(f"UPB header (always today): **{upb_col}**")
-    st.dataframe(serv_full.head(30), use_container_width=True)
+        st.markdown("### Servicer lookup preview")
+        st.caption("Servicer files were skipped. Servicer-driven columns will be blank or Salesforce-fallback where available.")
+        st.caption(f"UPB header (always today): **{upb_col}**")
+    else:
+        with st.spinner("Parsing servicer files (cached)..."):
+            serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
+
+        st.markdown("### Servicer lookup preview")
+        st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
+        st.caption(f"UPB header (always today): **{upb_col}**")
+        st.dataframe(serv_full.head(30), use_container_width=True)
 
     need = required_report_keys(build_target)
     dfs = pull_reports(sf, need)
@@ -2254,10 +2135,10 @@ if build_btn:
             term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
 
     st.subheader("Diagnostics")
-    if bridge_asset is not None and "_loan_upb" in bridge_asset.columns:
-        st.write(f"Bridge Asset servicer-join match rate (UPB): {bridge_asset['_loan_upb'].notna().mean():.1%}")
+    if bridge_asset is not None and upb_col in bridge_asset.columns:
+        st.write(f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}")
     if term_loan is not None and upb_col in term_loan.columns:
-        st.write(f"Term Loan servicer-join match rate (UPB): {term_loan[upb_col].notna().mean():.1%}")
+        st.write(f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}")
 
     tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
 
