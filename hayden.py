@@ -42,10 +42,9 @@ def hey(name: str = PRIMARY_USER_NAME) -> str:
 
 
 # =============================================================================
-# TEMPLATE / REFERENCE FILES
+# TEMPLATE FILE
 # =============================================================================
 TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
-REFERENCE_WORKBOOK_FILENAME = "20260302 Active Loans_Bridge Asset Column Mapping.xlsx"
 API_VERSION = "v66.0"
 
 
@@ -73,62 +72,6 @@ def load_repo_template_bytes() -> Tuple[bytes, str]:
         f"Tried:\n{tried}\n\n"
         f"Fix: Commit '{TEMPLATE_FILENAME}' to your GitHub repo."
     )
-
-
-@st.cache_data(show_spinner=False)
-def load_reference_workbook_tables() -> dict:
-    here = Path(__file__).resolve().parent
-    candidates = [
-        here / REFERENCE_WORKBOOK_FILENAME,
-        here / "assets" / REFERENCE_WORKBOOK_FILENAME,
-        here / "templates" / REFERENCE_WORKBOOK_FILENAME,
-        Path.cwd() / REFERENCE_WORKBOOK_FILENAME,
-        Path(REFERENCE_WORKBOOK_FILENAME),
-    ]
-
-    path = None
-    for p in candidates:
-        try:
-            if p.exists() and p.is_file():
-                path = p
-                break
-        except Exception:
-            continue
-
-    if path is None:
-        return {
-            "source_path": None,
-            "strategy_grouping_map": {},
-            "legacy_term_keys": set(),
-        }
-
-    wb = load_workbook(path, data_only=True, read_only=True)
-    try:
-        strategy_grouping_map: Dict[str, str] = {}
-        legacy_term_keys: Set[str] = set()
-
-        if "Strategy Groupings" in wb.sheetnames:
-            ws = wb["Strategy Groupings"]
-            for row in ws.iter_rows(min_row=5, values_only=True):
-                strategy = row[1] if len(row) > 1 else None
-                grouping = row[2] if len(row) > 2 else None
-                if strategy and grouping:
-                    strategy_grouping_map[str(strategy).strip()] = str(grouping).strip()
-
-        if "Legacy" in wb.sheetnames:
-            ws = wb["Legacy"]
-            for row in ws.iter_rows(min_row=6, values_only=True):
-                term_deal = row[6] if len(row) > 6 else None
-                if term_deal is not None and str(term_deal).strip() != "":
-                    legacy_term_keys.add(str(term_deal).strip().replace(".0", ""))
-
-        return {
-            "source_path": str(path),
-            "strategy_grouping_map": strategy_grouping_map,
-            "legacy_term_keys": legacy_term_keys,
-        }
-    finally:
-        wb.close()
 
 
 def today_et() -> date:
@@ -846,7 +789,6 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         "Warehouse Line": f"{opp_rel}.Warehouse_Line__c",
         "Deal Loan Number": f"{opp_rel}.Deal_Loan_Number__c",
         "Servicer Loan Number": "Servicer_Loan_Number__c",
-        "Servicer Commitment Id": f"{opp_rel}.Servicer_Commitment_Id__c",
         "Yardi ID": "Yardi_Id__c",
         "Asset ID": "Asset_ID__c",
         "Deal Name": f"{opp_rel}.Name",
@@ -872,7 +814,7 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         "Original Asset Maturity Date": "Asset_Maturity_Date_Override__c",
         "Current Asset Maturity date": "Current_Asset_Maturity_Date__c",
         "Remedy Plan": "Remedy_Plan__c",
-        "Delinquency Status Notes": "Delinquency_Status_Notes__c",
+        "Delinquency_Status_Notes": "Delinquency_Status_Notes__c",
         "Maturity Status": "Maturity_Status__c",
         "Is Special Asset": "Is_Special_Asset__c",
         "Special Asset: Status": _expr_special_asset_rel("Status_Comment__c"),
@@ -906,7 +848,70 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         "Approved Advance Amount Funded": "Approved_Advance_Amount_Used__c",
     }
 
-    rename_map = {expr: label for label, expr in exprs.items()}
+    rename_map = {
+        "Sold To": "Sold To",
+        "Warehouse Line": "Warehouse Line",
+        "Deal Loan Number": "Deal Loan Number",
+        "Servicer Loan Number": "Servicer Loan Number",
+        "Yardi ID": "Yardi ID",
+        "Asset ID": "Asset ID",
+        "Deal Name": "Deal Name",
+        "Borrower Entity: Business Entity Name": "Borrower Entity: Business Entity Name",
+        "Account Name: Account Name": "Account Name: Account Name",
+        "Primary Contact: Full Name": "Primary Contact: Full Name",
+        "Address": "Address",
+        "City": "City",
+        "State": "State",
+        "Zip": "Zip",
+        "County": "County",
+        "CBSA": "CBSA",
+        "APN": "APN",
+        "Additional APNs": "Additional APNs",
+        "# of Units": "# of Units",
+        "Year Built": "Year Built",
+        "Square Feet": "Square Feet",
+        "Close Date": "Close Date",
+        "First Funding Date": "First Funding Date",
+        "Last Funding Date": "Last Funding Date",
+        "Original Loan Maturity Date": "Original Loan Maturity Date",
+        "Current Loan Maturity date": "Current Loan Maturity date",
+        "Original Asset Maturity Date": "Original Asset Maturity Date",
+        "Current Asset Maturity date": "Current Asset Maturity date",
+        "Remedy Plan": "Remedy Plan",
+        "Delinquency_Status_Notes": "Delinquency Status Notes",
+        "Maturity Status": "Maturity Status",
+        "Is Special Asset": "Is Special Asset",
+        "Special Asset: Status": "Special Asset: Status",
+        "Special Asset: Special Asset Reason": "Special Asset: Special Asset Reason",
+        "Special Asset: Special Asset Status": "Special Asset: Special Asset Status",
+        "Special Asset: Resolved Date": "Special Asset: Resolved Date",
+        "Forbearance Term Date": "Forbearance Term Date",
+        "REO Date": "REO Date",
+        "Initial Disbursement Funded": "Initial Disbursement Funded",
+        "Approved Renovation Advance Amount": "Approved Renovation Advance Amount",
+        "Renovation Advance Amount Funded": "Renovation Advance Amount Funded",
+        "Reno Advance Amount Remaining": "Reno Advance Amount Remaining",
+        "Interest Allocation": "Interest Allocation",
+        "Interest Holdback Funded": "Interest Holdback Funded",
+        "Title Company: Account Name": "Title Company: Account Name",
+        "Tax Payment Next Due Date": "Tax Payment Next Due Date",
+        "Taxes Payment Frequency": "Taxes Payment Frequency",
+        "Tax Commentary": "Tax Commentary",
+        "Product Type": "Product Type",
+        "Product Sub-Type": "Product Sub-Type",
+        "Transaction Type": "Transaction Type",
+        "Project Strategy": "Project Strategy",
+        "Property Type": "Property Type",
+        "Originator: Originating Company": "Originator: Originating Company",
+        "Deal Intro Sub-Source": "Deal Intro Sub-Source",
+        "Referral Source Account: Account Name": "Referral Source Account: Account Name",
+        "Referral Source Contact: Full Name": "Referral Source Contact: Full Name",
+        "Stage": "Stage",
+        "Status": "Status",
+        "Current UPB": "Current UPB",
+        "Approved Advance Amount Funded": "Approved Advance Amount Funded",
+    }
+
     soql = (
         "SELECT "
         + ", ".join(exprs.values())
@@ -917,23 +922,16 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
     if df.empty:
         return df
 
+    bulk_cols = list(rename_map.keys())
+    if len(df.columns) == len(bulk_cols):
+        df.columns = bulk_cols
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
 
-    for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number"]:
+    for c in ["Servicer Loan Number", "Deal Loan Number"]:
         if c in df.columns:
             df[c] = df[c].astype("string").str.strip().replace({"": pd.NA})
-
-    if {"Deal Loan Number", "Servicer Loan Number", "Servicer Commitment Id"}.issubset(df.columns):
-        def _first_non_na(s: pd.Series):
-            s = s.dropna()
-            return s.iloc[0] if len(s) else pd.NA
-
-        deal_servicer = df.groupby("Deal Loan Number")["Servicer Loan Number"].transform(_first_non_na)
-        deal_commit = df.groupby("Deal Loan Number")["Servicer Commitment Id"].transform(_first_non_na)
-        authoritative = deal_servicer.fillna(deal_commit)
-        df["Servicer Loan Number"] = df["Servicer Loan Number"].fillna(authoritative)
-        df.loc[authoritative.notna(), "Servicer Loan Number"] = authoritative[authoritative.notna()]
 
     return df
 
@@ -954,7 +952,6 @@ def _build_valuation_like() -> pd.DataFrame:
         "Appraisal: Created Date": "CreatedDate",
     }
 
-    rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT "
         + ", ".join(exprs.values())
@@ -965,7 +962,10 @@ def _build_valuation_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.rename(columns=rename_map)
+    bulk_cols = list(exprs.keys())
+    if len(df.columns) == len(bulk_cols):
+        df.columns = bulk_cols
+
     df = _normalize_bulk_df(df)
 
     if "Asset ID" in df.columns:
@@ -1002,13 +1002,15 @@ def _build_opportunity_wide() -> pd.DataFrame:
         "Sold Loan: Sold To": _expr_sold_term_buyer_name(),
     }
 
-    rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Opportunity WHERE Deal_Loan_Number__c != NULL"
     df = run_bulk_query(soql)
     if df.empty:
         return df
 
-    df = df.rename(columns=rename_map)
+    bulk_cols = list(exprs.keys())
+    if len(df.columns) == len(bulk_cols):
+        df.columns = bulk_cols
+
     df = _normalize_bulk_df(df)
     return df
 
@@ -1062,7 +1064,6 @@ def _build_term_asset_like() -> pd.DataFrame:
         "ALA": "ALA__c",
     }
 
-    rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT "
         + ", ".join(exprs.values())
@@ -1073,7 +1074,10 @@ def _build_term_asset_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.rename(columns=rename_map)
+    bulk_cols = list(exprs.keys())
+    if len(df.columns) == len(bulk_cols):
+        df.columns = bulk_cols
+
     df = _normalize_bulk_df(df)
     return df
 
@@ -1644,13 +1648,6 @@ def build_bridge_asset(
             + pd.to_numeric(out.get("Interest Allocation Funded", 0), errors="coerce").fillna(0)
         )
 
-    ref_tables = load_reference_workbook_tables()
-    sg_map = ref_tables.get("strategy_grouping_map") or {}
-    if "Project Strategy" in out.columns:
-        out["Strategy Grouping"] = out["Strategy Grouping"].replace({"": pd.NA}).fillna(
-            out["Project Strategy"].map(sg_map)
-        ).fillna("")
-
     if "Is Special Asset (Y/N)" in out.columns:
         out["Is Special Asset (Y/N)"] = _yn_from_bool_series(out["Is Special Asset (Y/N)"])
 
@@ -1762,11 +1759,6 @@ def build_term_loan(
         out["Portfolio"] = ""
     if "Segment" not in out.columns:
         out["Segment"] = ""
-
-    ref_tables = load_reference_workbook_tables()
-    legacy_term_keys = ref_tables.get("legacy_term_keys") or set()
-    if legacy_term_keys:
-        out["Segment"] = np.where(out["_deal_key"].isin(legacy_term_keys), "Legacy", out["Segment"])
 
     return out
 
@@ -2040,12 +2032,6 @@ try:
 except Exception as e:
     st.error(str(e))
     st.stop()
-
-ref_tables = load_reference_workbook_tables()
-if ref_tables.get("source_path"):
-    st.caption(f"Optional mapping workbook found: {ref_tables['source_path']}")
-else:
-    st.caption("Optional mapping workbook not found. Strategy Grouping / Legacy helpers will be skipped.")
 
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
