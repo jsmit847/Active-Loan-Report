@@ -8,6 +8,7 @@
 # - Optional servicer file parsing (can be skipped)
 # - Repo template workbook (no template upload)
 # - Uses today's ET date for UPB header
+# - No reference mapping workbook dependency
 # ============================================================
 
 import base64
@@ -42,7 +43,7 @@ def hey(name: str = PRIMARY_USER_NAME) -> str:
 
 
 # =============================================================================
-# TEMPLATE FILE
+# TEMPLATE
 # =============================================================================
 TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
 API_VERSION = "v66.0"
@@ -252,7 +253,9 @@ def has_any_value(val) -> bool:
 
 
 def _yn_from_bool_series(s: pd.Series) -> pd.Series:
-    return s.fillna(False).map(lambda x: "Y" if bool(x) else "N")
+    s_obj = pd.Series(s, index=s.index, dtype="object")
+    s_obj = s_obj.where(pd.notna(s_obj), False)
+    return s_obj.map(lambda x: "Y" if bool(x) else "N")
 
 
 # =============================================================================
@@ -751,14 +754,26 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
     numeric_hints = ("amount", "value", "upb", "balance", "feet", "units", "year", "rate", "commitment", "ala")
-    date_hints = ("date", "maturity", "close", "funding", "order", "resolved")
+
+    def _is_date_like(col_name: str) -> bool:
+        cl = str(col_name).lower()
+        if "status" in cl:
+            return False
+        return (
+            "date" in cl
+            or "funding" in cl
+            or "close" in cl
+            or "order" in cl
+            or "resolved" in cl
+            or "maturity" in cl
+        )
 
     for c in out.columns:
         s = out[c]
-        cl = c.lower()
+        cl = str(c).lower()
 
-        if any(h in cl for h in date_hints):
-            parsed = pd.to_datetime(s, errors="coerce")
+        if _is_date_like(c):
+            parsed = pd.to_datetime(s.astype("string"), errors="coerce")
             if parsed.notna().sum() > 0:
                 out[c] = parsed
                 continue
@@ -784,137 +799,76 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
 
-    exprs: Dict[str, str] = {
-        "Sold To": _expr_bridge_sold_to_name(opp_rel),
-        "Warehouse Line": f"{opp_rel}.Warehouse_Line__c",
-        "Deal Loan Number": f"{opp_rel}.Deal_Loan_Number__c",
-        "Servicer Loan Number": "Servicer_Loan_Number__c",
-        "Yardi ID": "Yardi_Id__c",
-        "Asset ID": "Asset_ID__c",
-        "Deal Name": f"{opp_rel}.Name",
-        "Borrower Entity: Business Entity Name": f"{opp_rel}.{_expr_borrower_entity_name()}",
-        "Account Name: Account Name": f"{opp_rel}.Account.Name",
-        "Primary Contact: Full Name": f"{opp_rel}.{_expr_contact_name('Opportunity', 'Primary Contact', api_candidates=('Contact__c', 'Primary_Contact__c'))}",
-        "Address": "Name",
-        "City": "City__c",
-        "State": "State__c",
-        "Zip": "ZipCode__c",
-        "County": "County__c",
-        "CBSA": "MSA__c",
-        "APN": "APN__c",
-        "Additional APNs": "Additional_APNs__c",
-        "# of Units": "Number_of_Units__c",
-        "Year Built": "Year_Built__c",
-        "Square Feet": "Square_Feet__c",
-        "Close Date": f"{opp_rel}.CloseDate",
-        "First Funding Date": "First_Funding_Date__c",
-        "Last Funding Date": "Funding_Date__c",
-        "Original Loan Maturity Date": f"{opp_rel}.Stated_Maturity_Date__c",
-        "Current Loan Maturity date": f"{opp_rel}.Current_Line_Maturity_Date__c",
-        "Original Asset Maturity Date": "Asset_Maturity_Date_Override__c",
-        "Current Asset Maturity date": "Current_Asset_Maturity_Date__c",
-        "Remedy Plan": "Remedy_Plan__c",
-        "Delinquency_Status_Notes": "Delinquency_Status_Notes__c",
-        "Maturity Status": "Maturity_Status__c",
-        "Is Special Asset": "Is_Special_Asset__c",
-        "Special Asset: Status": _expr_special_asset_rel("Status_Comment__c"),
-        "Special Asset: Special Asset Reason": _expr_special_asset_rel("Special_Asset_Reason__c"),
-        "Special Asset: Special Asset Status": _expr_special_asset_rel("Severity_Level__c"),
-        "Special Asset: Resolved Date": _expr_special_asset_rel("Resolved_Date__c"),
-        "Forbearance Term Date": "Forbearance_Term_Date__c",
-        "REO Date": "REO_Date__c",
-        "Initial Disbursement Funded": "Initial_Disbursement_Used__c",
-        "Approved Renovation Advance Amount": "Approved_Renovation_Holdback__c",
-        "Renovation Advance Amount Funded": "Renovation_Advance_Amount_Used__c",
-        "Reno Advance Amount Remaining": "Reno_Advance_Amount_Remaining__c",
-        "Interest Allocation": "Interest_Allocation__c",
-        "Interest Holdback Funded": "Interest_Reserves__c",
-        "Title Company: Account Name": _expr_title_company_name(),
-        "Tax Payment Next Due Date": "Tax_Payment_Next_Due_Date__c",
-        "Taxes Payment Frequency": "Taxes_Payment_Frequency__c",
-        "Tax Commentary": "Tax_Commentary__c",
-        "Product Type": f"{opp_rel}.LOC_Loan_Type__c",
-        "Product Sub-Type": f"{opp_rel}.Product_Sub_Type__c",
-        "Transaction Type": f"{opp_rel}.Transaction_Type__c",
-        "Project Strategy": f"{opp_rel}.Project_Strategy__c",
-        "Property Type": "Property_Type__c",
-        "Originator: Originating Company": f"{opp_rel}.Owner.Originating_Company__c",
-        "Deal Intro Sub-Source": f"{opp_rel}.Deal_Intro_Sub_Source__c",
-        "Referral Source Account: Account Name": f"{opp_rel}.{_expr_referral_source_account()}",
-        "Referral Source Contact: Full Name": f"{opp_rel}.{_expr_referral_source_contact()}",
-        "Stage": f"{opp_rel}.StageName",
-        "Status": "Status__c",
-        "Current UPB": "Current_UPB__c",
-        "Approved Advance Amount Funded": "Approved_Advance_Amount_Used__c",
-    }
-
-    rename_map = {
-        "Sold To": "Sold To",
-        "Warehouse Line": "Warehouse Line",
-        "Deal Loan Number": "Deal Loan Number",
-        "Servicer Loan Number": "Servicer Loan Number",
-        "Yardi ID": "Yardi ID",
-        "Asset ID": "Asset ID",
-        "Deal Name": "Deal Name",
-        "Borrower Entity: Business Entity Name": "Borrower Entity: Business Entity Name",
-        "Account Name: Account Name": "Account Name: Account Name",
-        "Primary Contact: Full Name": "Primary Contact: Full Name",
-        "Address": "Address",
-        "City": "City",
-        "State": "State",
-        "Zip": "Zip",
-        "County": "County",
-        "CBSA": "CBSA",
-        "APN": "APN",
-        "Additional APNs": "Additional APNs",
-        "# of Units": "# of Units",
-        "Year Built": "Year Built",
-        "Square Feet": "Square Feet",
-        "Close Date": "Close Date",
-        "First Funding Date": "First Funding Date",
-        "Last Funding Date": "Last Funding Date",
-        "Original Loan Maturity Date": "Original Loan Maturity Date",
-        "Current Loan Maturity date": "Current Loan Maturity date",
-        "Original Asset Maturity Date": "Original Asset Maturity Date",
-        "Current Asset Maturity date": "Current Asset Maturity date",
-        "Remedy Plan": "Remedy Plan",
-        "Delinquency_Status_Notes": "Delinquency Status Notes",
-        "Maturity Status": "Maturity Status",
-        "Is Special Asset": "Is Special Asset",
-        "Special Asset: Status": "Special Asset: Status",
-        "Special Asset: Special Asset Reason": "Special Asset: Special Asset Reason",
-        "Special Asset: Special Asset Status": "Special Asset: Special Asset Status",
-        "Special Asset: Resolved Date": "Special Asset: Resolved Date",
-        "Forbearance Term Date": "Forbearance Term Date",
-        "REO Date": "REO Date",
-        "Initial Disbursement Funded": "Initial Disbursement Funded",
-        "Approved Renovation Advance Amount": "Approved Renovation Advance Amount",
-        "Renovation Advance Amount Funded": "Renovation Advance Amount Funded",
-        "Reno Advance Amount Remaining": "Reno Advance Amount Remaining",
-        "Interest Allocation": "Interest Allocation",
-        "Interest Holdback Funded": "Interest Holdback Funded",
-        "Title Company: Account Name": "Title Company: Account Name",
-        "Tax Payment Next Due Date": "Tax Payment Next Due Date",
-        "Taxes Payment Frequency": "Taxes Payment Frequency",
-        "Tax Commentary": "Tax Commentary",
-        "Product Type": "Product Type",
-        "Product Sub-Type": "Product Sub-Type",
-        "Transaction Type": "Transaction Type",
-        "Project Strategy": "Project Strategy",
-        "Property Type": "Property Type",
-        "Originator: Originating Company": "Originator: Originating Company",
-        "Deal Intro Sub-Source": "Deal Intro Sub-Source",
-        "Referral Source Account: Account Name": "Referral Source Account: Account Name",
-        "Referral Source Contact: Full Name": "Referral Source Contact: Full Name",
-        "Stage": "Stage",
-        "Status": "Status",
-        "Current UPB": "Current UPB",
-        "Approved Advance Amount Funded": "Approved Advance Amount Funded",
-    }
+    select_pairs = [
+        ("Sold To", _expr_bridge_sold_to_name(opp_rel)),
+        ("Warehouse Line", f"{opp_rel}.Warehouse_Line__c"),
+        ("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c"),
+        ("Servicer Loan Number", "Servicer_Loan_Number__c"),
+        ("Servicer Commitment Id", f"{opp_rel}.Servicer_Commitment_Id__c"),
+        ("Yardi ID", "Yardi_Id__c"),
+        ("Asset ID", "Asset_ID__c"),
+        ("Deal Name", f"{opp_rel}.Name"),
+        ("Borrower Entity: Business Entity Name", f"{opp_rel}.{_expr_borrower_entity_name()}"),
+        ("Account Name: Account Name", f"{opp_rel}.Account.Name"),
+        ("Primary Contact: Full Name", f"{opp_rel}.{_expr_contact_name('Opportunity', 'Primary Contact', api_candidates=('Contact__c', 'Primary_Contact__c'))}"),
+        ("Address", "Name"),
+        ("City", "City__c"),
+        ("State", "State__c"),
+        ("Zip", "ZipCode__c"),
+        ("County", "County__c"),
+        ("CBSA", "MSA__c"),
+        ("APN", "APN__c"),
+        ("Additional APNs", "Additional_APNs__c"),
+        ("# of Units", "Number_of_Units__c"),
+        ("Year Built", "Year_Built__c"),
+        ("Square Feet", "Square_Feet__c"),
+        ("Close Date", f"{opp_rel}.CloseDate"),
+        ("First Funding Date", "First_Funding_Date__c"),
+        ("Last Funding Date", "Funding_Date__c"),
+        ("Original Loan Maturity Date", f"{opp_rel}.Stated_Maturity_Date__c"),
+        ("Current Loan Maturity date", f"{opp_rel}.Current_Line_Maturity_Date__c"),
+        ("Original Asset Maturity Date", "Asset_Maturity_Date_Override__c"),
+        ("Current Asset Maturity date", "Current_Asset_Maturity_Date__c"),
+        ("Loan Commitment", f"{opp_rel}.LOC_Commitment__c"),
+        ("Remaining Commitment", f"{opp_rel}.Outstanding_Facility_Amount__c"),
+        ("Remedy Plan", "Remedy_Plan__c"),
+        ("Delinquency Status Notes", "Delinquency_Status_Notes__c"),
+        ("Maturity Status", "Maturity_Status__c"),
+        ("Is Special Asset", "Is_Special_Asset__c"),
+        ("Special Asset: Status", _expr_special_asset_rel("Status_Comment__c")),
+        ("Special Asset: Special Asset Reason", _expr_special_asset_rel("Special_Asset_Reason__c")),
+        ("Special Asset: Special Asset Status", _expr_special_asset_rel("Severity_Level__c")),
+        ("Special Asset: Resolved Date", _expr_special_asset_rel("Resolved_Date__c")),
+        ("Forbearance Term Date", "Forbearance_Term_Date__c"),
+        ("REO Date", "REO_Date__c"),
+        ("Initial Disbursement Funded", "Initial_Disbursement_Used__c"),
+        ("Approved Renovation Advance Amount", "Approved_Renovation_Holdback__c"),
+        ("Renovation Advance Amount Funded", "Renovation_Advance_Amount_Used__c"),
+        ("Reno Advance Amount Remaining", "Reno_Advance_Amount_Remaining__c"),
+        ("Interest Allocation", "Interest_Allocation__c"),
+        ("Interest Holdback Funded", "Interest_Reserves__c"),
+        ("Title Company: Account Name", _expr_title_company_name()),
+        ("Tax Payment Next Due Date", "Tax_Payment_Next_Due_Date__c"),
+        ("Taxes Payment Frequency", "Taxes_Payment_Frequency__c"),
+        ("Tax Commentary", "Tax_Commentary__c"),
+        ("Product Type", f"{opp_rel}.LOC_Loan_Type__c"),
+        ("Product Sub-Type", f"{opp_rel}.Product_Sub_Type__c"),
+        ("Transaction Type", f"{opp_rel}.Transaction_Type__c"),
+        ("Project Strategy", f"{opp_rel}.Project_Strategy__c"),
+        ("Property Type", "Property_Type__c"),
+        ("Originator: Originating Company", f"{opp_rel}.Owner.Originating_Company__c"),
+        ("Deal Intro Sub-Source", f"{opp_rel}.Deal_Intro_Sub_Source__c"),
+        ("Referral Source Account: Account Name", f"{opp_rel}.{_expr_referral_source_account()}"),
+        ("Referral Source Contact: Full Name", f"{opp_rel}.{_expr_referral_source_contact()}"),
+        ("Stage", f"{opp_rel}.StageName"),
+        ("Status", "Status__c"),
+        ("Current UPB", "Current_UPB__c"),
+        ("Approved Advance Amount Funded", "Approved_Advance_Amount_Used__c"),
+    ]
 
     soql = (
         "SELECT "
-        + ", ".join(exprs.values())
+        + ", ".join(expr for _label, expr in select_pairs)
         + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
     )
 
@@ -922,16 +876,31 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    bulk_cols = list(rename_map.keys())
-    if len(df.columns) == len(bulk_cols):
-        df.columns = bulk_cols
+    expected_labels = [label for label, _expr in select_pairs]
+    rename_map = {expr: label for label, expr in select_pairs}
 
-    df = df.rename(columns=rename_map)
+    if len(df.columns) == len(expected_labels):
+        df.columns = expected_labels
+    else:
+        df = df.rename(columns=rename_map)
+
     df = _normalize_bulk_df(df)
 
-    for c in ["Servicer Loan Number", "Deal Loan Number"]:
+    for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number"]:
         if c in df.columns:
             df[c] = df[c].astype("string").str.strip().replace({"": pd.NA})
+
+    if {"Deal Loan Number", "Servicer Loan Number", "Servicer Commitment Id"}.issubset(df.columns):
+        def _first_non_na(s: pd.Series):
+            s = s.dropna()
+            return s.iloc[0] if len(s) else pd.NA
+
+        deal_servicer = df.groupby("Deal Loan Number")["Servicer Loan Number"].transform(_first_non_na)
+        deal_commit = df.groupby("Deal Loan Number")["Servicer Commitment Id"].transform(_first_non_na)
+        authoritative = deal_servicer.fillna(deal_commit)
+
+        df["Servicer Loan Number"] = df["Servicer Loan Number"].fillna(authoritative)
+        df.loc[authoritative.notna(), "Servicer Loan Number"] = authoritative[authoritative.notna()]
 
     return df
 
@@ -952,6 +921,7 @@ def _build_valuation_like() -> pd.DataFrame:
         "Appraisal: Created Date": "CreatedDate",
     }
 
+    rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT "
         + ", ".join(exprs.values())
@@ -962,9 +932,10 @@ def _build_valuation_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    bulk_cols = list(exprs.keys())
-    if len(df.columns) == len(bulk_cols):
-        df.columns = bulk_cols
+    if len(df.columns) == len(exprs):
+        df.columns = list(exprs.keys())
+    else:
+        df = df.rename(columns=rename_map)
 
     df = _normalize_bulk_df(df)
 
@@ -1002,14 +973,16 @@ def _build_opportunity_wide() -> pd.DataFrame:
         "Sold Loan: Sold To": _expr_sold_term_buyer_name(),
     }
 
+    rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Opportunity WHERE Deal_Loan_Number__c != NULL"
     df = run_bulk_query(soql)
     if df.empty:
         return df
 
-    bulk_cols = list(exprs.keys())
-    if len(df.columns) == len(bulk_cols):
-        df.columns = bulk_cols
+    if len(df.columns) == len(exprs):
+        df.columns = list(exprs.keys())
+    else:
+        df = df.rename(columns=rename_map)
 
     df = _normalize_bulk_df(df)
     return df
@@ -1042,7 +1015,11 @@ def _build_am_assignments_like() -> pd.DataFrame:
         "Date_Assigned__c": "Date Assigned",
     }
 
-    df = df.rename(columns=rename_map)
+    if len(df.columns) == len(rename_map):
+        df.columns = list(rename_map.values())
+    else:
+        df = df.rename(columns=rename_map)
+
     df = _normalize_bulk_df(df)
     return df
 
@@ -1064,6 +1041,7 @@ def _build_term_asset_like() -> pd.DataFrame:
         "ALA": "ALA__c",
     }
 
+    rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT "
         + ", ".join(exprs.values())
@@ -1074,9 +1052,10 @@ def _build_term_asset_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    bulk_cols = list(exprs.keys())
-    if len(df.columns) == len(bulk_cols):
-        df.columns = bulk_cols
+    if len(df.columns) == len(exprs):
+        df.columns = list(exprs.keys())
+    else:
+        df = df.rename(columns=rename_map)
 
     df = _normalize_bulk_df(df)
     return df
@@ -1513,6 +1492,10 @@ def build_bridge_asset(
     for col, label in BRIDGE_ASSET_FROM_BRIDGE_MATURITY.items():
         out[col] = sf_spine[label] if label in sf_spine.columns else None
 
+    for extra in ["Loan Commitment", "Remaining Commitment", "Current UPB"]:
+        if extra in sf_spine.columns:
+            out[extra] = sf_spine[extra]
+
     out["Portfolio"] = out.get("Portfolio", "")
     out["Segment"] = out.get("Segment", "")
     out["Strategy Grouping"] = out.get("Strategy Grouping", "")
@@ -1604,8 +1587,8 @@ def build_bridge_asset(
 
         stage_series = out.get("Loan Stage", pd.Series([None] * len(out)))
         reo_mask = stage_series.apply(is_reo_stage)
-        loan_upb = pd.to_numeric(out.get("_loan_upb", np.nan), errors="coerce")
-        prev_upb_vals = pd.to_numeric(out.get("_prev_upb", np.nan), errors="coerce")
+        loan_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out))), errors="coerce")
+        prev_upb_vals = pd.to_numeric(out.get("_prev_upb", pd.Series([np.nan] * len(out))), errors="coerce")
 
         fill_val = prev_upb_vals.fillna(0.0)
         out["_loan_upb"] = np.where(reo_mask & ((loan_upb.isna()) | (loan_upb <= 0)), fill_val, loan_upb)
@@ -1626,6 +1609,10 @@ def build_bridge_asset(
             out["_loan_suspense"] * (out["_w"] / out["_w_sum"]),
             out["_loan_suspense"] / out["_n_in_loan"],
         )
+
+        sf_current_upb = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
+        current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
+        out[upb_col] = current_upb_series.where(current_upb_series.notna(), sf_current_upb)
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
     else:
@@ -1710,6 +1697,11 @@ def build_term_loan(
     out["Servicer ID"] = sf_term["Servicer Commitment Id"] if "Servicer Commitment Id" in sf_term.columns else None
     out["_sid_key"] = id_key_no_leading_zeros(out["Servicer ID"].astype("string"))
 
+    sf_upb_fallback = pd.to_numeric(
+        sf_term["Current Servicer UPB"] if "Current Servicer UPB" in sf_term.columns else pd.Series([np.nan] * len(out)),
+        errors="coerce",
+    )
+
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy()
         s2 = s.rename(
@@ -1728,14 +1720,19 @@ def build_term_loan(
         out["Servicer"] = out["Servicer"].fillna(out["_servicer_file"]).fillna("")
         out["Servicer ID"] = out["_matched_servicer_id"].fillna(out["Servicer ID"])
         out = out.drop(columns=["_servicer_file", "_matched_servicer_id"], errors="ignore")
+
+        if upb_col in out.columns:
+            out[upb_col] = pd.to_numeric(out[upb_col], errors="coerce").where(
+                pd.to_numeric(out[upb_col], errors="coerce").notna(),
+                sf_upb_fallback,
+            )
+        else:
+            out[upb_col] = sf_upb_fallback
     else:
         out["Servicer"] = ""
         out["Maturity Date"] = pd.NaT
         out["Next Payment Date"] = pd.NaT
-        if "Current Servicer UPB" in sf_term.columns:
-            out[upb_col] = pd.to_numeric(sf_term["Current Servicer UPB"], errors="coerce")
-        else:
-            out[upb_col] = np.nan
+        out[upb_col] = sf_upb_fallback
 
     out["REO Date"] = ""
     if "term_loan_reo" in prev_maps:
@@ -1811,7 +1808,7 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
             "Servicer": g["Servicer"].apply(_first) if "Servicer" in ba.columns else "",
             "Deal Name": g["Deal Name"].first() if "Deal Name" in ba.columns else "",
             "Borrower Name": g["Borrower Entity"].first() if "Borrower Entity" in ba.columns else "",
-            "Account ": g["Account Name"].first() if "Account Name" in ba.columns else "",
+            "Account": g["Account Name"].first() if "Account Name" in ba.columns else "",
             "Do Not Lend (Y/N)": g["Do Not Lend (Y/N)"].max() if "Do Not Lend (Y/N)" in ba.columns else "",
             "Primary Contact": g["Primary Contact"].first() if "Primary Contact" in ba.columns else "",
             "Number of Assets": g["Asset ID"].nunique() if "Asset ID" in ba.columns else 0,
@@ -1825,14 +1822,14 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
             "Next Payment Date": g["Next Payment Date"].apply(_min_dt) if "Next Payment Date" in ba.columns else "",
             "Days Past Due": "",
             "Loan Level Delinquency": "",
-            "Loan Commitment": "",
+            "Loan Commitment": g["Loan Commitment"].first() if "Loan Commitment" in ba.columns else "",
             "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
             upb_col: pd.to_numeric(g[upb_col].sum(min_count=1), errors="coerce") if upb_col in ba.columns else np.nan,
             "Suspense Balance": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
-            "Remaining Commitment": "",
-            "Most Recent Valuation Date": "",
-            "Most Recent As-Is Value": np.nan,
-            "Most Recent ARV": np.nan,
+            "Remaining Commitment": g["Remaining Commitment"].first() if "Remaining Commitment" in ba.columns else "",
+            "Most Recent Valuation Date": g["Updated Valuation Date"].apply(_max_dt) if "Updated Valuation Date" in ba.columns else "",
+            "Most Recent As-Is Value": pd.to_numeric(g["Updated As-Is Value"].sum(min_count=1), errors="coerce") if "Updated As-Is Value" in ba.columns else np.nan,
+            "Most Recent ARV": pd.to_numeric(g["Updated ARV"].sum(min_count=1), errors="coerce") if "Updated ARV" in ba.columns else np.nan,
             "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
             "Renovation Holdback": pd.to_numeric(g["Renovation Holdback"].sum(min_count=1), errors="coerce") if "Renovation Holdback" in ba.columns else np.nan,
             "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce") if "Renovation Holdback Funded" in ba.columns else np.nan,
@@ -1917,6 +1914,28 @@ def clear_columns(ws, col_indices: List[int], start_row: int = 5):
             ws.cell(r, c).value = None
 
 
+def _excel_safe_value(val):
+    if val is None or val is pd.NA:
+        return None
+
+    if isinstance(val, pd.Timestamp):
+        return None if pd.isna(val) else val.to_pydatetime()
+
+    if isinstance(val, np.generic):
+        val = val.item()
+
+    if isinstance(val, (list, dict, set, tuple)):
+        return str(val)
+
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    return val
+
+
 def write_df_to_sheet_preserve_formulas(
     ws_formula,
     df: pd.DataFrame,
@@ -1938,8 +1957,15 @@ def write_df_to_sheet_preserve_formulas(
 
     for r_offset, row in enumerate(df_out.itertuples(index=False, name=None), start=0):
         r = start_row + r_offset
-        for (c, _h), val in zip(write_cols, row):
-            ws_formula.cell(r, c).value = val
+        for (c, h), val in zip(write_cols, row):
+            safe_val = _excel_safe_value(val)
+            try:
+                ws_formula.cell(r, c).value = safe_val
+            except Exception as e:
+                raise ValueError(
+                    f"Sheet={ws_formula.title}, row={r}, col={c}, header={h}, "
+                    f"value={safe_val!r}, original={val!r}, type={type(val).__name__}"
+                ) from e
 
 
 def _parse_mmdd_from_upb_header(h: str) -> Optional[Tuple[int, int]]:
@@ -2032,6 +2058,8 @@ try:
 except Exception as e:
     st.error(str(e))
     st.stop()
+
+st.caption("Using hardcoded Salesforce mappings from your provided object/API names. No reference workbook required.")
 
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
