@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 import urllib.parse
+import warnings
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
@@ -256,6 +257,48 @@ def _yn_from_bool_series(s: pd.Series) -> pd.Series:
     s_obj = pd.Series(s, index=s.index, dtype="object")
     s_obj = s_obj.where(pd.notna(s_obj), False)
     return s_obj.map(lambda x: "Y" if bool(x) else "N")
+
+
+# =============================================================================
+# DATE / TYPE HELPERS
+# =============================================================================
+LIKELY_DATE_PATTERNS = (
+    re.compile(r"^\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?$"),
+    re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?$", re.I),
+    re.compile(r"^\d{1,2}-\d{1,2}-\d{2,4}$"),
+)
+MONTH_NAME_RE = re.compile(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b", re.I)
+
+
+def _looks_like_date_string(x) -> bool:
+    if x is None:
+        return False
+    try:
+        if pd.isna(x):
+            return False
+    except Exception:
+        pass
+
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "nat", "none", "<na>"}:
+        return False
+
+    if any(p.match(s) for p in LIKELY_DATE_PATTERNS):
+        return True
+    if MONTH_NAME_RE.search(s):
+        return True
+    return False
+
+
+def _to_datetime_series_mixed(s: pd.Series) -> pd.Series:
+    s_str = pd.Series(s, copy=False).astype("string").str.strip()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        warnings.simplefilter("ignore", FutureWarning)
+        try:
+            return pd.to_datetime(s_str, errors="coerce", format="mixed")
+        except TypeError:
+            return pd.to_datetime(s_str, errors="coerce")
 
 
 # =============================================================================
@@ -772,11 +815,23 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
         s = out[c]
         cl = str(c).lower()
 
-        if _is_date_like(c):
-            parsed = pd.to_datetime(s.astype("string"), errors="coerce")
-            if parsed.notna().sum() > 0:
-                out[c] = parsed
-                continue
+        if _is_date_like(c) and not pd.api.types.is_datetime64_any_dtype(s):
+            s_str = s.astype("string").str.strip()
+            nonblank_mask = s_str.notna() & s_str.ne("")
+            nonblank_count = int(nonblank_mask.sum())
+
+            if nonblank_count > 0:
+                likely_date_mask = s_str.map(_looks_like_date_string)
+                likely_count = int((likely_date_mask & nonblank_mask).sum())
+
+                if likely_count > 0 and (likely_count / nonblank_count) >= 0.60:
+                    parsed_input = s_str.where(likely_date_mask, pd.NA)
+                    parsed = _to_datetime_series_mixed(parsed_input)
+                    parsed_count = int(parsed[nonblank_mask].notna().sum())
+
+                    if parsed_count > 0 and (parsed_count / nonblank_count) >= 0.60:
+                        out[c] = parsed
+                        continue
 
         if any(h in cl for h in numeric_hints):
             cleaned = (
@@ -1953,9 +2008,6 @@ def write_df_to_sheet_preserve_formulas(
             df_out[h] = None
     df_out = df_out[headers]
 
-    # EXACT FIX:
-    # Convert pandas missing values like pd.NA / NaT to plain Python None
-    # before iterating into openpyxl, because openpyxl cannot write <NA>.
     df_out = df_out.astype(object).where(pd.notna(df_out), None)
 
     clear_columns(ws_formula, col_indices, start_row=start_row)
@@ -2117,156 +2169,203 @@ if st.button("Clear cached servicer parsing", type="secondary"):
     st.cache_data.clear()
     st.success("Cleared Streamlit data cache.")
 
+if "built_workbook_bytes" not in st.session_state:
+    st.session_state.built_workbook_bytes = None
+if "built_workbook_name" not in st.session_state:
+    st.session_state.built_workbook_name = None
+if "built_template_path" not in st.session_state:
+    st.session_state.built_template_path = None
+if "show_download_prompt" not in st.session_state:
+    st.session_state.show_download_prompt = False
+if "download_choice" not in st.session_state:
+    st.session_state.download_choice = "Not yet"
+
 build_btn = st.button("Build", type="primary")
 
 if build_btn:
+    st.session_state.built_workbook_bytes = None
+    st.session_state.built_workbook_name = None
+    st.session_state.built_template_path = None
+    st.session_state.show_download_prompt = False
+    st.session_state.download_choice = "Not yet"
+
     if not skip_servicer_files and not servicer_uploads:
         st.error("Upload the servicer files, or check 'Skip servicer files and build Salesforce-only version'.")
-        st.stop()
-
-    if use_sf and sf is None:
+    elif use_sf and sf is None:
         st.error("Salesforce login is required.")
-        st.stop()
-
-    prev_maps: dict = {}
-    if prev_upload:
-        with st.spinner("Reading last week's report (carry-forward)..."):
-            prev_maps = build_prev_maps(prev_upload.getvalue())
-
-    if skip_servicer_files:
-        serv_join = pd.DataFrame(columns=[
-            "source_file", "servicer", "servicer_id", "upb", "suspense",
-            "next_payment_date", "maturity_date", "status", "as_of", "_sid_key",
-        ])
-        detected_run_date = run_dt
-        serv_full = serv_join.copy()
-
-        st.markdown("### Servicer lookup preview")
-        st.caption("Servicer files were skipped. Servicer-driven columns will be blank or Salesforce-fallback where available.")
-        st.caption(f"UPB header (always today): **{upb_col}**")
     else:
-        with st.spinner("Parsing servicer files (cached)..."):
-            serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
+        try:
+            prev_maps: dict = {}
+            if prev_upload:
+                with st.spinner("Reading last week's report (carry-forward)..."):
+                    prev_maps = build_prev_maps(prev_upload.getvalue())
 
-        st.markdown("### Servicer lookup preview")
-        st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
-        st.caption(f"UPB header (always today): **{upb_col}**")
-        st.dataframe(serv_full.head(30), use_container_width=True)
+            if skip_servicer_files:
+                serv_join = pd.DataFrame(columns=[
+                    "source_file", "servicer", "servicer_id", "upb", "suspense",
+                    "next_payment_date", "maturity_date", "status", "as_of", "_sid_key",
+                ])
+                detected_run_date = run_dt
+                serv_full = serv_join.copy()
 
-    need = required_report_keys(build_target)
-    dfs = pull_reports(sf, need)
+                st.markdown("### Servicer lookup preview")
+                st.caption("Servicer files were skipped. Servicer-driven columns will be blank or Salesforce-fallback where available.")
+                st.caption(f"UPB header (always today): **{upb_col}**")
+            else:
+                with st.spinner("Parsing servicer files (cached)..."):
+                    serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
 
-    bridge_asset = None
-    bridge_loan = None
-    term_loan = None
-    term_asset = None
+                st.markdown("### Servicer lookup preview")
+                st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
+                st.caption(f"UPB header (always today): **{upb_col}**")
+                st.dataframe(serv_full.head(30), use_container_width=True)
 
-    if build_target in ("Bridge Asset", "Bridge Loan", "All"):
-        with st.spinner("Building Bridge Asset..."):
-            bridge_asset = build_bridge_asset(
-                dfs.get("bridge_maturity", pd.DataFrame()),
-                dfs.get("do_not_lend", pd.DataFrame()),
-                dfs.get("valuation", pd.DataFrame()),
-                dfs.get("am_assignments", pd.DataFrame()),
-                dfs.get("active_rm", pd.DataFrame()),
-                serv_join,
-                upb_col,
-                prev_maps,
-            )
+            need = required_report_keys(build_target)
+            dfs = pull_reports(sf, need)
 
-    if build_target in ("Bridge Loan", "All"):
-        if bridge_asset is None:
-            bridge_asset = build_bridge_asset(
-                dfs.get("bridge_maturity", pd.DataFrame()),
-                dfs.get("do_not_lend", pd.DataFrame()),
-                dfs.get("valuation", pd.DataFrame()),
-                dfs.get("am_assignments", pd.DataFrame()),
-                dfs.get("active_rm", pd.DataFrame()),
-                serv_join,
-                upb_col,
-                prev_maps,
-            )
-        with st.spinner("Building Bridge Loan..."):
-            bridge_loan = build_bridge_loan(bridge_asset, upb_col, prev_maps)
+            bridge_asset = None
+            bridge_loan = None
+            term_loan = None
+            term_asset = None
 
-    if build_target in ("Term Loan", "Term Asset", "All"):
-        with st.spinner("Building Term Loan..."):
-            term_loan = build_term_loan(
-                dfs.get("term_export", pd.DataFrame()),
-                dfs.get("sold_term", pd.DataFrame()),
-                dfs.get("am_assignments", pd.DataFrame()),
-                dfs.get("active_rm", pd.DataFrame()),
-                serv_join,
-                upb_col,
-                prev_maps,
-            )
+            if build_target in ("Bridge Asset", "Bridge Loan", "All"):
+                with st.spinner("Building Bridge Asset..."):
+                    bridge_asset = build_bridge_asset(
+                        dfs.get("bridge_maturity", pd.DataFrame()),
+                        dfs.get("do_not_lend", pd.DataFrame()),
+                        dfs.get("valuation", pd.DataFrame()),
+                        dfs.get("am_assignments", pd.DataFrame()),
+                        dfs.get("active_rm", pd.DataFrame()),
+                        serv_join,
+                        upb_col,
+                        prev_maps,
+                    )
 
-    if build_target in ("Term Asset", "All"):
-        if term_loan is None:
-            term_loan = build_term_loan(
-                dfs.get("term_export", pd.DataFrame()),
-                dfs.get("sold_term", pd.DataFrame()),
-                dfs.get("am_assignments", pd.DataFrame()),
-                dfs.get("active_rm", pd.DataFrame()),
-                serv_join,
-                upb_col,
-                prev_maps,
-            )
-        with st.spinner("Building Term Asset..."):
-            term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
+            if build_target in ("Bridge Loan", "All"):
+                if bridge_asset is None:
+                    bridge_asset = build_bridge_asset(
+                        dfs.get("bridge_maturity", pd.DataFrame()),
+                        dfs.get("do_not_lend", pd.DataFrame()),
+                        dfs.get("valuation", pd.DataFrame()),
+                        dfs.get("am_assignments", pd.DataFrame()),
+                        dfs.get("active_rm", pd.DataFrame()),
+                        serv_join,
+                        upb_col,
+                        prev_maps,
+                    )
+                with st.spinner("Building Bridge Loan..."):
+                    bridge_loan = build_bridge_loan(bridge_asset, upb_col, prev_maps)
 
-    st.subheader("Diagnostics")
-    if bridge_asset is not None and upb_col in bridge_asset.columns:
-        st.write(f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}")
-    if term_loan is not None and upb_col in term_loan.columns:
-        st.write(f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}")
+            if build_target in ("Term Loan", "Term Asset", "All"):
+                with st.spinner("Building Term Loan..."):
+                    term_loan = build_term_loan(
+                        dfs.get("term_export", pd.DataFrame()),
+                        dfs.get("sold_term", pd.DataFrame()),
+                        dfs.get("am_assignments", pd.DataFrame()),
+                        dfs.get("active_rm", pd.DataFrame()),
+                        serv_join,
+                        upb_col,
+                        prev_maps,
+                    )
 
-    tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
+            if build_target in ("Term Asset", "All"):
+                if term_loan is None:
+                    term_loan = build_term_loan(
+                        dfs.get("term_export", pd.DataFrame()),
+                        dfs.get("sold_term", pd.DataFrame()),
+                        dfs.get("am_assignments", pd.DataFrame()),
+                        dfs.get("active_rm", pd.DataFrame()),
+                        serv_join,
+                        upb_col,
+                        prev_maps,
+                    )
+                with st.spinner("Building Term Asset..."):
+                    term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
 
-    wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
-    wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
+            st.subheader("Diagnostics")
+            if bridge_asset is not None and upb_col in bridge_asset.columns:
+                st.write(f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}")
+            if term_loan is not None and upb_col in term_loan.columns:
+                st.write(f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}")
 
-    for sheet in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]:
-        if sheet in wb.sheetnames and sheet in wb_vals.sheetnames:
-            set_upb_header_in_sheet(wb[sheet], wb_vals[sheet], upb_col, header_row=4)
-            update_run_date_in_row3(wb[sheet], wb_vals[sheet], run_dt, header_row=4, date_row=3)
+            tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
 
-    sheet_to_df = {
-        "Bridge Asset": bridge_asset,
-        "Bridge Loan": bridge_loan,
-        "Term Loan": term_loan,
-        "Term Asset": term_asset,
-    }
+            wb = None
+            wb_vals = None
+            try:
+                wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
+                wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
 
-    targets = ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"] if build_target == "All" else [build_target]
+                for sheet in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]:
+                    if sheet in wb.sheetnames and sheet in wb_vals.sheetnames:
+                        set_upb_header_in_sheet(wb[sheet], wb_vals[sheet], upb_col, header_row=4)
+                        update_run_date_in_row3(wb[sheet], wb_vals[sheet], run_dt, header_row=4, date_row=3)
 
-    for sheet_name in targets:
-        df = sheet_to_df.get(sheet_name)
-        if df is None:
-            continue
-        if sheet_name not in wb.sheetnames or sheet_name not in wb_vals.sheetnames:
-            continue
+                sheet_to_df = {
+                    "Bridge Asset": bridge_asset,
+                    "Bridge Loan": bridge_loan,
+                    "Term Loan": term_loan,
+                    "Term Asset": term_asset,
+                }
 
-        ws = wb[sheet_name]
-        ws_v = wb_vals[sheet_name]
+                targets = ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"] if build_target == "All" else [build_target]
 
-        hdr = header_tuples_from_ws(ws_v, header_row=4)
-        hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
-        fcols = formula_col_indices(ws, start_row=5, header_row=4)
+                for sheet_name in targets:
+                    df = sheet_to_df.get(sheet_name)
+                    if df is None:
+                        continue
+                    if sheet_name not in wb.sheetnames or sheet_name not in wb_vals.sheetnames:
+                        continue
 
-        write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
+                    ws = wb[sheet_name]
+                    ws_v = wb_vals[sheet_name]
 
-    out_bytes = BytesIO()
-    wb.save(out_bytes)
-    out_bytes.seek(0)
+                    hdr = header_tuples_from_ws(ws_v, header_row=4)
+                    hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
+                    fcols = formula_col_indices(ws, start_row=5, header_row=4)
 
-    fname_target = build_target.replace(" ", "_")
-    st.success("✅ Workbook built")
-    st.caption(f"Built from repo template: {tmpl_path_used}")
-    st.download_button(
-        "Download",
-        data=out_bytes.getvalue(),
-        file_name=f"Active_Loans_{fname_target}_{run_dt.isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+                    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
+
+                out_bytes = BytesIO()
+                wb.save(out_bytes)
+                out_bytes.seek(0)
+
+            finally:
+                if wb is not None:
+                    wb.close()
+                if wb_vals is not None:
+                    wb_vals.close()
+
+            fname_target = build_target.replace(" ", "_")
+            st.session_state.built_workbook_bytes = out_bytes.getvalue()
+            st.session_state.built_workbook_name = f"Active_Loans_{fname_target}_{run_dt.isoformat()}.xlsx"
+            st.session_state.built_template_path = tmpl_path_used
+            st.session_state.show_download_prompt = True
+            st.session_state.download_choice = "Not yet"
+
+            st.success("✅ Workbook built")
+            st.caption(f"Built from repo template: {tmpl_path_used}")
+
+        except Exception as e:
+            st.error("The report builder hit an error. The real traceback is below.")
+            st.exception(e)
+
+if st.session_state.get("show_download_prompt") and st.session_state.get("built_workbook_bytes"):
+    st.markdown("### Download")
+    st.radio(
+        "Your report is ready. Do you want to download the Excel file now?",
+        options=["Not yet", "Yes"],
+        horizontal=True,
+        key="download_choice",
     )
+
+    if st.session_state.get("download_choice") == "Yes":
+        st.download_button(
+            "Download Excel file",
+            data=st.session_state["built_workbook_bytes"],
+            file_name=st.session_state["built_workbook_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.caption("No problem — the file is ready whenever you want to download it during this session.")
