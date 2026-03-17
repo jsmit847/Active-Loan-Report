@@ -1,16 +1,20 @@
+# =========================
+# BULK API 2.0 + mapping-driven Salesforce layer
+# Paste this AFTER your existing imports + helper functions like:
+# today_et, norm_id_series, id_key_no_leading_zeros, money_to_float,
+# to_dt, is_reo_stage, has_any_value, _yn_from_bool_series, ensure_sf_session
+# =========================
+
 import io
 import time
-import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
 
-# =========================
-# BULK API 2.0 + mapping-driven report reconstruction
-# Drop-in replacement for REPORTS + Salesforce pull layer, plus patched
-# build_bridge_asset() and build_term_loan() that fix Active RM handling.
-# This keeps the rest of your app (OAuth, servicer parser, Excel writer,
-# UI, previous-week carry-forward, etc.) intact.
-# =========================
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from openpyxl import load_workbook
 
 API_VERSION = "v66.0"
 REFERENCE_WORKBOOK_FILENAME = "20260302 Active Loans_Bridge Asset Column Mapping.xlsx"
@@ -26,8 +30,7 @@ REPORTS: Dict[str, Tuple[str, str]] = {
     "term_asset": ("Term Asset Level - By Deal", "00OPK00000DRwy52AD"),
 }
 
-# NOTE: Active RM is intentionally NOT pulled from Bridge Maturity anymore.
-# It is merged from the separate Active RM dataset.
+# Active RM intentionally removed here. It comes from separate dataset.
 BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
@@ -100,7 +103,6 @@ BRIDGE_ASSET_FROM_VALUATION = {
     "Updated ARV": "Current Appraised After Repair Value",
 }
 
-# NOTE: Active RM intentionally excluded here too; merged from Active RM dataset.
 TERM_LOAN_FROM_TERM_EXPORT = {
     "Deal Number": "Deal Loan Number",
     "SF Yardi ID": "Yardi ID",
@@ -132,6 +134,21 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "Property Type": "Property Type",
     "Property ALA": "ALA",
 }
+
+
+def show_salesforce_login_helper():
+    st.info(
+        "Step 1: Click the Salesforce login button below.\n\n"
+        "Step 2: Approve access.\n\n"
+        "Step 3: Come back here and click Build. "
+        "This app uses the Salesforce API and Bulk API 2.0 to pull large datasets."
+    )
+
+
+def _session_cache(bucket: str) -> dict:
+    if bucket not in st.session_state:
+        st.session_state[bucket] = {}
+    return st.session_state[bucket]
 
 
 def _sf_auth_parts() -> Tuple[str, str]:
@@ -166,6 +183,7 @@ def _sf_request(
     hdrs = _sf_headers(headers)
     if json_body is not None:
         hdrs.setdefault("Content-Type", "application/json")
+
     resp = requests.request(
         method=method,
         url=url,
@@ -174,16 +192,12 @@ def _sf_request(
         json=json_body,
         timeout=timeout,
     )
+
     if resp.status_code >= 400:
         msg = resp.text[:2000]
-        if _is_perm_error(msg):
-            st.warning(f"⚠️ Salesforce access issue for: {path}. Returning empty results for this item.")
-            return {} if expect_json else resp
         raise RuntimeError(f"Salesforce API {method} failed ({resp.status_code}) for {path}: {msg}")
+
     if expect_json:
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        if "json" not in ctype:
-            raise RuntimeError(f"Expected JSON from {path}, got Content-Type={ctype}")
         return resp.json()
     return resp
 
@@ -207,6 +221,7 @@ def _bulk_query_wait(job_id: str, poll_seconds: float = 1.5, timeout_seconds: in
     while True:
         js = _sf_request(f"jobs/query/{job_id}", method="GET")
         state = js.get("state")
+
         if state == "JobComplete":
             return js
         if state in {"Aborted", "Failed"}:
@@ -215,6 +230,7 @@ def _bulk_query_wait(job_id: str, poll_seconds: float = 1.5, timeout_seconds: in
             )
         if time.time() - t0 > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for Bulk query job {job_id}.")
+
         time.sleep(poll_seconds)
 
 
@@ -248,6 +264,7 @@ def _bulk_query_results_to_df(job_id: str, max_records: int = 100000) -> pd.Data
 
     if not frames:
         return pd.DataFrame()
+
     return pd.concat(frames, ignore_index=True)
 
 
@@ -255,12 +272,6 @@ def run_bulk_query(soql: str) -> pd.DataFrame:
     job_id = _bulk_query_create_job(soql)
     _bulk_query_wait(job_id)
     return _bulk_query_results_to_df(job_id)
-
-
-def _session_cache(bucket: str) -> dict:
-    if bucket not in st.session_state:
-        st.session_state[bucket] = {}
-    return st.session_state[bucket]
 
 
 def describe_sobject(sobject: str) -> dict:
@@ -304,6 +315,7 @@ def _find_ref_field(
     for f in fields:
         if f.get("type") != "reference" or not f.get("relationshipName"):
             continue
+
         refs = set(f.get("referenceTo") or [])
         if refset and not refs.intersection(refset):
             continue
@@ -320,7 +332,6 @@ def _find_ref_field(
         for opt in contains_options_l:
             if opt and opt in label_l:
                 score += 100
-        # mild preferences
         if name.endswith("__c"):
             score += 5
         if refs:
@@ -355,16 +366,6 @@ def _find_appraisal_to_property_link() -> dict:
         api_name_options=("Property__c", "Subject_Property__c"),
         reference_to=("Property__c",),
     )
-
-
-def _safe_rel_expr(parent_obj: str, field_api: str, child_field: str = "Name") -> str:
-    rel = _relationship_name_for_field(parent_obj, field_api)
-    return f"{rel}.{child_field}"
-
-
-def _pick(exprs: Dict[str, str], label: str, expr: str):
-    if expr:
-        exprs[label] = expr
 
 
 def _expr_account_name(sobject: str, field_label: str, *, api_candidates: Sequence[str] = ()) -> str:
@@ -443,7 +444,6 @@ def _expr_title_company_name() -> str:
 
 
 def _expr_bridge_sold_to_name(opp_rel: str) -> str:
-    # Sold To is on the deal side in the mapping workbook / notebook.
     fld = _find_ref_field(
         "Opportunity",
         label_options=("Sold To",),
@@ -482,28 +482,32 @@ def _expr_special_asset_rel(child_field: str) -> str:
 def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
     out = df.copy()
-    # best-effort type parsing
-    numeric_hints = (
-        "amount", "value", "upb", "balance", "feet", "units", "year", "rate", "commitment", "ala"
-    )
+    numeric_hints = ("amount", "value", "upb", "balance", "feet", "units", "year", "rate", "commitment", "ala")
     date_hints = ("date", "maturity", "close", "funding", "order", "resolved")
 
     for c in out.columns:
         s = out[c]
-        if not isinstance(s, pd.Series):
-            continue
         cl = c.lower()
+
         if any(h in cl for h in date_hints):
             parsed = pd.to_datetime(s, errors="coerce")
             if parsed.notna().sum() > 0:
                 out[c] = parsed
                 continue
+
         if any(h in cl for h in numeric_hints):
-            cleaned = s.astype("string").str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.replace("%", "", regex=False)
+            cleaned = (
+                s.astype("string")
+                .str.replace(",", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("%", "", regex=False)
+            )
             parsed = pd.to_numeric(cleaned, errors="coerce")
             if parsed.notna().sum() > 0:
                 out[c] = parsed
+
     return out
 
 
@@ -549,8 +553,8 @@ def load_reference_workbook_tables() -> dict:
         if "Strategy Groupings" in wb.sheetnames:
             ws = wb["Strategy Groupings"]
             for row in ws.iter_rows(min_row=5, values_only=True):
-                strategy = row[1]
-                grouping = row[2]
+                strategy = row[1] if len(row) > 1 else None
+                grouping = row[2] if len(row) > 2 else None
                 officer = row[5] if len(row) > 5 else None
                 officer_flag = row[6] if len(row) > 6 else None
                 if strategy and grouping:
@@ -661,11 +665,10 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
     df = run_bulk_query(soql)
     if df.empty:
         return df
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
 
-    # Notebook rule: within each Deal Loan Number, use any present Servicer Loan Number;
-    # otherwise fall back to Servicer Commitment Id for the whole deal.
     for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number"]:
         if c in df.columns:
             df[c] = df[c].astype("string").str.strip().replace({"": pd.NA})
@@ -699,21 +702,24 @@ def _build_valuation_like() -> pd.DataFrame:
         "Origination After Repair Value": f"{prop_rel}.Origination_After_Repair_Value__c",
         "Appraisal: Created Date": "CreatedDate",
     }
+
     rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Appraisal__c"
     df = run_bulk_query(soql)
     if df.empty:
         return df
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
 
     if "Asset ID" in df.columns:
         df["_asset_key"] = norm_id_series(df["Asset ID"])
-        order_dt = pd.to_datetime(df.get("Order Date"), errors="coerce")
-        created_dt = pd.to_datetime(df.get("Appraisal: Created Date"), errors="coerce")
-        df = df.assign(_order_dt=order_dt, _created_dt=created_dt)
+        df["_order_dt"] = pd.to_datetime(df.get("Order Date"), errors="coerce")
+        df["_created_dt"] = pd.to_datetime(df.get("Appraisal: Created Date"), errors="coerce")
         df = df.sort_values(["_asset_key", "_order_dt", "_created_dt"], ascending=[True, True, True])
-        df = df.drop_duplicates(["_asset_key"], keep="last").drop(columns=["_asset_key", "_order_dt", "_created_dt", "Appraisal: Created Date"], errors="ignore")
+        df = df.drop_duplicates(["_asset_key"], keep="last")
+        df = df.drop(columns=["_asset_key", "_order_dt", "_created_dt", "Appraisal: Created Date"], errors="ignore")
+
     return df
 
 
@@ -739,11 +745,13 @@ def _build_opportunity_wide() -> pd.DataFrame:
         "Current Servicer UPB": "Current_UPB__c",
         "Sold Loan: Sold To": _expr_sold_term_buyer_name(),
     }
+
     rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Opportunity WHERE Deal_Loan_Number__c != NULL"
     df = run_bulk_query(soql)
     if df.empty:
         return df
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
     return df
@@ -757,15 +765,19 @@ def _build_am_assignments_like() -> pd.DataFrame:
         "Team Role": "TeamMemberRole",
         "Date Assigned": "Date_Assigned__c",
     }
+
     rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, TeamMember.Name, "
-        "TeamMemberRole, Date_Assigned__c FROM OpportunityTeamMember "
+        "TeamMemberRole, Date_Assigned__c "
+        "FROM OpportunityTeamMember "
         "WHERE Opportunity.Deal_Loan_Number__c != NULL"
     )
+
     df = run_bulk_query(soql)
     if df.empty:
         return df
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
     return df
@@ -777,13 +789,11 @@ def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
 
     if which == "do_not_lend":
         cols = [c for c in ["Deal Loan Number", "Do Not Lend", "Account Name"] if c in opp.columns]
-        out = opp[cols].copy()
-        return out.drop_duplicates()
+        return opp[cols].drop_duplicates()
 
     if which == "active_rm":
         cols = [c for c in ["Deal Loan Number", "Deal Name", "CAF Originator"] if c in opp.columns]
-        out = opp[cols].copy()
-        return out.drop_duplicates()
+        return opp[cols].drop_duplicates()
 
     if which == "term_export":
         cols = [c for c in [
@@ -792,13 +802,11 @@ def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
             "Referral Source Account", "Referral Source Contact", "Comments AM", "Servicer Commitment Id",
             "Current Servicer UPB", "Stage", "Type"
         ] if c in opp.columns]
-        out = opp[cols].copy()
-        return out.drop_duplicates()
+        return opp[cols].drop_duplicates()
 
     if which == "sold_term":
         cols = [c for c in ["Deal Loan Number", "Deal Name", "Servicer Commitment Id", "Yardi ID", "Type", "Sold Loan: Sold To"] if c in opp.columns]
-        out = opp[cols].copy()
-        return out.drop_duplicates()
+        return opp[cols].drop_duplicates()
 
     raise KeyError(f"Unhandled opp-slice key: {which}")
 
@@ -806,6 +814,7 @@ def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
 def _build_term_asset_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
+
     exprs = {
         "Deal Loan Number": f"{opp_rel}.Deal_Loan_Number__c",
         "Asset ID": "Asset_ID__c",
@@ -818,17 +827,19 @@ def _build_term_asset_like() -> pd.DataFrame:
         "Property Type": "Property_Type__c",
         "ALA": "ALA__c",
     }
+
     rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Property__c"
     df = run_bulk_query(soql)
     if df.empty:
         return df
+
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
     return df
 
 
-def pull_reports(sf: Salesforce, keys: Set[str]) -> Dict[str, pd.DataFrame]:
+def pull_reports(sf, keys: Set[str]) -> Dict[str, pd.DataFrame]:
     day_key = today_et().isoformat()
     cache = _session_cache("report_cache")
     out: Dict[str, pd.DataFrame] = {}
@@ -856,7 +867,7 @@ def pull_reports(sf: Salesforce, keys: Set[str]) -> Dict[str, pd.DataFrame]:
     if need_term_asset:
         ck = f"term_asset:{day_key}"
         if ck not in cache:
-            with st.spinner("Pulling term-asset property data from Salesforce Bulk API..."):
+            with st.spinner("Pulling term asset data from Salesforce Bulk API..."):
                 cache[ck] = _build_term_asset_like()
         out["term_asset"] = cache[ck]
 
@@ -898,7 +909,6 @@ def build_bridge_asset(
     out["Portfolio"] = out.get("Portfolio", "")
     out["Segment"] = out.get("Segment", "")
     out["Strategy Grouping"] = out.get("Strategy Grouping", "")
-
     out["Do Not Lend (Y/N)"] = None
     out["Active RM"] = None
 
@@ -952,7 +962,6 @@ def build_bridge_asset(
         out = out.merge(piv_name, on="_deal_key", how="left")
         out = out.merge(piv_date, on="_deal_key", how="left")
 
-    # Active RM always comes from the separate Active RM dataset.
     if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
         arm = sf_arm.copy()
         arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
@@ -1025,7 +1034,6 @@ def build_bridge_asset(
     ref_tables = load_reference_workbook_tables()
     sg_map = ref_tables.get("strategy_grouping_map") or {}
     if "Project Strategy" in out.columns:
-        out["Strategy Grouping"] = out.get("Strategy Grouping", pd.Series([None] * len(out)))
         out["Strategy Grouping"] = out["Strategy Grouping"].replace({"": pd.NA}).fillna(
             out["Project Strategy"].map(sg_map)
         ).fillna("")
@@ -1064,7 +1072,6 @@ def build_term_loan(
             out["Loan Buyer"] = out["Sold Loan: Sold To"]
             out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
 
-    # Active RM always comes from the separate Active RM dataset.
     out["Active RM"] = pd.NA
     if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
         arm = sf_arm.copy()
