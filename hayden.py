@@ -149,7 +149,6 @@ REPORTS: Dict[str, Tuple[str, str]] = {
     "term_asset": ("Term Asset Level - By Deal", "00OPK00000DRwy52AD"),
 }
 
-# Active RM intentionally NOT here; merged separately from its own dataset
 BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
@@ -1016,7 +1015,7 @@ def _build_opportunity_wide() -> pd.DataFrame:
 
 def _build_am_assignments_like() -> pd.DataFrame:
     soql = (
-        "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, TeamMember.Name, "
+        "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, User.Name, "
         "TeamMemberRole, Date_Assigned__c "
         "FROM OpportunityTeamMember "
         "WHERE Opportunity.Deal_Loan_Number__c != NULL"
@@ -1036,7 +1035,7 @@ def _build_am_assignments_like() -> pd.DataFrame:
     rename_map = {
         "Opportunity.Deal_Loan_Number__c": "Deal Loan Number",
         "Opportunity.Name": "Deal Name",
-        "TeamMember.Name": "Team Member Name",
+        "User.Name": "Team Member Name",
         "TeamMemberRole": "Team Role",
         "Date_Assigned__c": "Date Assigned",
     }
