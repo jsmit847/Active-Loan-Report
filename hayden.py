@@ -1,20 +1,9 @@
 # =========================
 # BULK API 2.0 + mapping-driven Salesforce layer
-# Paste this AFTER your existing imports + helper functions like:
+# Place this AFTER helper functions like:
 # today_et, norm_id_series, id_key_no_leading_zeros, money_to_float,
 # to_dt, is_reo_stage, has_any_value, _yn_from_bool_series, ensure_sf_session
 # =========================
-
-import io
-import time
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
-
-import numpy as np
-import pandas as pd
-import requests
-import streamlit as st
-from openpyxl import load_workbook
 
 API_VERSION = "v66.0"
 REFERENCE_WORKBOOK_FILENAME = "20260302 Active Loans_Bridge Asset Column Mapping.xlsx"
@@ -138,10 +127,9 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 
 def show_salesforce_login_helper():
     st.info(
-        "Step 1: Click the Salesforce login button below.\n\n"
+        "Step 1: Log in to Salesforce.\n\n"
         "Step 2: Approve access.\n\n"
-        "Step 3: Come back here and click Build. "
-        "This app uses the Salesforce API and Bulk API 2.0 to pull large datasets."
+        "Step 3: Click Build. This app uses the Salesforce API and Bulk API 2.0 to pull larger datasets."
     )
 
 
@@ -230,7 +218,6 @@ def _bulk_query_wait(job_id: str, poll_seconds: float = 1.5, timeout_seconds: in
             )
         if time.time() - t0 > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for Bulk query job {job_id}.")
-
         time.sleep(poll_seconds)
 
 
@@ -312,6 +299,7 @@ def _find_ref_field(
 
     best = None
     best_score = -10**9
+
     for f in fields:
         if f.get("type") != "reference" or not f.get("relationshipName"):
             continue
@@ -321,21 +309,18 @@ def _find_ref_field(
             continue
 
         name = f.get("name") or ""
-        label = (f.get("label") or "").strip()
-        label_l = label.lower()
+        label = (f.get("label") or "").strip().lower()
         score = 0
 
         if name in api_name_options:
             score += 1000
-        if label_l in label_options_l:
+        if label in label_options_l:
             score += 500
         for opt in contains_options_l:
-            if opt and opt in label_l:
+            if opt and opt in label:
                 score += 100
         if name.endswith("__c"):
             score += 5
-        if refs:
-            score += 1
 
         if score > best_score:
             best_score = score
@@ -412,35 +397,19 @@ def _expr_borrower_entity_name() -> str:
 
 
 def _expr_referral_source_account() -> str:
-    return _expr_account_name(
-        "Opportunity",
-        "Referral Source Account",
-        api_candidates=("Referral_Source__c",),
-    )
+    return _expr_account_name("Opportunity", "Referral Source Account", api_candidates=("Referral_Source__c",))
 
 
 def _expr_referral_source_contact() -> str:
-    return _expr_contact_name(
-        "Opportunity",
-        "Referral Source Contact",
-        api_candidates=("Referral_Source_Contact__c",),
-    )
+    return _expr_contact_name("Opportunity", "Referral Source Contact", api_candidates=("Referral_Source_Contact__c",))
 
 
 def _expr_caf_originator_name() -> str:
-    return _expr_user_name(
-        "Opportunity",
-        "CAF Originator",
-        api_candidates=("CAF_Originator__c",),
-    )
+    return _expr_user_name("Opportunity", "CAF Originator", api_candidates=("CAF_Originator__c",))
 
 
 def _expr_title_company_name() -> str:
-    return _expr_account_name(
-        "Property__c",
-        "Title Company",
-        api_candidates=("Title_Company__c",),
-    )
+    return _expr_account_name("Property__c", "Title Company", api_candidates=("Title_Company__c",))
 
 
 def _expr_bridge_sold_to_name(opp_rel: str) -> str:
@@ -464,6 +433,7 @@ def _expr_sold_term_buyer_name() -> str:
     sold_pool_obj = (sold_pool.get("referenceTo") or [None])[0]
     if not sold_pool_obj:
         raise KeyError("Could not determine Sold Loan Pool target object from Opportunity describe().")
+
     sold_to = _find_ref_field(
         sold_pool_obj,
         label_options=("Sold To",),
@@ -513,24 +483,20 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_reference_workbook_tables() -> dict:
-    base_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    base_dir = Path(__file__).resolve().parent
     candidates = [
-        Path(REFERENCE_WORKBOOK_FILENAME),
-        Path.cwd() / REFERENCE_WORKBOOK_FILENAME,
         base_dir / REFERENCE_WORKBOOK_FILENAME,
         base_dir / "assets" / REFERENCE_WORKBOOK_FILENAME,
         base_dir / "templates" / REFERENCE_WORKBOOK_FILENAME,
+        Path.cwd() / REFERENCE_WORKBOOK_FILENAME,
         Path("/mnt/data") / REFERENCE_WORKBOOK_FILENAME,
     ]
 
     path = None
     for p in candidates:
-        try:
-            if p.exists() and p.is_file():
-                path = p
-                break
-        except Exception:
-            pass
+        if p.exists() and p.is_file():
+            path = p
+            break
 
     if path is None:
         return {
@@ -545,9 +511,6 @@ def load_reference_workbook_tables() -> dict:
     wb = load_workbook(path, data_only=True, read_only=True)
     try:
         strategy_grouping_map: Dict[str, str] = {}
-        special_asset_officers: Set[str] = set()
-        ssp_deal_keys: Set[str] = set()
-        legacy_bridge_keys: Set[str] = set()
         legacy_term_keys: Set[str] = set()
 
         if "Strategy Groupings" in wb.sheetnames:
@@ -555,36 +518,19 @@ def load_reference_workbook_tables() -> dict:
             for row in ws.iter_rows(min_row=5, values_only=True):
                 strategy = row[1] if len(row) > 1 else None
                 grouping = row[2] if len(row) > 2 else None
-                officer = row[5] if len(row) > 5 else None
-                officer_flag = row[6] if len(row) > 6 else None
                 if strategy and grouping:
                     strategy_grouping_map[str(strategy).strip()] = str(grouping).strip()
-                if officer and str(officer_flag).strip().upper() == "Y":
-                    special_asset_officers.add(str(officer).strip())
-
-        if "SSP Loans" in wb.sheetnames:
-            ws = wb["SSP Loans"]
-            for row in ws.iter_rows(min_row=5, values_only=True):
-                deal = row[1] if len(row) > 1 else None
-                if deal is not None and str(deal).strip() != "":
-                    ssp_deal_keys.add(str(deal).strip().replace(".0", ""))
 
         if "Legacy" in wb.sheetnames:
             ws = wb["Legacy"]
             for row in ws.iter_rows(min_row=6, values_only=True):
-                bridge_deal = row[1] if len(row) > 1 else None
                 term_deal = row[6] if len(row) > 6 else None
-                if bridge_deal is not None and str(bridge_deal).strip() != "":
-                    legacy_bridge_keys.add(str(bridge_deal).strip().replace(".0", ""))
                 if term_deal is not None and str(term_deal).strip() != "":
                     legacy_term_keys.add(str(term_deal).strip().replace(".0", ""))
 
         return {
             "source_path": str(path),
             "strategy_grouping_map": strategy_grouping_map,
-            "special_asset_officers": special_asset_officers,
-            "ssp_deal_keys": ssp_deal_keys,
-            "legacy_bridge_keys": legacy_bridge_keys,
             "legacy_term_keys": legacy_term_keys,
         }
     finally:
