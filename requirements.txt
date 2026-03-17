@@ -4,3 +4,4 @@ numpy
 openpyxl
 simple-salesforce
 xlsxwriter
+requests
