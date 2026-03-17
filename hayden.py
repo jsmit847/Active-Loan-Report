@@ -4,6 +4,7 @@
 # Features
 # - Salesforce OAuth (PKCE) login
 # - Salesforce Bulk API 2.0 for large pulls
+# - REST query fallback for OpportunityTeamMember
 # - Optional servicer file parsing (can be skipped)
 # - Repo template workbook (no template upload)
 # - Uses today's ET date for UPB header
@@ -394,9 +395,9 @@ def ensure_sf_session() -> Salesforce:
     store = pkce_store()
 
     now = time.time()
-    TTL = 900
+    ttl = 900
     for s, (_v, t0) in list(store.items()):
-        if now - t0 > TTL:
+        if now - t0 > ttl:
             store.pop(s, None)
 
     if code:
@@ -493,7 +494,7 @@ def _sf_request(
     )
 
     if resp.status_code >= 400:
-        msg = resp.text[:2000]
+        msg = resp.text[:4000]
         raise RuntimeError(f"Salesforce API {method} failed ({resp.status_code}) for {path}: {msg}")
 
     if expect_json:
@@ -570,6 +571,48 @@ def run_bulk_query(soql: str) -> pd.DataFrame:
     job_id = _bulk_query_create_job(soql)
     _bulk_query_wait(job_id)
     return _bulk_query_results_to_df(job_id)
+
+
+def _rest_query(soql: str) -> dict:
+    return _sf_request("query", method="GET", params={"q": soql})
+
+
+def _rest_query_more(next_records_url: str) -> dict:
+    path = next_records_url
+    marker = f"/services/data/{API_VERSION}/"
+    if marker in path:
+        path = path.split(marker, 1)[-1]
+    return _sf_request(path, method="GET")
+
+
+def run_rest_query_all(soql: str) -> pd.DataFrame:
+    js = _rest_query(soql)
+    records = list(js.get("records") or [])
+
+    while not js.get("done", True):
+        next_url = js.get("nextRecordsUrl")
+        if not next_url:
+            break
+        js = _rest_query_more(next_url)
+        records.extend(js.get("records") or [])
+
+    if not records:
+        return pd.DataFrame()
+
+    def _flatten_record(rec: dict) -> dict:
+        out = {}
+        for k, v in rec.items():
+            if k == "attributes":
+                continue
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    if sub_k != "attributes":
+                        out[f"{k}.{sub_k}"] = sub_v
+            else:
+                out[k] = v
+        return out
+
+    return pd.DataFrame([_flatten_record(r) for r in records])
 
 
 def describe_sobject(sobject: str) -> dict:
@@ -865,7 +908,12 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + " FROM Property__c"
+    soql = (
+        "SELECT "
+        + ", ".join(exprs.values())
+        + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
+    )
+
     df = run_bulk_query(soql)
     if df.empty:
         return df
@@ -908,7 +956,12 @@ def _build_valuation_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + " FROM Appraisal__c"
+    soql = (
+        "SELECT "
+        + ", ".join(exprs.values())
+        + f" FROM Appraisal__c WHERE {prop_rel}.Asset_ID__c != NULL"
+    )
+
     df = run_bulk_query(soql)
     if df.empty:
         return df
@@ -962,15 +1015,6 @@ def _build_opportunity_wide() -> pd.DataFrame:
 
 
 def _build_am_assignments_like() -> pd.DataFrame:
-    exprs = {
-        "Deal Loan Number": "Opportunity.Deal_Loan_Number__c",
-        "Deal Name": "Opportunity.Name",
-        "Team Member Name": "TeamMember.Name",
-        "Team Role": "TeamMemberRole",
-        "Date Assigned": "Date_Assigned__c",
-    }
-
-    rename_map = {expr: label for label, expr in exprs.items()}
     soql = (
         "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, TeamMember.Name, "
         "TeamMemberRole, Date_Assigned__c "
@@ -978,9 +1022,24 @@ def _build_am_assignments_like() -> pd.DataFrame:
         "WHERE Opportunity.Deal_Loan_Number__c != NULL"
     )
 
-    df = run_bulk_query(soql)
+    try:
+        df = run_bulk_query(soql)
+    except Exception:
+        st.warning(
+            "OpportunityTeamMember bulk pull failed, so the app is using REST query fallback for AM assignments."
+        )
+        df = run_rest_query_all(soql)
+
     if df.empty:
         return df
+
+    rename_map = {
+        "Opportunity.Deal_Loan_Number__c": "Deal Loan Number",
+        "Opportunity.Name": "Deal Name",
+        "TeamMember.Name": "Team Member Name",
+        "TeamMemberRole": "Team Role",
+        "Date_Assigned__c": "Date Assigned",
+    }
 
     df = df.rename(columns=rename_map)
     df = _normalize_bulk_df(df)
@@ -1005,7 +1064,12 @@ def _build_term_asset_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + " FROM Property__c"
+    soql = (
+        "SELECT "
+        + ", ".join(exprs.values())
+        + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
+    )
+
     df = run_bulk_query(soql)
     if df.empty:
         return df
@@ -1088,7 +1152,7 @@ def pull_reports(sf, keys: Set[str]) -> Dict[str, pd.DataFrame]:
     if need_am:
         ck = f"am_assignments:{day_key}"
         if ck not in cache:
-            with st.spinner("Pulling AM assignments from Salesforce Bulk API..."):
+            with st.spinner("Pulling AM assignments from Salesforce (Bulk first, REST fallback if needed)..."):
                 cache[ck] = _build_am_assignments_like()
         out["am_assignments"] = cache[ck]
 
@@ -1562,7 +1626,6 @@ def build_bridge_asset(
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
     else:
-        # Salesforce-only fallback
         if "Current UPB" in sf_spine.columns:
             out[upb_col] = pd.to_numeric(sf_spine["Current UPB"], errors="coerce")
         else:
@@ -1985,13 +2048,13 @@ if ref_tables.get("source_path"):
 else:
     st.caption("Optional mapping workbook not found. Strategy Grouping / Legacy helpers will be skipped.")
 
-colA, colB = st.columns([1.3, 1.0])
-with colA:
+col_a, col_b = st.columns([1.3, 1.0])
+with col_a:
     prev_upload = st.file_uploader(
         "Upload LAST WEEK'S Active Loans report (.xlsx) for carry-forward (optional)",
         type=["xlsx"],
     )
-with colB:
+with col_b:
     servicer_uploads = st.file_uploader(
         "Upload current servicer files (csv/xlsx) (optional if skipped below)",
         type=["csv", "xlsx"],
