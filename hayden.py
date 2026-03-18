@@ -26,6 +26,23 @@ API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 600
 
+# ------------------------------------------------------------------
+# EXACT FILTERS FROM THE SALESFORCE REPORT METADATA YOU POSTED
+# ------------------------------------------------------------------
+BRIDGE_ACTIVE_STAGES = ["Closed Won", "Expired", "Matured", "REO", "Sold"]
+BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
+BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan"]
+BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
+
+VALUATION_STAGES = ["Closed Won", "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold"]
+VALUATION_PROPERTY_STATUSES = ["Active", "Paid Off", "REO", "REO-Sold"]
+
+TERM_ACTIVE_STAGES = ["Approved by Committee", "Closed Won", "Paid Off", "REO", "REO-Sold", "Sold"]
+TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
+
+AM_ASSIGNMENT_ROLES = ["Asset Manager", "Asset Manager 2", "Construction Manager"]
+EXCLUDED_TEST_ACCOUNT_NAME = "Inhouse Test Account"
+
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
     return f"Hi {name} 👋"
@@ -287,6 +304,79 @@ def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
     return out
+
+
+# ------------------------------------------------------------------
+# SMALL SOQL HELPERS
+# ------------------------------------------------------------------
+def _soql_quote(v: str) -> str:
+    s = str(v).replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{s}'"
+
+
+def _soql_in(field: str, values) -> str:
+    vals = [v for v in values if v is not None and str(v).strip() != ""]
+    if not vals:
+        return "1 = 1"
+    return f"{field} IN ({', '.join(_soql_quote(v) for v in vals)})"
+
+
+def _soql_not_equal_or_null(field: str, bad_value: str) -> str:
+    q = _soql_quote(bad_value)
+    return f"({field} = NULL OR {field} != {q})"
+
+
+def _soql_parent_name_not_equal_or_no_parent(parent_id_field: str, parent_name_field: str, bad_value: str) -> str:
+    q = _soql_quote(bad_value)
+    return f"({parent_id_field} = NULL OR {parent_name_field} != {q})"
+
+
+def _chunked(seq, size=200):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _nonblank_unique(values):
+    out = []
+    seen = set()
+    for x in values:
+        if x is None:
+            continue
+        try:
+            if pd.isna(x):
+                continue
+        except Exception:
+            pass
+        s = str(x).strip()
+        if not s or s.lower() in {"nan", "nat", "none", "<na>"}:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _run_bulk_union(soql_list, rename_map=None):
+    frames = []
+    for soql in soql_list:
+        df = run_bulk_query(soql, rename_map=rename_map)
+        if not df.empty:
+            frames.append(df)
+        del df
+        gc.collect()
+
+    if not frames:
+        return pd.DataFrame()
+
+    if len(frames) == 1:
+        out = frames[0]
+    else:
+        out = pd.concat(frames, ignore_index=True, copy=False)
+
+    del frames
+    gc.collect()
+    return downcast_numeric_frame(out)
 
 
 def b64url_no_pad(b: bytes) -> str:
@@ -823,6 +913,9 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
     return downcast_numeric_frame(out)
 
 
+# ------------------------------------------------------------------
+# SALESFORCE DATA BUILDERS
+# ------------------------------------------------------------------
 def _build_bridge_spine_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
@@ -897,7 +990,22 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     ]
 
     rename_map = {expr: label for label, expr in select_pairs}
-    soql = "SELECT " + ", ".join(expr for _label, expr in select_pairs) + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
+
+    where_parts = [
+        f"{opp_rel}.Deal_Loan_Number__c != NULL",
+        _soql_in(f"{opp_rel}.StageName", BRIDGE_ACTIVE_STAGES),
+        _soql_in(f"{opp_rel}.Type", BRIDGE_TYPES),
+        _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
+        _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+    ]
+
+    soql = (
+        "SELECT "
+        + ", ".join(expr for _label, expr in select_pairs)
+        + " FROM Property__c WHERE "
+        + " AND ".join(where_parts)
+    )
+
     df = run_bulk_query(soql, rename_map=rename_map)
 
     if df.empty:
@@ -922,9 +1030,12 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     return downcast_numeric_frame(df)
 
 
-def _build_valuation_like() -> pd.DataFrame:
+def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     appr_to_prop = _find_appraisal_to_property_link()
     prop_rel = appr_to_prop["relationshipName"]
+
+    prop_to_opp = _find_property_to_opportunity_link()
+    opp_rel = prop_to_opp["relationshipName"]
 
     exprs = {
         "Asset ID": f"{prop_rel}.Asset_ID__c",
@@ -939,8 +1050,34 @@ def _build_valuation_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + f" FROM Appraisal__c WHERE {prop_rel}.Asset_ID__c != NULL"
-    df = run_bulk_query(soql, rename_map=rename_map)
+    asset_ids = _nonblank_unique(asset_ids or [])
+    soqls = []
+
+    if asset_ids:
+        for chunk in _chunked(asset_ids, size=200):
+            where_parts = [
+                _soql_in(f"{prop_rel}.Asset_ID__c", chunk),
+            ]
+            soqls.append(
+                "SELECT "
+                + ", ".join(exprs.values())
+                + " FROM Appraisal__c WHERE "
+                + " AND ".join(where_parts)
+            )
+    else:
+        where_parts = [
+            _soql_in(f"{prop_rel}.{opp_rel}.Type", BRIDGE_TYPES),
+            _soql_in(f"{prop_rel}.{opp_rel}.StageName", VALUATION_STAGES),
+            _soql_in(f"{prop_rel}.Status__c", VALUATION_PROPERTY_STATUSES),
+        ]
+        soqls.append(
+            "SELECT "
+            + ", ".join(exprs.values())
+            + " FROM Appraisal__c WHERE "
+            + " AND ".join(where_parts)
+        )
+
+    df = _run_bulk_union(soqls, rename_map=rename_map)
 
     if df.empty:
         return df
@@ -980,16 +1117,36 @@ def _build_term_wide_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + " FROM Opportunity WHERE Deal_Loan_Number__c != NULL"
+
+    where_parts = [
+        "Deal_Loan_Number__c != NULL",
+        _soql_in("Type", TERM_TYPES),
+        _soql_in("StageName", TERM_ACTIVE_STAGES),
+        "Probability > 0",
+    ]
+
+    soql = (
+        "SELECT "
+        + ", ".join(exprs.values())
+        + " FROM Opportunity WHERE "
+        + " AND ".join(where_parts)
+    )
+
     return run_bulk_query(soql, rename_map=rename_map)
 
 
 def _build_am_assignments_like() -> pd.DataFrame:
+    where_parts = [
+        "Opportunity.Deal_Loan_Number__c != NULL",
+        _soql_parent_name_not_equal_or_no_parent("Opportunity.AccountId", "Opportunity.Account.Name", EXCLUDED_TEST_ACCOUNT_NAME),
+        _soql_in("TeamMemberRole", AM_ASSIGNMENT_ROLES),
+    ]
+
     soql = (
         "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, User.Name, "
         "TeamMemberRole, Date_Assigned__c "
-        "FROM OpportunityTeamMember "
-        "WHERE Opportunity.Deal_Loan_Number__c != NULL"
+        "FROM OpportunityTeamMember WHERE "
+        + " AND ".join(where_parts)
     )
 
     try:
@@ -1012,7 +1169,7 @@ def _build_am_assignments_like() -> pd.DataFrame:
     return downcast_numeric_frame(_normalize_bulk_df(df))
 
 
-def _build_term_asset_like() -> pd.DataFrame:
+def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
 
@@ -1030,8 +1187,48 @@ def _build_term_asset_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = "SELECT " + ", ".join(exprs.values()) + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
-    return run_bulk_query(soql, rename_map=rename_map)
+    deal_numbers = _nonblank_unique(deal_numbers or [])
+    soqls = []
+
+    if deal_numbers:
+        for chunk in _chunked(deal_numbers, size=200):
+            where_parts = [
+                f"{opp_rel}.Deal_Loan_Number__c != NULL",
+                _soql_in(f"{opp_rel}.Deal_Loan_Number__c", chunk),
+            ]
+            soqls.append(
+                "SELECT "
+                + ", ".join(exprs.values())
+                + f" FROM Property__c WHERE "
+                + " AND ".join(where_parts)
+            )
+    else:
+        where_parts = [
+            f"{opp_rel}.Deal_Loan_Number__c != NULL",
+            _soql_in(f"{opp_rel}.Type", TERM_TYPES),
+            _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
+            f"{opp_rel}.Probability > 0",
+        ]
+        soqls.append(
+            "SELECT "
+            + ", ".join(exprs.values())
+            + f" FROM Property__c WHERE "
+            + " AND ".join(where_parts)
+        )
+
+    return _run_bulk_union(soqls, rename_map=rename_map)
+
+
+def _bridge_asset_ids_from_spine(bridge_spine: pd.DataFrame):
+    if bridge_spine is None or bridge_spine.empty or "Asset ID" not in bridge_spine.columns:
+        return []
+    return _nonblank_unique(bridge_spine["Asset ID"].tolist())
+
+
+def _term_deal_numbers_from_wide(term_wide: pd.DataFrame):
+    if term_wide is None or term_wide.empty or "Deal Loan Number" not in term_wide.columns:
+        return []
+    return _nonblank_unique(term_wide["Deal Loan Number"].tolist())
 
 
 @dataclass(frozen=True)
@@ -1911,7 +2108,7 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.caption("Memory-optimized build: no large Salesforce report cache, no duplicate template workbook in memory, and sheets are built/written one at a time.")
+st.caption("Memory-optimized build with active-loan report filters: no large Salesforce report cache, no duplicate template workbook in memory, and valuation/term-asset pulls are limited to active IDs found earlier in the run.")
 
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
@@ -1951,7 +2148,7 @@ if use_sf:
         st.success("✅ Logged in to Salesforce API")
         if inst:
             st.caption(f"Connected to: {inst}")
-            st.caption("Bulk API 2.0 is used with smaller page sizes to reduce memory pressure.")
+            st.caption("Bulk API 2.0 is used with smaller page sizes and report-matched filters to reduce memory pressure.")
     with c2:
         if st.button("Log out"):
             st.session_state.sf_token = None
@@ -2021,9 +2218,10 @@ if build_btn:
             if need_bridge:
                 status.update(label="Pulling bridge/property data from Salesforce...")
                 bridge_spine = _build_bridge_spine_like()
+                bridge_asset_ids = _bridge_asset_ids_from_spine(bridge_spine)
 
                 status.update(label="Pulling valuation data from Salesforce...")
-                bridge_val = _build_valuation_like()
+                bridge_val = _build_valuation_like(asset_ids=bridge_asset_ids)
 
                 status.update(label="Building Bridge Asset...")
                 bridge_asset = build_bridge_asset(
@@ -2035,6 +2233,9 @@ if build_btn:
                     prev_maps,
                 )
 
+                diagnostics.append(
+                    f"Bridge Asset rows: {len(bridge_asset):,}"
+                )
                 diagnostics.append(
                     f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}"
                     if upb_col in bridge_asset.columns
@@ -2053,7 +2254,7 @@ if build_btn:
                     write_output_sheet(wb, "Bridge Loan", bridge_loan, upb_col, run_dt)
                     del bridge_loan
 
-                del bridge_spine, bridge_val, bridge_asset
+                del bridge_spine, bridge_asset_ids, bridge_val, bridge_asset
                 gc.collect()
 
             if need_term:
@@ -2070,6 +2271,9 @@ if build_btn:
                 )
 
                 diagnostics.append(
+                    f"Term Loan rows: {len(term_loan):,}"
+                )
+                diagnostics.append(
                     f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}"
                     if upb_col in term_loan.columns
                     else f"Term Loan nonblank {upb_col}: n/a"
@@ -2080,15 +2284,17 @@ if build_btn:
                     write_output_sheet(wb, "Term Loan", term_loan, upb_col, run_dt)
 
                 if need_term_asset:
+                    term_deal_numbers = _term_deal_numbers_from_wide(term_wide)
+
                     status.update(label="Pulling term asset data from Salesforce...")
-                    term_asset_source = _build_term_asset_like()
+                    term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
 
                     status.update(label="Building Term Asset...")
                     term_asset = build_term_asset(term_asset_source, term_loan, upb_col)
 
                     status.update(label="Writing Term Asset sheet...")
                     write_output_sheet(wb, "Term Asset", term_asset, upb_col, run_dt)
-                    del term_asset_source, term_asset
+                    del term_deal_numbers, term_asset_source, term_asset
 
                 del term_wide, term_loan
                 gc.collect()
