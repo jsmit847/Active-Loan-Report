@@ -1,17 +1,5 @@
-# ============================================================
-# Active Loans Report Builder — ONE FILE (Streamlit)
-#
-# Features
-# - Salesforce OAuth (PKCE) login
-# - Salesforce Bulk API 2.0 for large pulls
-# - REST query fallback for OpportunityTeamMember
-# - Optional servicer file parsing (can be skipped)
-# - Repo template workbook (no template upload)
-# - Uses today's ET date for UPB header
-# - No reference mapping workbook dependency
-# ============================================================
-
 import base64
+import gc
 import hashlib
 import io
 import re
@@ -31,23 +19,16 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import load_workbook
-from simple_salesforce import Salesforce
 
-# =============================================================================
-# PERSONALIZATION
-# =============================================================================
 PRIMARY_USER_NAME = "Hayden"
+TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
+API_VERSION = "v66.0"
+BULK_PAGE_SIZE = 5000
+BULK_WAIT_TIMEOUT_SECONDS = 600
 
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
     return f"Hi {name} 👋"
-
-
-# =============================================================================
-# TEMPLATE
-# =============================================================================
-TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
-API_VERSION = "v66.0"
 
 
 @st.cache_data(show_spinner=False)
@@ -60,14 +41,12 @@ def load_repo_template_bytes() -> Tuple[bytes, str]:
         Path.cwd() / TEMPLATE_FILENAME,
         Path(TEMPLATE_FILENAME),
     ]
-
     for p in candidates:
         try:
             if p.exists() and p.is_file():
                 return p.read_bytes(), str(p)
         except Exception:
             continue
-
     tried = "\n".join(str(p) for p in candidates)
     raise FileNotFoundError(
         f"Could not find '{TEMPLATE_FILENAME}' in your repo.\n\n"
@@ -80,21 +59,7 @@ def today_et() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
-# =============================================================================
-# REPORTS / LABEL MAPS
-# =============================================================================
-REPORTS: Dict[str, Tuple[str, str]] = {
-    "bridge_maturity": ("Bridge Maturity Report v3", "00O5b000005s0aFEAQ"),
-    "do_not_lend": ("Do Not Lend", "00OPK000005tu3V2AQ"),
-    "valuation": ("Valuation v4 Report", "00OPK000003PXS52AO"),
-    "am_assignments": ("AM Assignments Report", "00OPK00000257Kf2AI"),
-    "active_rm": ("Active RM Report", "00OPK000005QLAn2AO"),
-    "term_export": ("Term Data Export", "00OPK000004p7Uz2AI"),
-    "sold_term": ("Sold Term Loans", "00OPK0000030QFJ2A2"),
-    "term_asset": ("Term Asset Level - By Deal", "00OPK00000DRwy52AD"),
-}
-
-BRIDGE_ASSET_FROM_BRIDGE_MATURITY = {
+BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
     "Deal Number": "Deal Loan Number",
@@ -166,7 +131,7 @@ BRIDGE_ASSET_FROM_VALUATION = {
     "Updated ARV": "Current Appraised After Repair Value",
 }
 
-TERM_LOAN_FROM_TERM_EXPORT = {
+TERM_LOAN_FROM_TERM_WIDE = {
     "Deal Number": "Deal Loan Number",
     "SF Yardi ID": "Yardi ID",
     "Deal Name": "Deal Name",
@@ -183,8 +148,6 @@ TERM_LOAN_FROM_TERM_EXPORT = {
     "AM Commentary": "Comments AM",
 }
 
-TERM_LOAN_FROM_SOLD_TERM = {"Loan Buyer": "Sold Loan: Sold To"}
-
 TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "Deal Number": "Deal Loan Number",
     "Asset ID": "Asset ID",
@@ -199,9 +162,6 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 }
 
 
-# =============================================================================
-# NORMALIZATION
-# =============================================================================
 def norm_id_series(s: pd.Series) -> pd.Series:
     return (
         s.astype("string")
@@ -254,14 +214,28 @@ def has_any_value(val) -> bool:
 
 
 def _yn_from_bool_series(s: pd.Series) -> pd.Series:
-    s_obj = pd.Series(s, index=s.index, dtype="object")
-    s_obj = s_obj.where(pd.notna(s_obj), False)
-    return s_obj.map(lambda x: "Y" if bool(x) else "N")
+    truthy = {"true", "t", "y", "yes", "1"}
+    falsy = {"false", "f", "n", "no", "0", ""}
+
+    def _one(x):
+        if x is None:
+            return "N"
+        try:
+            if pd.isna(x):
+                return "N"
+        except Exception:
+            pass
+        if isinstance(x, str):
+            xs = x.strip().lower()
+            if xs in truthy:
+                return "Y"
+            if xs in falsy:
+                return "N"
+        return "Y" if bool(x) else "N"
+
+    return pd.Series(s, index=s.index, dtype="object").map(_one)
 
 
-# =============================================================================
-# DATE / TYPE HELPERS
-# =============================================================================
 LIKELY_DATE_PATTERNS = (
     re.compile(r"^\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?$"),
     re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?$", re.I),
@@ -278,11 +252,9 @@ def _looks_like_date_string(x) -> bool:
             return False
     except Exception:
         pass
-
     s = str(x).strip()
     if not s or s.lower() in {"nan", "nat", "none", "<na>"}:
         return False
-
     if any(p.match(s) for p in LIKELY_DATE_PATTERNS):
         return True
     if MONTH_NAME_RE.search(s):
@@ -301,9 +273,22 @@ def _to_datetime_series_mixed(s: pd.Series) -> pd.Series:
             return pd.to_datetime(s_str, errors="coerce")
 
 
-# =============================================================================
-# SALESFORCE AUTH (OAuth + PKCE)
-# =============================================================================
+def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df
+    for c in out.columns:
+        s = out[c]
+        try:
+            if pd.api.types.is_integer_dtype(s):
+                out[c] = pd.to_numeric(s, errors="coerce", downcast="integer")
+            elif pd.api.types.is_float_dtype(s):
+                out[c] = pd.to_numeric(s, errors="coerce", downcast="float")
+        except Exception:
+            pass
+    return out
+
+
 def b64url_no_pad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
 
@@ -320,6 +305,15 @@ def make_challenge(verifier: str) -> str:
 @st.cache_resource
 def pkce_store():
     return {}
+
+
+@st.cache_resource
+def http_session():
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=0)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
 
 
 def exchange_code_for_token(
@@ -339,8 +333,7 @@ def exchange_code_for_token(
     }
     if client_secret:
         data["client_secret"] = client_secret
-
-    resp = requests.post(token_url, data=data, timeout=30)
+    resp = http_session().post(token_url, data=data, timeout=30)
     if resp.status_code != 200:
         raise RuntimeError(f"Token exchange failed ({resp.status_code}): {resp.text}")
     return resp.json()
@@ -354,16 +347,14 @@ def show_salesforce_login_helper():
     )
 
 
-def ensure_sf_session() -> Salesforce:
+def ensure_sf_session() -> dict:
     cfg = st.secrets["salesforce"]
-
-    CLIENT_ID = cfg["client_id"]
-    AUTH_HOST = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
-    REDIRECT_URI = cfg["redirect_uri"].rstrip("/")
-    CLIENT_SECRET = cfg.get("client_secret")
-
-    AUTH_URL = f"{AUTH_HOST}/services/oauth2/authorize"
-    TOKEN_URL = f"{AUTH_HOST}/services/oauth2/token"
+    client_id = cfg["client_id"]
+    auth_host = cfg.get("auth_host", "https://cvest.my.salesforce.com").rstrip("/")
+    redirect_uri = cfg["redirect_uri"].rstrip("/")
+    client_secret = cfg.get("client_secret")
+    auth_url = f"{auth_host}/services/oauth2/authorize"
+    token_url = f"{auth_host}/services/oauth2/token"
 
     qp = st.query_params
     code = qp.get("code")
@@ -381,7 +372,6 @@ def ensure_sf_session() -> Salesforce:
         st.session_state.sf_token = None
 
     store = pkce_store()
-
     now = time.time()
     ttl = 900
     for s, (_v, t0) in list(store.items()):
@@ -393,7 +383,7 @@ def ensure_sf_session() -> Salesforce:
             st.error("Login link expired. Click login again.")
             st.stop()
         verifier, _t0 = store.pop(state)
-        tok = exchange_code_for_token(TOKEN_URL, code, verifier, CLIENT_ID, REDIRECT_URI, CLIENT_SECRET)
+        tok = exchange_code_for_token(token_url, code, verifier, client_id, redirect_uri, client_secret)
         st.session_state.sf_token = tok
         st.query_params.clear()
         st.rerun()
@@ -403,36 +393,29 @@ def ensure_sf_session() -> Salesforce:
         new_verifier = make_verifier()
         new_challenge = make_challenge(new_verifier)
         store[new_state] = (new_verifier, time.time())
-
         login_params = {
             "response_type": "code",
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
             "code_challenge": new_challenge,
             "code_challenge_method": "S256",
             "state": new_state,
             "prompt": "login",
             "scope": "api refresh_token",
         }
-        login_url = AUTH_URL + "?" + urllib.parse.urlencode(login_params)
-
+        login_url = auth_url + "?" + urllib.parse.urlencode(login_params)
         st.link_button("Login to Salesforce", login_url)
         st.stop()
 
     tok = st.session_state.sf_token
     access_token = tok.get("access_token")
     instance_url = tok.get("instance_url")
-
     if not access_token or not instance_url:
         st.error("Login token missing needed values.")
         st.stop()
+    return {"access_token": access_token, "instance_url": instance_url.rstrip("/")}
 
-    return Salesforce(instance_url=instance_url, session_id=access_token)
 
-
-# =============================================================================
-# BULK API 2.0 HELPERS
-# =============================================================================
 def _session_cache(bucket: str) -> dict:
     if bucket not in st.session_state:
         st.session_state[bucket] = {}
@@ -471,8 +454,7 @@ def _sf_request(
     hdrs = _sf_headers(headers)
     if json_body is not None:
         hdrs.setdefault("Content-Type", "application/json")
-
-    resp = requests.request(
+    resp = http_session().request(
         method=method,
         url=url,
         headers=hdrs,
@@ -480,11 +462,9 @@ def _sf_request(
         json=json_body,
         timeout=timeout,
     )
-
     if resp.status_code >= 400:
         msg = resp.text[:4000]
         raise RuntimeError(f"Salesforce API {method} failed ({resp.status_code}) for {path}: {msg}")
-
     if expect_json:
         return resp.json()
     return resp
@@ -504,32 +484,26 @@ def _bulk_query_create_job(soql: str) -> str:
     return job_id
 
 
-def _bulk_query_wait(job_id: str, poll_seconds: float = 1.5, timeout_seconds: int = 1800) -> dict:
+def _bulk_query_wait(job_id: str, poll_seconds: float = 1.25, timeout_seconds: int = BULK_WAIT_TIMEOUT_SECONDS) -> dict:
     t0 = time.time()
     while True:
         js = _sf_request(f"jobs/query/{job_id}", method="GET")
         state = js.get("state")
-
         if state == "JobComplete":
             return js
         if state in {"Aborted", "Failed"}:
-            raise RuntimeError(
-                f"Bulk query job {job_id} failed: state={state}; message={js.get('errorMessage') or js}"
-            )
+            raise RuntimeError(f"Bulk query job {job_id} failed: state={state}; message={js.get('errorMessage') or js}")
         if time.time() - t0 > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for Bulk query job {job_id}.")
         time.sleep(poll_seconds)
 
 
-def _bulk_query_results_to_df(job_id: str, max_records: int = 100000) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
+def _bulk_query_results_pages(job_id: str, max_records: int = BULK_PAGE_SIZE):
     locator: Optional[str] = None
-
     while True:
         params = {"maxRecords": max_records}
         if locator:
             params["locator"] = locator
-
         resp = _sf_request(
             f"jobs/query/{job_id}/results",
             method="GET",
@@ -538,27 +512,33 @@ def _bulk_query_results_to_df(job_id: str, max_records: int = 100000) -> pd.Data
             expect_json=False,
             timeout=300,
         )
-
-        text = resp.text
-        if text.strip():
-            df = pd.read_csv(io.StringIO(text), keep_default_na=True, low_memory=False)
-            if not df.empty:
-                frames.append(df)
-
+        yield resp.text
         locator = resp.headers.get("Sforce-Locator") or resp.headers.get("sforce-locator")
         if not locator or locator.lower() == "null":
             break
 
-    if not frames:
-        return pd.DataFrame()
 
-    return pd.concat(frames, ignore_index=True)
-
-
-def run_bulk_query(soql: str) -> pd.DataFrame:
+def run_bulk_query(soql: str, rename_map: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     job_id = _bulk_query_create_job(soql)
     _bulk_query_wait(job_id)
-    return _bulk_query_results_to_df(job_id)
+    frames: List[pd.DataFrame] = []
+    for text in _bulk_query_results_pages(job_id):
+        if not text.strip():
+            continue
+        chunk = pd.read_csv(io.StringIO(text), keep_default_na=True, low_memory=True)
+        if rename_map:
+            chunk = chunk.rename(columns=rename_map)
+        chunk = _normalize_bulk_df(chunk)
+        chunk = downcast_numeric_frame(chunk)
+        frames.append(chunk)
+        del chunk, text
+        gc.collect()
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, copy=False)
+    del frames
+    gc.collect()
+    return downcast_numeric_frame(out)
 
 
 def _rest_query(soql: str) -> dict:
@@ -576,14 +556,12 @@ def _rest_query_more(next_records_url: str) -> dict:
 def run_rest_query_all(soql: str) -> pd.DataFrame:
     js = _rest_query(soql)
     records = list(js.get("records") or [])
-
     while not js.get("done", True):
         next_url = js.get("nextRecordsUrl")
         if not next_url:
             break
         js = _rest_query_more(next_url)
         records.extend(js.get("records") or [])
-
     if not records:
         return pd.DataFrame()
 
@@ -600,7 +578,10 @@ def run_rest_query_all(soql: str) -> pd.DataFrame:
                 out[k] = v
         return out
 
-    return pd.DataFrame([_flatten_record(r) for r in records])
+    out = pd.DataFrame([_flatten_record(r) for r in records])
+    del records
+    gc.collect()
+    return downcast_numeric_frame(out)
 
 
 def describe_sobject(sobject: str) -> dict:
@@ -638,22 +619,18 @@ def _find_ref_field(
     label_options_l = {x.lower() for x in label_options}
     contains_options_l = [x.lower() for x in contains_options]
     refset = set(reference_to)
-
     best = None
     best_score = -10**9
 
     for f in fields:
         if f.get("type") != "reference" or not f.get("relationshipName"):
             continue
-
         refs = set(f.get("referenceTo") or [])
         if refset and not refs.intersection(refset):
             continue
-
         name = f.get("name") or ""
         label = (f.get("label") or "").strip().lower()
         score = 0
-
         if name in api_name_options:
             score += 1000
         if label in label_options_l:
@@ -663,7 +640,6 @@ def _find_ref_field(
                 score += 100
         if name.endswith("__c"):
             score += 5
-
         if score > best_score:
             best_score = score
             best = f
@@ -844,13 +820,10 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
             if parsed.notna().sum() > 0:
                 out[c] = parsed
 
-    return out
+    return downcast_numeric_frame(out)
 
 
-# =============================================================================
-# BULK API DATA BUILDERS
-# =============================================================================
-def _build_bridge_maturity_like() -> pd.DataFrame:
+def _build_bridge_spine_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
 
@@ -866,6 +839,8 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         ("Borrower Entity: Business Entity Name", f"{opp_rel}.{_expr_borrower_entity_name()}"),
         ("Account Name: Account Name", f"{opp_rel}.Account.Name"),
         ("Primary Contact: Full Name", f"{opp_rel}.{_expr_contact_name('Opportunity', 'Primary Contact', api_candidates=('Contact__c', 'Primary_Contact__c'))}"),
+        ("Do Not Lend", f"{opp_rel}.Account.Do_Not_Lend__c"),
+        ("CAF Originator", f"{opp_rel}.{_expr_caf_originator_name()}"),
         ("Address", "Name"),
         ("City", "City__c"),
         ("State", "State__c"),
@@ -921,25 +896,12 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         ("Approved Advance Amount Funded", "Approved_Advance_Amount_Used__c"),
     ]
 
-    soql = (
-        "SELECT "
-        + ", ".join(expr for _label, expr in select_pairs)
-        + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
-    )
+    rename_map = {expr: label for label, expr in select_pairs}
+    soql = "SELECT " + ", ".join(expr for _label, expr in select_pairs) + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
+    df = run_bulk_query(soql, rename_map=rename_map)
 
-    df = run_bulk_query(soql)
     if df.empty:
         return df
-
-    expected_labels = [label for label, _expr in select_pairs]
-    rename_map = {expr: label for label, expr in select_pairs}
-
-    if len(df.columns) == len(expected_labels):
-        df.columns = expected_labels
-    else:
-        df = df.rename(columns=rename_map)
-
-    df = _normalize_bulk_df(df)
 
     for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number"]:
         if c in df.columns:
@@ -957,7 +919,7 @@ def _build_bridge_maturity_like() -> pd.DataFrame:
         df["Servicer Loan Number"] = df["Servicer Loan Number"].fillna(authoritative)
         df.loc[authoritative.notna(), "Servicer Loan Number"] = authoritative[authoritative.notna()]
 
-    return df
+    return downcast_numeric_frame(df)
 
 
 def _build_valuation_like() -> pd.DataFrame:
@@ -977,22 +939,11 @@ def _build_valuation_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = (
-        "SELECT "
-        + ", ".join(exprs.values())
-        + f" FROM Appraisal__c WHERE {prop_rel}.Asset_ID__c != NULL"
-    )
+    soql = "SELECT " + ", ".join(exprs.values()) + f" FROM Appraisal__c WHERE {prop_rel}.Asset_ID__c != NULL"
+    df = run_bulk_query(soql, rename_map=rename_map)
 
-    df = run_bulk_query(soql)
     if df.empty:
         return df
-
-    if len(df.columns) == len(exprs):
-        df.columns = list(exprs.keys())
-    else:
-        df = df.rename(columns=rename_map)
-
-    df = _normalize_bulk_df(df)
 
     if "Asset ID" in df.columns:
         df["_asset_key"] = norm_id_series(df["Asset ID"])
@@ -1002,10 +953,10 @@ def _build_valuation_like() -> pd.DataFrame:
         df = df.drop_duplicates(["_asset_key"], keep="last")
         df = df.drop(columns=["_asset_key", "_order_dt", "_created_dt", "Appraisal: Created Date"], errors="ignore")
 
-    return df
+    return downcast_numeric_frame(df)
 
 
-def _build_opportunity_wide() -> pd.DataFrame:
+def _build_term_wide_like() -> pd.DataFrame:
     exprs = {
         "Deal Loan Number": "Deal_Loan_Number__c",
         "Deal Name": "Name",
@@ -1030,17 +981,7 @@ def _build_opportunity_wide() -> pd.DataFrame:
 
     rename_map = {expr: label for label, expr in exprs.items()}
     soql = "SELECT " + ", ".join(exprs.values()) + " FROM Opportunity WHERE Deal_Loan_Number__c != NULL"
-    df = run_bulk_query(soql)
-    if df.empty:
-        return df
-
-    if len(df.columns) == len(exprs):
-        df.columns = list(exprs.keys())
-    else:
-        df = df.rename(columns=rename_map)
-
-    df = _normalize_bulk_df(df)
-    return df
+    return run_bulk_query(soql, rename_map=rename_map)
 
 
 def _build_am_assignments_like() -> pd.DataFrame:
@@ -1054,9 +995,7 @@ def _build_am_assignments_like() -> pd.DataFrame:
     try:
         df = run_bulk_query(soql)
     except Exception:
-        st.warning(
-            "OpportunityTeamMember bulk pull failed, so the app is using REST query fallback for AM assignments."
-        )
+        st.warning("OpportunityTeamMember bulk pull failed, so the app is using REST query fallback for AM assignments.")
         df = run_rest_query_all(soql)
 
     if df.empty:
@@ -1069,14 +1008,8 @@ def _build_am_assignments_like() -> pd.DataFrame:
         "TeamMemberRole": "Team Role",
         "Date_Assigned__c": "Date Assigned",
     }
-
-    if len(df.columns) == len(rename_map):
-        df.columns = list(rename_map.values())
-    else:
-        df = df.rename(columns=rename_map)
-
-    df = _normalize_bulk_df(df)
-    return df
+    df = df.rename(columns=rename_map)
+    return downcast_numeric_frame(_normalize_bulk_df(df))
 
 
 def _build_term_asset_like() -> pd.DataFrame:
@@ -1097,108 +1030,10 @@ def _build_term_asset_like() -> pd.DataFrame:
     }
 
     rename_map = {expr: label for label, expr in exprs.items()}
-    soql = (
-        "SELECT "
-        + ", ".join(exprs.values())
-        + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
-    )
-
-    df = run_bulk_query(soql)
-    if df.empty:
-        return df
-
-    if len(df.columns) == len(exprs):
-        df.columns = list(exprs.keys())
-    else:
-        df = df.rename(columns=rename_map)
-
-    df = _normalize_bulk_df(df)
-    return df
+    soql = "SELECT " + ", ".join(exprs.values()) + f" FROM Property__c WHERE {opp_rel}.Deal_Loan_Number__c != NULL"
+    return run_bulk_query(soql, rename_map=rename_map)
 
 
-def _slice_report_from_opp(opp: pd.DataFrame, which: str) -> pd.DataFrame:
-    if opp.empty:
-        return pd.DataFrame()
-
-    if which == "do_not_lend":
-        cols = [c for c in ["Deal Loan Number", "Do Not Lend", "Account Name"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "active_rm":
-        cols = [c for c in ["Deal Loan Number", "Deal Name", "CAF Originator"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "term_export":
-        cols = [c for c in [
-            "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name", "Do Not Lend",
-            "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator", "Deal Intro Sub-Source",
-            "Referral Source Account", "Referral Source Contact", "Comments AM", "Servicer Commitment Id",
-            "Current Servicer UPB", "Stage", "Type"
-        ] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    if which == "sold_term":
-        cols = [c for c in ["Deal Loan Number", "Deal Name", "Servicer Commitment Id", "Yardi ID", "Type", "Sold Loan: Sold To"] if c in opp.columns]
-        return opp[cols].drop_duplicates()
-
-    raise KeyError(f"Unhandled opp-slice key: {which}")
-
-
-def pull_reports(sf, keys: Set[str]) -> Dict[str, pd.DataFrame]:
-    day_key = today_et().isoformat()
-    cache = _session_cache("report_cache")
-    out: Dict[str, pd.DataFrame] = {}
-
-    need_bridge_prop = bool({"bridge_maturity"}.intersection(keys))
-    need_valuation = bool({"valuation"}.intersection(keys))
-    need_term_asset = bool({"term_asset"}.intersection(keys))
-    need_opp = bool({"do_not_lend", "active_rm", "term_export", "sold_term"}.intersection(keys))
-    need_am = bool({"am_assignments"}.intersection(keys))
-
-    if need_bridge_prop:
-        ck = f"bridge_prop:{day_key}"
-        if ck not in cache:
-            with st.spinner("Pulling bridge/property data from Salesforce Bulk API..."):
-                cache[ck] = _build_bridge_maturity_like()
-        out["bridge_maturity"] = cache[ck]
-
-    if need_valuation:
-        ck = f"valuation:{day_key}"
-        if ck not in cache:
-            with st.spinner("Pulling valuation data from Salesforce Bulk API..."):
-                cache[ck] = _build_valuation_like()
-        out["valuation"] = cache[ck]
-
-    if need_term_asset:
-        ck = f"term_asset:{day_key}"
-        if ck not in cache:
-            with st.spinner("Pulling term asset data from Salesforce Bulk API..."):
-                cache[ck] = _build_term_asset_like()
-        out["term_asset"] = cache[ck]
-
-    if need_opp:
-        ck = f"opp_wide:{day_key}"
-        if ck not in cache:
-            with st.spinner("Pulling opportunity data from Salesforce Bulk API..."):
-                cache[ck] = _build_opportunity_wide()
-        opp = cache[ck]
-        for k in ["do_not_lend", "active_rm", "term_export", "sold_term"]:
-            if k in keys:
-                out[k] = _slice_report_from_opp(opp, k)
-
-    if need_am:
-        ck = f"am_assignments:{day_key}"
-        if ck not in cache:
-            with st.spinner("Pulling AM assignments from Salesforce (Bulk first, REST fallback if needed)..."):
-                cache[ck] = _build_am_assignments_like()
-        out["am_assignments"] = cache[ck]
-
-    return out
-
-
-# =============================================================================
-# SERVICER FILE PARSING (CACHED)
-# =============================================================================
 @dataclass(frozen=True)
 class UploadBlob:
     filename: str
@@ -1274,7 +1109,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     as_of_file = pd.to_datetime(d_file) if d_file else pd.NaT
 
     if name.lower().endswith(".csv"):
-        df = pd.read_csv(BytesIO(b))
+        usecols = lambda c: c in {"Servicer Loan ID", "UPB", "Next Due Date", "Current Maturity Date", "Performing Status", "Servicing Company"}
+        df = pd.read_csv(BytesIO(b), usecols=usecols)
         req = {"Servicer Loan ID", "UPB"}
         if not req.issubset(set(df.columns)):
             raise ValueError(f"CSV doesn't look like CHL Streamline (missing {req - set(df.columns)}).")
@@ -1293,7 +1129,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "as_of": as_of_file,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     checks: List[Tuple[str, Set[str], Optional[Sequence[str]]]] = [
         ("CHL", {"Servicer Loan ID", "UPB"}, None),
@@ -1315,7 +1151,18 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     if detected is None or sheet_name is None or header_row is None:
         raise ValueError("Could not detect servicer file type.")
 
-    df = pd.read_excel(BytesIO(b), sheet_name=sheet_name, header=header_row - 1)
+    if detected == "CHL":
+        needed = {"Servicer Loan ID", "UPB", "Next Due Date", "Current Maturity Date", "Performing Status", "Servicing Company"}
+    elif detected == "CoreVestLoanData":
+        needed = {"Loan Number", "Current UPB", "Unapplied Balance", "Due Date", "Maturity Date", "Loan Status"}
+    elif detected == "CoreVest_Data_Tape":
+        needed = {"BCM Loan#", "Principal Balance", "Suspense Balance", "Next Payment Due Date", "Maturity Date", "Loan Status"}
+    elif detected == "FCI":
+        needed = {"Account", "Current Balance", "Suspense Pmt.", "Next Due Date", "Maturity Date", "Status"}
+    else:
+        needed = {"ServicerLoanNumber", "UPB$", "NextPaymentDate", "MaturityDate", "ServicerLoanStatus"}
+
+    df = pd.read_excel(BytesIO(b), sheet_name=sheet_name, header=header_row - 1, usecols=lambda c: c in needed)
 
     if detected == "CHL":
         servicer = df.get("Servicing Company", pd.Series(["CHL Streamline"] * len(df))).astype("string")
@@ -1332,7 +1179,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "as_of": as_of_file,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     if detected == "CoreVestLoanData":
         needs_pad = "corevestloandata" in name.lower()
@@ -1350,7 +1197,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "as_of": as_of_file,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     if detected == "CoreVest_Data_Tape":
         status = df.get("Loan Status", pd.Series(["Active"] * len(df))).astype("string")
@@ -1367,7 +1214,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "as_of": as_of_file,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     if detected == "FCI":
         out = pd.DataFrame(
@@ -1383,44 +1230,35 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "as_of": as_of_file,
             }
         )
-        return out.dropna(subset=["servicer_id"])
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
-    if detected == "Midland":
-        raw = df["ServicerLoanNumber"].astype("string").str.strip()
-        raw = raw.str.replace(r"COM$", "", regex=True)
-        raw = raw.str.replace(r"[^0-9A-Za-z]", "", regex=True).str.lstrip("0")
+    raw = df["ServicerLoanNumber"].astype("string").str.strip()
+    raw = raw.str.replace(r"COM$", "", regex=True)
+    raw = raw.str.replace(r"[^0-9A-Za-z]", "", regex=True).str.lstrip("0")
 
-        out = pd.DataFrame(
-            {
-                "source_file": name,
-                "servicer": "Midland",
-                "servicer_id": raw.replace({"": pd.NA}),
-                "upb": df.get("UPB$", pd.Series([np.nan] * len(df))).apply(money_to_float),
-                "suspense": np.nan,
-                "next_payment_date": df.get("NextPaymentDate", pd.Series([None] * len(df))).apply(to_dt),
-                "maturity_date": df.get("MaturityDate", pd.Series([None] * len(df))).apply(to_dt),
-                "status": df.get("ServicerLoanStatus", pd.Series([None] * len(df))).astype("string"),
-                "as_of": as_of_file,
-            }
-        )
-        return out.dropna(subset=["servicer_id"])
-
-    raise ValueError("Unhandled servicer type.")
+    out = pd.DataFrame(
+        {
+            "source_file": name,
+            "servicer": "Midland",
+            "servicer_id": raw.replace({"": pd.NA}),
+            "upb": df.get("UPB$", pd.Series([np.nan] * len(df))).apply(money_to_float),
+            "suspense": np.nan,
+            "next_payment_date": df.get("NextPaymentDate", pd.Series([None] * len(df))).apply(to_dt),
+            "maturity_date": df.get("MaturityDate", pd.Series([None] * len(df))).apply(to_dt),
+            "status": df.get("ServicerLoanStatus", pd.Series([None] * len(df))).astype("string"),
+            "as_of": as_of_file,
+        }
+    )
+    return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=6 * 60 * 60,
-    max_entries=128,
-    hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"},
-)
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60, max_entries=128, hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"})
 def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
 
 
 def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
     blobs: List[UploadBlob] = [make_upload_blob(u) for u in servicer_uploads]
-
     frames: List[pd.DataFrame] = []
     file_dates: List[date] = []
 
@@ -1431,21 +1269,9 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
             file_dates.append(d)
 
     full = (
-        pd.concat(frames, ignore_index=True)
+        pd.concat(frames, ignore_index=True, copy=False)
         if frames
-        else pd.DataFrame(
-            columns=[
-                "source_file",
-                "servicer",
-                "servicer_id",
-                "upb",
-                "suspense",
-                "next_payment_date",
-                "maturity_date",
-                "status",
-                "as_of",
-            ]
-        )
+        else pd.DataFrame(columns=["source_file", "servicer", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
     )
 
     if not full.empty:
@@ -1453,29 +1279,29 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_sid_key"] = id_key_no_leading_zeros(full["servicer_id"])
         full = full.dropna(subset=["_sid_key"]).copy()
 
-        full["_has_upb"] = full["upb"].notna().astype(int)
-        full["_has_npd"] = full["next_payment_date"].notna().astype(int)
-        full["_has_mat"] = full["maturity_date"].notna().astype(int)
+        full["_has_upb"] = full["upb"].notna().astype("int8")
+        full["_has_npd"] = full["next_payment_date"].notna().astype("int8")
+        full["_has_mat"] = full["maturity_date"].notna().astype("int8")
 
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_upb", "_has_npd", "_has_mat", "upb"],
             ascending=[True, True, True, True, True, True],
         )
-        join = full.drop_duplicates(["_sid_key"], keep="last").drop(
-            columns=["_has_upb", "_has_npd", "_has_mat"], errors="ignore"
-        )
+
+        join = full.drop_duplicates(["_sid_key"], keep="last").drop(columns=["_has_upb", "_has_npd", "_has_mat"], errors="ignore")
+        preview = full.head(200).copy()
         full = full.drop(columns=["_has_upb", "_has_npd", "_has_mat"], errors="ignore")
     else:
         full["_sid_key"] = pd.Series(dtype="string")
         join = full.copy()
+        preview = full.copy()
 
     run_date = max(file_dates) if file_dates else date.today()
-    return join, run_date, full
+    del frames
+    gc.collect()
+    return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
 
 
-# =============================================================================
-# LAST WEEK REPORT CARRY-FORWARD
-# =============================================================================
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
     df = df.dropna(how="all")
@@ -1526,49 +1352,36 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     except Exception:
         pass
 
+    gc.collect()
     return out
 
 
-# =============================================================================
-# BUILDERS
-# =============================================================================
 def build_bridge_asset(
     sf_spine: pd.DataFrame,
-    sf_dnl: pd.DataFrame,
     sf_val: pd.DataFrame,
     sf_am: pd.DataFrame,
-    sf_arm: pd.DataFrame,
     serv_lookup: pd.DataFrame,
     upb_col: str,
     prev_maps: dict,
 ) -> pd.DataFrame:
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=sf_spine.index)
 
-    for col, label in BRIDGE_ASSET_FROM_BRIDGE_MATURITY.items():
+    for col, label in BRIDGE_ASSET_FROM_BRIDGE_SPINE.items():
         out[col] = sf_spine[label] if label in sf_spine.columns else None
 
     for extra in ["Loan Commitment", "Remaining Commitment", "Current UPB"]:
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
-    out["Portfolio"] = out.get("Portfolio", "")
-    out["Segment"] = out.get("Segment", "")
-    out["Strategy Grouping"] = out.get("Strategy Grouping", "")
-    out["Do Not Lend (Y/N)"] = None
-    out["Active RM"] = None
+    out["Portfolio"] = ""
+    out["Segment"] = ""
+    out["Strategy Grouping"] = ""
+    out["Do Not Lend (Y/N)"] = _yn_from_bool_series(sf_spine["Do Not Lend"]) if "Do Not Lend" in sf_spine.columns else "N"
+    out["Active RM"] = sf_spine["CAF Originator"] if "CAF Originator" in sf_spine.columns else None
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
     out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
-
-    if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
-        dnl = sf_dnl.copy()
-        dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
-        if "Do Not Lend" in dnl.columns:
-            dnl_flag = dnl.groupby("_deal_key")["Do Not Lend"].max().reset_index()
-            out = out.merge(dnl_flag, on="_deal_key", how="left")
-            out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend"])
-            out = out.drop(columns=["Do Not Lend"], errors="ignore")
 
     if not sf_val.empty and "Asset ID" in sf_val.columns:
         v = sf_val.copy()
@@ -1607,14 +1420,6 @@ def build_bridge_asset(
         out = out.merge(piv_name, on="_deal_key", how="left")
         out = out.merge(piv_date, on="_deal_key", how="left")
 
-    if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
-        arm = sf_arm.copy()
-        arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
-        arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
-        out = out.merge(arm, on="_deal_key", how="left")
-        out["Active RM"] = out["CAF Originator"]
-        out = out.drop(columns=["CAF Originator"], errors="ignore")
-
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy()
         s = s.rename(
@@ -1644,7 +1449,6 @@ def build_bridge_asset(
         reo_mask = stage_series.apply(is_reo_stage)
         loan_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out))), errors="coerce")
         prev_upb_vals = pd.to_numeric(out.get("_prev_upb", pd.Series([np.nan] * len(out))), errors="coerce")
-
         fill_val = prev_upb_vals.fillna(0.0)
         out["_loan_upb"] = np.where(reo_mask & ((loan_upb.isna()) | (loan_upb <= 0)), fill_val, loan_upb)
 
@@ -1671,10 +1475,7 @@ def build_bridge_asset(
 
         out = out.drop(columns=["_prev_upb"], errors="ignore")
     else:
-        if "Current UPB" in sf_spine.columns:
-            out[upb_col] = pd.to_numeric(sf_spine["Current UPB"], errors="coerce")
-        else:
-            out[upb_col] = np.nan
+        out[upb_col] = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
         out["Servicer"] = ""
         out["Next Payment Date"] = pd.NaT
         out["Servicer Maturity Date"] = pd.NaT
@@ -1693,21 +1494,19 @@ def build_bridge_asset(
     if "Is Special Asset (Y/N)" in out.columns:
         out["Is Special Asset (Y/N)"] = _yn_from_bool_series(out["Is Special Asset (Y/N)"])
 
-    return out
+    return downcast_numeric_frame(out)
 
 
 def build_term_loan(
     sf_term: pd.DataFrame,
-    sf_sold: pd.DataFrame,
     sf_am: pd.DataFrame,
-    sf_arm: pd.DataFrame,
     serv_lookup: pd.DataFrame,
     upb_col: str,
     prev_maps: dict,
 ) -> pd.DataFrame:
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=sf_term.index)
 
-    for col, label in TERM_LOAN_FROM_TERM_EXPORT.items():
+    for col, label in TERM_LOAN_FROM_TERM_WIDE.items():
         out[col] = sf_term[label] if label in sf_term.columns else None
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
@@ -1715,29 +1514,15 @@ def build_term_loan(
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
 
-    if not sf_sold.empty and "Deal Loan Number" in sf_sold.columns:
-        sold = sf_sold.copy()
-        sold["_deal_key"] = norm_id_series(sold["Deal Loan Number"])
-        if "Sold Loan: Sold To" in sold.columns:
-            sold = sold[["_deal_key", "Sold Loan: Sold To"]].drop_duplicates("_deal_key")
-            out = out.merge(sold, on="_deal_key", how="left")
-            out["Loan Buyer"] = out["Sold Loan: Sold To"]
-            out = out.drop(columns=["Sold Loan: Sold To"], errors="ignore")
-
-    out["Active RM"] = pd.NA
-    if not sf_arm.empty and "Deal Loan Number" in sf_arm.columns and "CAF Originator" in sf_arm.columns:
-        arm = sf_arm.copy()
-        arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
-        arm = arm[["_deal_key", "CAF Originator"]].drop_duplicates("_deal_key")
-        out = out.merge(arm, on="_deal_key", how="left")
-        out["Active RM"] = out["CAF Originator"].replace({"": pd.NA}).fillna(out["Active RM"])
-        out = out.drop(columns=["CAF Originator"], errors="ignore")
+    out["Loan Buyer"] = sf_term["Sold Loan: Sold To"] if "Sold Loan: Sold To" in sf_term.columns else None
+    out["Active RM"] = sf_term["CAF Originator"].replace({"": pd.NA}) if "CAF Originator" in sf_term.columns else pd.NA
 
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
         am["_dt"] = pd.to_datetime(am.get("Date Assigned"), errors="coerce")
         am = am.sort_values(["_deal_key", "Team Role", "_dt"]).drop_duplicates(["_deal_key", "Team Role"], keep="last")
+
         if "Team Role" in am.columns and "Team Member Name" in am.columns:
             am1 = am[am["Team Role"].astype("string").str.strip().eq("Asset Manager")][["_deal_key", "Team Member Name"]]
             am1 = am1.drop_duplicates("_deal_key")
@@ -1812,11 +1597,11 @@ def build_term_loan(
     if "Segment" not in out.columns:
         out["Segment"] = ""
 
-    return out
+    return downcast_numeric_frame(out)
 
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=sf_term_asset.index)
 
     for col, label in TERM_ASSET_FROM_TERM_ASSET_REPORT.items():
         out[col] = sf_term_asset[label] if label in sf_term_asset.columns else None
@@ -1834,7 +1619,7 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         ala_sum = ala.groupby(out["_deal_key"]).transform("sum")
         out[upb_col] = np.where(ala_sum > 0, out[upb_col] * (ala / ala_sum), out[upb_col])
 
-    return out
+    return downcast_numeric_frame(out)
 
 
 def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict) -> pd.DataFrame:
@@ -1929,15 +1714,12 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
         out = out2
 
     out["Special Focus (Y/N)"] = out["Special Focus (Y/N)"].replace({"": "N"}).fillna("N")
-    return out
+    return downcast_numeric_frame(out)
 
 
-# =============================================================================
-# EXCEL OUTPUT HELPERS
-# =============================================================================
-def header_tuples_from_ws(ws_values, header_row: int = 4) -> List[Tuple[int, str]]:
+def header_tuples_from_ws(ws, header_row: int = 4) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
-    row = list(ws_values.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
+    row = list(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
     for col_idx, cell in enumerate(row, start=1):
         v = cell.value
         h = "" if v is None else str(v).strip()
@@ -1972,22 +1754,17 @@ def clear_columns(ws, col_indices: List[int], start_row: int = 5):
 def _excel_safe_value(val):
     if val is None or val is pd.NA:
         return None
-
     if isinstance(val, pd.Timestamp):
         return None if pd.isna(val) else val.to_pydatetime()
-
     if isinstance(val, np.generic):
         val = val.item()
-
     if isinstance(val, (list, dict, set, tuple)):
         return str(val)
-
     try:
         if pd.isna(val):
             return None
     except Exception:
         pass
-
     return val
 
 
@@ -2002,13 +1779,9 @@ def write_df_to_sheet_preserve_formulas(
     col_indices = [c for c, _h in write_cols]
     headers = [h for _c, h in write_cols]
 
-    df_out = df.copy()
-    for h in headers:
-        if h not in df_out.columns:
-            df_out[h] = None
+    missing = {h: pd.NA for h in headers if h not in df.columns}
+    df_out = df.assign(**missing) if missing else df
     df_out = df_out[headers]
-
-    df_out = df_out.astype(object).where(pd.notna(df_out), None)
 
     clear_columns(ws_formula, col_indices, start_row=start_row)
 
@@ -2034,29 +1807,29 @@ def _parse_mmdd_from_upb_header(h: str) -> Optional[Tuple[int, int]]:
     return int(m.group(1)), int(m.group(2))
 
 
-def set_upb_header_in_sheet(ws_formula, ws_values, new_upb_header: str, header_row: int = 4):
-    hdr = header_tuples_from_ws(ws_values, header_row=header_row)
+def _existing_upb_mmdd(ws, header_row: int = 4) -> Optional[Tuple[int, int]]:
+    hdr = header_tuples_from_ws(ws, header_row=header_row)
+    for _c, h in hdr:
+        mmdd = _parse_mmdd_from_upb_header(h)
+        if mmdd:
+            return mmdd
+    return None
+
+
+def set_upb_header_in_sheet(ws_formula, new_upb_header: str, header_row: int = 4):
+    hdr = header_tuples_from_ws(ws_formula, header_row=header_row)
     for col_idx, h in hdr:
         if isinstance(h, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", h):
             ws_formula.cell(header_row, col_idx).value = new_upb_header
             return
 
 
-def update_run_date_in_row3(ws_formula, ws_values, run_dt: date, header_row: int = 4, date_row: int = 3):
-    hdr = header_tuples_from_ws(ws_values, header_row=header_row)
-    old_mmdd: Optional[Tuple[int, int]] = None
-    for _c, h in hdr:
-        mmdd = _parse_mmdd_from_upb_header(h)
-        if mmdd:
-            old_mmdd = mmdd
-            break
-
+def update_run_date_in_row3(ws_formula, run_dt: date, old_mmdd: Optional[Tuple[int, int]], date_row: int = 3):
     if not old_mmdd:
         return
 
     old_m, old_d = old_mmdd
-
-    row = list(ws_values.iter_rows(min_row=date_row, max_row=date_row, values_only=False))[0]
+    row = list(ws_formula.iter_rows(min_row=date_row, max_row=date_row, values_only=False))[0]
     for col_idx, cell in enumerate(row, start=1):
         v = cell.value
         if isinstance(v, datetime):
@@ -2067,29 +1840,51 @@ def update_run_date_in_row3(ws_formula, ws_values, run_dt: date, header_row: int
                 ws_formula.cell(date_row, col_idx).value = run_dt
 
 
-# =============================================================================
-# REPORT SELECTION / CACHING
-# =============================================================================
-def required_report_keys(target: str) -> Set[str]:
-    need: Set[str] = set()
-    if target in ("Bridge Asset", "Bridge Loan", "All"):
-        need |= {"bridge_maturity", "do_not_lend", "valuation", "am_assignments", "active_rm"}
-    if target in ("Term Loan", "Term Asset", "All"):
-        need |= {"term_export", "sold_term", "am_assignments", "active_rm"}
-    if target in ("Term Asset", "All"):
-        need |= {"term_asset"}
-    return need
+def prepare_sheet_for_run(ws, upb_col: str, run_dt: date):
+    old_mmdd = _existing_upb_mmdd(ws, header_row=4)
+    update_run_date_in_row3(ws, run_dt, old_mmdd, date_row=3)
+    set_upb_header_in_sheet(ws, upb_col, header_row=4)
 
 
-# =============================================================================
-# STREAMLIT UI
-# =============================================================================
+def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str, run_dt: date):
+    if sheet_name not in wb.sheetnames:
+        return
+    ws = wb[sheet_name]
+    prepare_sheet_for_run(ws, upb_col, run_dt)
+    hdr = header_tuples_from_ws(ws, header_row=4)
+    hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
+    fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
+
+
+def init_build_state():
+    if "built_workbook_bytes" not in st.session_state:
+        st.session_state.built_workbook_bytes = None
+    if "built_workbook_name" not in st.session_state:
+        st.session_state.built_workbook_name = None
+    if "built_template_path" not in st.session_state:
+        st.session_state.built_template_path = None
+    if "show_download_prompt" not in st.session_state:
+        st.session_state.show_download_prompt = False
+    if "download_choice" not in st.session_state:
+        st.session_state.download_choice = "Not yet"
+
+
+def reset_build_state():
+    st.session_state.built_workbook_bytes = None
+    st.session_state.built_workbook_name = None
+    st.session_state.built_template_path = None
+    st.session_state.show_download_prompt = False
+    st.session_state.download_choice = "Not yet"
+
+
 st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
 st.subheader(hey())
 
 run_dt = today_et()
 upb_col = make_upb_header(run_dt)
+init_build_state()
 
 st.markdown(
     f"""
@@ -2116,7 +1911,7 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.caption("Using hardcoded Salesforce mappings from your provided object/API names. No reference workbook required.")
+st.caption("Memory-optimized build: no large Salesforce report cache, no duplicate template workbook in memory, and sheets are built/written one at a time.")
 
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
@@ -2144,197 +1939,168 @@ build_target = st.selectbox(
 )
 
 use_sf = st.checkbox("Use Salesforce API (recommended)", value=True)
-sf = None
+sf_ready = False
 if use_sf:
     show_salesforce_login_helper()
-    sf = ensure_sf_session()
+    sf_info = ensure_sf_session()
+    sf_ready = bool(sf_info)
+
     c1, c2 = st.columns([3, 1])
     with c1:
         inst = (st.session_state.get("sf_token") or {}).get("instance_url", "")
         st.success("✅ Logged in to Salesforce API")
         if inst:
             st.caption(f"Connected to: {inst}")
-            st.caption("Bulk API 2.0 will be used automatically for large pulls.")
+            st.caption("Bulk API 2.0 is used with smaller page sizes to reduce memory pressure.")
     with c2:
         if st.button("Log out"):
             st.session_state.sf_token = None
             st.rerun()
 
-if st.button("Clear cached Salesforce reports", type="secondary"):
-    st.session_state.report_cache = {}
+if st.button("Clear cached Salesforce metadata", type="secondary"):
     st.session_state.sobject_describe_cache = {}
-    st.success("Cleared Salesforce caches for this session.")
+    st.success("Cleared Salesforce metadata cache for this session.")
 
 if st.button("Clear cached servicer parsing", type="secondary"):
     st.cache_data.clear()
     st.success("Cleared Streamlit data cache.")
 
-if "built_workbook_bytes" not in st.session_state:
-    st.session_state.built_workbook_bytes = None
-if "built_workbook_name" not in st.session_state:
-    st.session_state.built_workbook_name = None
-if "built_template_path" not in st.session_state:
-    st.session_state.built_template_path = None
-if "show_download_prompt" not in st.session_state:
-    st.session_state.show_download_prompt = False
-if "download_choice" not in st.session_state:
-    st.session_state.download_choice = "Not yet"
-
 build_btn = st.button("Build", type="primary")
 
 if build_btn:
-    st.session_state.built_workbook_bytes = None
-    st.session_state.built_workbook_name = None
-    st.session_state.built_template_path = None
-    st.session_state.show_download_prompt = False
-    st.session_state.download_choice = "Not yet"
+    reset_build_state()
 
-    if not skip_servicer_files and not servicer_uploads:
+    if not use_sf:
+        st.error("This version requires Salesforce API to build the report.")
+    elif not skip_servicer_files and not servicer_uploads:
         st.error("Upload the servicer files, or check 'Skip servicer files and build Salesforce-only version'.")
-    elif use_sf and sf is None:
+    elif not sf_ready:
         st.error("Salesforce login is required.")
     else:
+        wb = None
         try:
+            status = st.status("Preparing build...", expanded=True)
+            diagnostics: List[str] = []
             prev_maps: dict = {}
+
             if prev_upload:
-                with st.spinner("Reading last week's report (carry-forward)..."):
-                    prev_maps = build_prev_maps(prev_upload.getvalue())
+                status.update(label="Reading last week's report for carry-forward...")
+                prev_maps = build_prev_maps(prev_upload.getvalue())
 
             if skip_servicer_files:
-                serv_join = pd.DataFrame(columns=[
-                    "source_file", "servicer", "servicer_id", "upb", "suspense",
-                    "next_payment_date", "maturity_date", "status", "as_of", "_sid_key",
-                ])
+                serv_join = pd.DataFrame(columns=["source_file", "servicer", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of", "_sid_key"])
                 detected_run_date = run_dt
-                serv_full = serv_join.copy()
+                serv_preview = serv_join.copy()
 
                 st.markdown("### Servicer lookup preview")
                 st.caption("Servicer files were skipped. Servicer-driven columns will be blank or Salesforce-fallback where available.")
                 st.caption(f"UPB header (always today): **{upb_col}**")
             else:
-                with st.spinner("Parsing servicer files (cached)..."):
-                    serv_join, detected_run_date, serv_full = build_servicer_lookup(servicer_uploads)
+                status.update(label="Parsing servicer files...")
+                serv_join, detected_run_date, serv_preview = build_servicer_lookup(servicer_uploads)
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest file date from filenames (info only): **{detected_run_date.isoformat()}**")
                 st.caption(f"UPB header (always today): **{upb_col}**")
-                st.dataframe(serv_full.head(30), use_container_width=True)
+                st.dataframe(serv_preview.head(30), use_container_width=True)
 
-            need = required_report_keys(build_target)
-            dfs = pull_reports(sf, need)
+            status.update(label="Loading Excel template...")
+            tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
+            wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
 
-            bridge_asset = None
-            bridge_loan = None
-            term_loan = None
-            term_asset = None
+            need_bridge = build_target in ("Bridge Asset", "Bridge Loan", "All")
+            need_term = build_target in ("Term Loan", "Term Asset", "All")
+            need_term_asset = build_target in ("Term Asset", "All")
+            need_am = need_bridge or need_term
 
-            if build_target in ("Bridge Asset", "Bridge Loan", "All"):
-                with st.spinner("Building Bridge Asset..."):
-                    bridge_asset = build_bridge_asset(
-                        dfs.get("bridge_maturity", pd.DataFrame()),
-                        dfs.get("do_not_lend", pd.DataFrame()),
-                        dfs.get("valuation", pd.DataFrame()),
-                        dfs.get("am_assignments", pd.DataFrame()),
-                        dfs.get("active_rm", pd.DataFrame()),
-                        serv_join,
-                        upb_col,
-                        prev_maps,
-                    )
+            sf_am = pd.DataFrame()
+            if need_am:
+                status.update(label="Pulling AM assignments from Salesforce...")
+                sf_am = _build_am_assignments_like()
 
-            if build_target in ("Bridge Loan", "All"):
-                if bridge_asset is None:
-                    bridge_asset = build_bridge_asset(
-                        dfs.get("bridge_maturity", pd.DataFrame()),
-                        dfs.get("do_not_lend", pd.DataFrame()),
-                        dfs.get("valuation", pd.DataFrame()),
-                        dfs.get("am_assignments", pd.DataFrame()),
-                        dfs.get("active_rm", pd.DataFrame()),
-                        serv_join,
-                        upb_col,
-                        prev_maps,
-                    )
-                with st.spinner("Building Bridge Loan..."):
+            if need_bridge:
+                status.update(label="Pulling bridge/property data from Salesforce...")
+                bridge_spine = _build_bridge_spine_like()
+
+                status.update(label="Pulling valuation data from Salesforce...")
+                bridge_val = _build_valuation_like()
+
+                status.update(label="Building Bridge Asset...")
+                bridge_asset = build_bridge_asset(
+                    bridge_spine,
+                    bridge_val,
+                    sf_am,
+                    serv_join,
+                    upb_col,
+                    prev_maps,
+                )
+
+                diagnostics.append(
+                    f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}"
+                    if upb_col in bridge_asset.columns
+                    else f"Bridge Asset nonblank {upb_col}: n/a"
+                )
+
+                if build_target in ("Bridge Asset", "All"):
+                    status.update(label="Writing Bridge Asset sheet...")
+                    write_output_sheet(wb, "Bridge Asset", bridge_asset, upb_col, run_dt)
+
+                if build_target in ("Bridge Loan", "All"):
+                    status.update(label="Building Bridge Loan...")
                     bridge_loan = build_bridge_loan(bridge_asset, upb_col, prev_maps)
 
-            if build_target in ("Term Loan", "Term Asset", "All"):
-                with st.spinner("Building Term Loan..."):
-                    term_loan = build_term_loan(
-                        dfs.get("term_export", pd.DataFrame()),
-                        dfs.get("sold_term", pd.DataFrame()),
-                        dfs.get("am_assignments", pd.DataFrame()),
-                        dfs.get("active_rm", pd.DataFrame()),
-                        serv_join,
-                        upb_col,
-                        prev_maps,
-                    )
+                    status.update(label="Writing Bridge Loan sheet...")
+                    write_output_sheet(wb, "Bridge Loan", bridge_loan, upb_col, run_dt)
+                    del bridge_loan
 
-            if build_target in ("Term Asset", "All"):
-                if term_loan is None:
-                    term_loan = build_term_loan(
-                        dfs.get("term_export", pd.DataFrame()),
-                        dfs.get("sold_term", pd.DataFrame()),
-                        dfs.get("am_assignments", pd.DataFrame()),
-                        dfs.get("active_rm", pd.DataFrame()),
-                        serv_join,
-                        upb_col,
-                        prev_maps,
-                    )
-                with st.spinner("Building Term Asset..."):
-                    term_asset = build_term_asset(dfs.get("term_asset", pd.DataFrame()), term_loan, upb_col)
+                del bridge_spine, bridge_val, bridge_asset
+                gc.collect()
 
-            st.subheader("Diagnostics")
-            if bridge_asset is not None and upb_col in bridge_asset.columns:
-                st.write(f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}")
-            if term_loan is not None and upb_col in term_loan.columns:
-                st.write(f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}")
+            if need_term:
+                status.update(label="Pulling term data from Salesforce...")
+                term_wide = _build_term_wide_like()
 
-            tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
+                status.update(label="Building Term Loan...")
+                term_loan = build_term_loan(
+                    term_wide,
+                    sf_am,
+                    serv_join,
+                    upb_col,
+                    prev_maps,
+                )
 
-            wb = None
-            wb_vals = None
-            try:
-                wb = load_workbook(BytesIO(tmpl_bytes), data_only=False)
-                wb_vals = load_workbook(BytesIO(tmpl_bytes), data_only=True)
+                diagnostics.append(
+                    f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}"
+                    if upb_col in term_loan.columns
+                    else f"Term Loan nonblank {upb_col}: n/a"
+                )
 
-                for sheet in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]:
-                    if sheet in wb.sheetnames and sheet in wb_vals.sheetnames:
-                        set_upb_header_in_sheet(wb[sheet], wb_vals[sheet], upb_col, header_row=4)
-                        update_run_date_in_row3(wb[sheet], wb_vals[sheet], run_dt, header_row=4, date_row=3)
+                if build_target in ("Term Loan", "All"):
+                    status.update(label="Writing Term Loan sheet...")
+                    write_output_sheet(wb, "Term Loan", term_loan, upb_col, run_dt)
 
-                sheet_to_df = {
-                    "Bridge Asset": bridge_asset,
-                    "Bridge Loan": bridge_loan,
-                    "Term Loan": term_loan,
-                    "Term Asset": term_asset,
-                }
+                if need_term_asset:
+                    status.update(label="Pulling term asset data from Salesforce...")
+                    term_asset_source = _build_term_asset_like()
 
-                targets = ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"] if build_target == "All" else [build_target]
+                    status.update(label="Building Term Asset...")
+                    term_asset = build_term_asset(term_asset_source, term_loan, upb_col)
 
-                for sheet_name in targets:
-                    df = sheet_to_df.get(sheet_name)
-                    if df is None:
-                        continue
-                    if sheet_name not in wb.sheetnames or sheet_name not in wb_vals.sheetnames:
-                        continue
+                    status.update(label="Writing Term Asset sheet...")
+                    write_output_sheet(wb, "Term Asset", term_asset, upb_col, run_dt)
+                    del term_asset_source, term_asset
 
-                    ws = wb[sheet_name]
-                    ws_v = wb_vals[sheet_name]
+                del term_wide, term_loan
+                gc.collect()
 
-                    hdr = header_tuples_from_ws(ws_v, header_row=4)
-                    hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
-                    fcols = formula_col_indices(ws, start_row=5, header_row=4)
+            del sf_am, serv_join, serv_preview
+            gc.collect()
 
-                    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
-
-                out_bytes = BytesIO()
-                wb.save(out_bytes)
-                out_bytes.seek(0)
-
-            finally:
-                if wb is not None:
-                    wb.close()
-                if wb_vals is not None:
-                    wb_vals.close()
+            status.update(label="Saving workbook...")
+            out_bytes = BytesIO()
+            wb.save(out_bytes)
+            out_bytes.seek(0)
+            wb.close()
 
             fname_target = build_target.replace(" ", "_")
             st.session_state.built_workbook_bytes = out_bytes.getvalue()
@@ -2343,12 +2109,24 @@ if build_btn:
             st.session_state.show_download_prompt = True
             st.session_state.download_choice = "Not yet"
 
+            status.update(label="Build complete", state="complete")
             st.success("✅ Workbook built")
             st.caption(f"Built from repo template: {tmpl_path_used}")
+
+            if diagnostics:
+                st.subheader("Diagnostics")
+                for msg in diagnostics:
+                    st.write(msg)
 
         except Exception as e:
             st.error("The report builder hit an error. The real traceback is below.")
             st.exception(e)
+        finally:
+            try:
+                if wb is not None:
+                    wb.close()
+            except Exception:
+                pass
 
 if st.session_state.get("show_download_prompt") and st.session_state.get("built_workbook_bytes"):
     st.markdown("### Download")
