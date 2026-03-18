@@ -7,6 +7,7 @@ import secrets
 import time
 import urllib.parse
 import warnings
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
@@ -19,6 +20,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font
 
 PRIMARY_USER_NAME = "Hayden"
 TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
@@ -42,6 +44,54 @@ TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
 
 AM_ASSIGNMENT_ROLES = ["Asset Manager", "Asset Manager 2", "Construction Manager"]
 EXCLUDED_TEST_ACCOUNT_NAME = "Inhouse Test Account"
+
+# ------------------------------------------------------------------
+# LOOK / FORMATTING MATCHED TO THE COMPLETED ACTIVE LOANS FILE
+# ------------------------------------------------------------------
+DATE_NUMBER_FORMAT = "mm-dd-yy"
+MONEY0_FORMAT = r'#,###;[Red]\(#,###\);"-"'
+MONEY2_FORMAT = r'#,###.00;[Red]\(#,###.00\);"-"'
+BASE_FONT = Font(name="Aptos Narrow", size=11)
+BASE_ALIGNMENT = Alignment(horizontal="center", vertical="center")
+
+SHEET_DATE_HEADERS = {
+    "Bridge Asset": {
+        "Origination Date", "First Funding Date", "Last Funding Date", "Next Payment Date",
+        "Original Loan Maturity date", "Current Loan Maturity date", "Original Asset Maturity date",
+        "Current Asset Maturity Date", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
+        "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date", "Origination Value Dt",
+        "Most Recent Appraisal Order Date", "Updated Valuation Date", "Tax Due Date",
+        "Servicer Maturity Date", "CV Maturity Date", "Maturity Date", "Most Recent Valuation Date",
+    },
+    "Bridge Loan": {
+        "Origination Date", "Last Funding Date", "Original Maturity Date", "Current Maturity Date",
+        "Next Advance Maturity Date", "Next Payment Date", "Most Recent Valuation Date",
+        "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
+    },
+    "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
+    "Term Asset": {"Value Date"},
+}
+
+SHEET_MONEY2_HEADERS = {
+    "Bridge Asset": {
+        "SF Funded Amount", "Suspense Balance", "Origination As-Is Value", "Origination ARV",
+        "Updated As-Is Value", "Updated ARV", "Initial Disbursement Funded", "Renovation Holdback",
+        "Renovation Holdback Funded", "Renovation Holdback Remaining", "Interest Allocation",
+        "Interest Allocation Funded", "Most Recent As-Is Value", "Most Recent ARV", "Needs NPL Value",
+        "Property ALA", "As-Is Value",
+    },
+    "Term Asset": {"Property ALA", "As-Is Value"},
+}
+
+SHEET_MONEY0_HEADERS = {
+    "Bridge Loan": {
+        "Loan Commitment", "Active Funded Amount", "Suspense Balance", "Remaining Commitment",
+        "Most Recent As-Is Value", "Most Recent ARV", "Initial Disbursement Funded",
+        "Renovation Holdback", "Renovation HB Funded", "Renovation HB Remaining",
+        "Interest Allocation", "Interest Allocation Funded",
+    },
+    "Term Loan": {"Loan Amount"},
+}
 
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
@@ -306,9 +356,6 @@ def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ------------------------------------------------------------------
-# SMALL SOQL HELPERS
-# ------------------------------------------------------------------
 def _soql_quote(v: str) -> str:
     s = str(v).replace("\\", "\\\\").replace("'", "\\'")
     return f"'{s}'"
@@ -913,9 +960,6 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
     return downcast_numeric_frame(out)
 
 
-# ------------------------------------------------------------------
-# SALESFORCE DATA BUILDERS
-# ------------------------------------------------------------------
 def _build_bridge_spine_like() -> pd.DataFrame:
     prop_to_opp = _find_property_to_opportunity_link()
     opp_rel = prop_to_opp["relationshipName"]
@@ -1965,11 +2009,47 @@ def _excel_safe_value(val):
     return val
 
 
+def _money_format_for_header(sheet_name: str, header: str, upb_header: str) -> Optional[str]:
+    if header == upb_header:
+        return MONEY2_FORMAT if sheet_name in {"Bridge Asset", "Term Asset"} else MONEY0_FORMAT
+    if header in SHEET_MONEY2_HEADERS.get(sheet_name, set()):
+        return MONEY2_FORMAT
+    if header in SHEET_MONEY0_HEADERS.get(sheet_name, set()):
+        return MONEY0_FORMAT
+    return None
+
+
+def _is_date_header(sheet_name: str, header: str) -> bool:
+    return header in SHEET_DATE_HEADERS.get(sheet_name, set())
+
+
+def _copy_reference_row_style(ws_formula, col_idx: int, target_cell):
+    ref_cell = ws_formula.cell(5, col_idx)
+    if ref_cell.has_style:
+        target_cell._style = copy(ref_cell._style)
+
+
+def _apply_display_style(ws_formula, row_idx: int, col_idx: int, header: str, upb_header: str):
+    cell = ws_formula.cell(row_idx, col_idx)
+    _copy_reference_row_style(ws_formula, col_idx, cell)
+
+    cell.font = copy(BASE_FONT)
+    cell.alignment = copy(BASE_ALIGNMENT)
+
+    if _is_date_header(ws_formula.title, header):
+        cell.number_format = DATE_NUMBER_FORMAT
+    else:
+        money_fmt = _money_format_for_header(ws_formula.title, header, upb_header)
+        if money_fmt:
+            cell.number_format = money_fmt
+
+
 def write_df_to_sheet_preserve_formulas(
     ws_formula,
     df: pd.DataFrame,
     header_tuples: List[Tuple[int, str]],
     formula_cols: Set[int],
+    upb_header: str,
     start_row: int = 5,
 ):
     write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
@@ -1988,6 +2068,7 @@ def write_df_to_sheet_preserve_formulas(
             safe_val = _excel_safe_value(val)
             try:
                 ws_formula.cell(r, c).value = safe_val
+                _apply_display_style(ws_formula, r, c, h, upb_header)
             except Exception as e:
                 raise ValueError(
                     f"Sheet={ws_formula.title}, row={r}, col={c}, header={h}, "
@@ -2051,7 +2132,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str, run_
     hdr = header_tuples_from_ws(ws, header_row=4)
     hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
-    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, start_row=5)
+    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=5)
 
 
 def init_build_state():
@@ -2108,7 +2189,7 @@ except Exception as e:
     st.error(str(e))
     st.stop()
 
-st.caption("Memory-optimized build with active-loan report filters: no large Salesforce report cache, no duplicate template workbook in memory, and valuation/term-asset pulls are limited to active IDs found earlier in the run.")
+st.caption("Memory-optimized build with active-loan report filters and completed-report style formatting applied to dates, balances, and display alignment.")
 
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
@@ -2233,9 +2314,7 @@ if build_btn:
                     prev_maps,
                 )
 
-                diagnostics.append(
-                    f"Bridge Asset rows: {len(bridge_asset):,}"
-                )
+                diagnostics.append(f"Bridge Asset rows: {len(bridge_asset):,}")
                 diagnostics.append(
                     f"Bridge Asset nonblank {upb_col}: {bridge_asset[upb_col].notna().mean():.1%}"
                     if upb_col in bridge_asset.columns
@@ -2270,9 +2349,7 @@ if build_btn:
                     prev_maps,
                 )
 
-                diagnostics.append(
-                    f"Term Loan rows: {len(term_loan):,}"
-                )
+                diagnostics.append(f"Term Loan rows: {len(term_loan):,}")
                 diagnostics.append(
                     f"Term Loan nonblank {upb_col}: {term_loan[upb_col].notna().mean():.1%}"
                     if upb_col in term_loan.columns
