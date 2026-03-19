@@ -1,4 +1,5 @@
 import base64
+import calendar
 import gc
 import hashlib
 import io
@@ -20,22 +21,26 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
 from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
 
 PRIMARY_USER_NAME = "Hayden"
-TEMPLATE_FILENAME = "Active Loan Report Template.xlsx"
+TEMPLATE_FILENAMES = ("Active Loan Template.xlsx", "Active Loan Report Template.xlsx")
 API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 600
+OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
+FORCE_QUARTER_END = None
+UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
-# ------------------------------------------------------------------
-# EXACT FILTERS FROM THE SALESFORCE REPORT METADATA YOU POSTED
-# ------------------------------------------------------------------
 BRIDGE_ACTIVE_STAGES = ["Closed Won", "Expired", "Matured", "REO", "Sold"]
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan"]
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
+
+DNL_STAGES = ["Closed Won", "Purchased", "Brokered- Closed Won", "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold"]
 
 VALUATION_STAGES = ["Closed Won", "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold"]
 VALUATION_PROPERTY_STATUSES = ["Active", "Paid Off", "REO", "REO-Sold"]
@@ -43,6 +48,8 @@ VALUATION_PROPERTY_STATUSES = ["Active", "Paid Off", "REO", "REO-Sold"]
 TERM_ACTIVE_STAGES = ["Approved by Committee", "Closed Won", "Paid Off", "REO", "REO-Sold", "Sold"]
 TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
 TERM_DSCR_TYPES = {"DSCR", "Investor DSCR"}
+
+ACTIVE_RM_STAGES = ["Approved by Committee", "Closed Won", "Purchased", "Brokered- Closed Won", "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold"]
 
 AM_ASSIGNMENT_ROLES = ["Asset Manager", "Asset Manager 2", "Construction Manager"]
 EXCLUDED_TEST_ACCOUNT_NAME = "Inhouse Test Account"
@@ -58,9 +65,6 @@ BRIDGE_MB_FINANCINGS = {
     "Ineligible",
 }
 
-# ------------------------------------------------------------------
-# LOOK / FORMATTING MATCHED TO THE COMPLETED ACTIVE LOANS FILE
-# ------------------------------------------------------------------
 DATE_NUMBER_FORMAT = "mm-dd-yy"
 MONEY0_FORMAT = r'#,###;[Red]\(#,###\);"-"'
 MONEY2_FORMAT = r'#,###.00;[Red]\(#,###.00\);"-"'
@@ -106,9 +110,6 @@ SHEET_MONEY0_HEADERS = {
     "Term Loan": {"Loan Amount"},
 }
 
-# ------------------------------------------------------------------
-# OUTPUT COLUMN MAPS
-# ------------------------------------------------------------------
 BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Loan Buyer": "Sold To",
     "Financing": "Warehouse Line",
@@ -163,7 +164,7 @@ BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Transaction Type": "Transaction Type",
     "Project Strategy": "Project Strategy",
     "Property Type": "Property Type",
-    "Originator": "Originator",
+    "Originator": "Originator: Originating Company",
     "Deal Intro Sub-Source": "Deal Intro Sub-Source",
     "Referral Source Account": "Referral Source Account: Account Name",
     "Referral Source Contact": "Referral Source Contact: Full Name",
@@ -213,6 +214,273 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "As-Is Value": "As-Is Value",
 }
 
+SHEET_BLUEPRINTS = {
+    "Bridge Asset": {
+        "row1": {
+            34: "CALC", 86: "CALC", 87: "CALC", 88: "CALC", 89: "CALC", 90: "CALC",
+            91: "CALC", 92: "CALC", 93: "CALC", 94: "CALC", 95: "CALC", 96: "CALC",
+            97: "CALC", 98: "CALC", 99: "CALC", 101: "CALC", 102: "CALC", 103: "CALC",
+            104: "CALC", 105: "CALC",
+        },
+        "row2": {
+            2: "Bridge Asset Data",
+            104: "__QEND__",
+        },
+        "row3": {
+            35: "__SUBTOTAL__",
+            89: "__RUN_DT__",
+            90: "=+$CK$3",
+            95: "=EDATE(CZ2,-6)",
+            104: "=+$CZ$2-90",
+        },
+        "row4": {
+            2: "Portfolio",
+            3: "Loan Buyer",
+            4: "Financing",
+            5: "Deal Number",
+            6: "Servicer ID",
+            7: "Servicer",
+            8: "SF Yardi ID",
+            9: "Asset ID",
+            10: "Deal Name",
+            11: "Borrower Entity",
+            12: "Account Name",
+            13: "Do Not Lend (Y/N)",
+            14: "Primary Contact",
+            15: "Address",
+            16: "City",
+            17: "State",
+            18: "Zip",
+            19: "County",
+            20: "CBSA",
+            21: "APN",
+            22: "Additional APNs",
+            23: "# of Units",
+            24: "Year Built",
+            25: "Square Feet",
+            26: "Origination Date",
+            27: "First Funding Date",
+            28: "Last Funding Date",
+            29: "Next Payment Date",
+            30: "Original Loan Maturity date",
+            31: "Current Loan Maturity date",
+            32: "Original Asset Maturity date",
+            33: "Current Asset Maturity Date",
+            34: "SF Funded Amount",
+            35: "__UPB__",
+            36: "Suspense Balance",
+            37: "Asset Manager 1",
+            38: "AM 1 Assigned Date",
+            39: "Asset Manager 2",
+            40: "AM 2 Assigned Date",
+            41: "Construction Mgr.",
+            42: "CM Assigned Date",
+            43: "Remedy Plan",
+            44: "Delinquency Notes",
+            45: "Maturity Status",
+            46: "Is Special Asset (Y/N)",
+            47: "Special Asset Status",
+            48: "Special Asset Reason",
+            49: "Special Asset: Special Asset Status",
+            50: "Special Asset: Resolved Date",
+            51: "Forbearance Term Date",
+            52: "REO Date",
+            53: "Origination Value Dt",
+            54: "Origination As-Is Value",
+            55: "Origination ARV",
+            56: "Most Recent Appraisal Order Date",
+            57: "Updated Valuation Date",
+            58: "Updated As-Is Value",
+            59: "Updated ARV",
+            60: "Initial Disbursement Funded",
+            61: "Renovation Holdback",
+            62: "Renovation Holdback Funded",
+            63: "Renovation Holdback Remaining",
+            64: "Interest Allocation",
+            65: "Interest Allocation Funded",
+            66: "Title Company",
+            67: "Tax Due Date",
+            68: "Tax Frequency",
+            69: "Tax Commentary",
+            70: "Segment",
+            71: "Product Type",
+            72: "Product Sub-Type",
+            73: "Transaction Type",
+            74: "Project Strategy",
+            75: "Strategy Grouping",
+            76: "Property Type",
+            77: "Originator",
+            78: "Active RM",
+            79: "Deal Intro Sub-Source",
+            80: "Referral Source Account",
+            81: "Referral Source Contact",
+            82: "Loan Stage",
+            83: "Property Status",
+            84: "Servicer Status",
+            85: "Servicer Maturity Date",
+            86: "CV Maturity Date",
+            87: "Maturity Difference",
+            88: "Maturity Date",
+            89: "Days to Maturity",
+            90: "Days Past Due",
+            91: "DQ Status",
+            92: "Most Recent Valuation Date",
+            93: "Most Recent As-Is Value",
+            94: "Most Recent ARV",
+            95: "Needs NPL Value",
+            96: "Securitized (Y/N)",
+            97: "SSP JV (Y/N)",
+            98: "CPP JV (Y/N)",
+            99: "Oaktree JV (Y/N)",
+            100: "Legacy (Y/N)",
+            101: "Matured Loan (YN)",
+            102: "DQ 45+ Loan (Y/N)",
+            103: "SA Loan (Y/N)",
+            104: "3/31 NPL (Y/N)",
+            105: "Special Flag",
+        },
+        "subtotal_col": 35,
+    },
+    "Bridge Loan": {
+        "row1": {},
+        "row2": {},
+        "row3": {
+            22: "=+'Bridge Asset'!$CK$3",
+            26: "__SUBTOTAL__",
+        },
+        "row4": {
+            2: "Portfolio",
+            3: "Loan Buyer",
+            4: "Financing",
+            5: "Deal Number",
+            6: "Servicer ID",
+            7: "Servicer",
+            8: "Deal Name",
+            9: "Borrower Name",
+            10: "Account",
+            11: "Do Not Lend (Y/N)",
+            12: "Primary Contact",
+            13: "Number of Assets",
+            14: "# of Units",
+            15: "State(s)",
+            16: "Origination Date",
+            17: "Last Funding Date",
+            18: "Original Maturity Date",
+            19: "Current Maturity Date",
+            20: "Next Advance Maturity Date",
+            21: "Next Payment Date",
+            22: "Days Past Due",
+            23: "Loan Level Delinquency",
+            24: "Loan Commitment",
+            25: "Active Funded Amount",
+            26: "=+'Bridge Asset'!$AI$4",
+            27: "Suspense Balance",
+            28: "Remaining Commitment",
+            29: "Most Recent Valuation Date",
+            30: "Most Recent As-Is Value",
+            31: "Most Recent ARV",
+            32: "Initial Disbursement Funded",
+            33: "Renovation Holdback",
+            34: "Renovation HB Funded",
+            35: "Renovation HB Remaining",
+            36: "Interest Allocation",
+            37: "Interest Allocation Funded",
+            38: "Loan Stage",
+            39: "Segment",
+            40: "Product Type",
+            41: "Product Sub Type",
+            42: "Transaction Type",
+            43: "Project Strategy",
+            44: "Strategy Grouping",
+            45: "CV Originator",
+            46: "Active RM",
+            47: "Deal Intro Sub-Source",
+            48: "Referral Source Account",
+            49: "Referral Source Contact",
+            50: "3/31 NPL",
+            51: "Needs NPL Value",
+            52: "Special Focus (Y/N)",
+            53: "Asset Manager 1",
+            54: "AM 1 Assigned Date",
+            55: "Asset Manager 2",
+            56: "AM 2 Assigned Date",
+            57: "Construction Mgr.",
+            58: "CM Assigned Date",
+            59: "AM Commentary",
+        },
+        "subtotal_col": 26,
+    },
+    "Term Loan": {
+        "row1": {
+            30: "__QEND__",
+        },
+        "row2": {
+            2: "Term Loan Data",
+        },
+        "row3": {
+            16: "__SUBTOTAL__",
+            21: "__RUN_DT__",
+            30: "=+$AD$1-90",
+        },
+        "row4": {
+            2: "Deal Number",
+            3: "Servicer ID",
+            4: "Servicer",
+            5: "SF Yardi ID",
+            6: "Deal Name",
+            7: "Borrower Entity",
+            8: "Account Name",
+            9: "Do Not Lend (Y/N)",
+            10: "Portfolio",
+            11: "Segment",
+            12: "Financing",
+            13: "CPP JV",
+            14: "Loan Buyer",
+            15: "Loan Amount",
+            16: "__UPB__",
+            17: "Origination Date",
+            18: "Maturity Date",
+            19: "Next Payment Date",
+            20: "REO Date",
+            21: "Days Past Due",
+            22: "DQ Status",
+            23: "Asset Manager",
+            24: "Originator",
+            25: "Active RM",
+            26: "Deal Intro Sub-Source",
+            27: "Referral Source Account",
+            28: "Referral Source Contact",
+            29: "AM Commentary",
+            30: "Special Loans List (Y/N)",
+        },
+        "subtotal_col": 16,
+    },
+    "Term Asset": {
+        "row1": {},
+        "row2": {},
+        "row3": {
+            12: "__SUBTOTAL__",
+        },
+        "row4": {
+            2: "Deal Number",
+            3: "Asset ID",
+            4: "Address",
+            5: "City",
+            6: "State",
+            7: "Zip",
+            8: "CBSA",
+            9: "# Units",
+            10: "Property Type",
+            11: "Property ALA",
+            12: "=+'Term Loan'!$P$4",
+            13: "Special (Y/N)",
+            14: "Value Date",
+            15: "As-Is Value",
+        },
+        "subtotal_col": 12,
+    },
+}
+
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
     return f"Hi {name} 👋"
@@ -221,24 +489,29 @@ def hey(name: str = PRIMARY_USER_NAME) -> str:
 @st.cache_data(show_spinner=False)
 def load_repo_template_bytes() -> Tuple[bytes, str]:
     here = Path(__file__).resolve().parent
-    candidates = [
-        here / TEMPLATE_FILENAME,
-        here / "templates" / TEMPLATE_FILENAME,
-        here / "assets" / TEMPLATE_FILENAME,
-        Path.cwd() / TEMPLATE_FILENAME,
-        Path(TEMPLATE_FILENAME),
-    ]
+    candidates = []
+    for filename in TEMPLATE_FILENAMES:
+        candidates.extend(
+            [
+                here / filename,
+                here / "templates" / filename,
+                here / "assets" / filename,
+                Path.cwd() / filename,
+                Path(filename),
+            ]
+        )
+
     for p in candidates:
         try:
             if p.exists() and p.is_file():
                 return p.read_bytes(), str(p)
         except Exception:
             continue
+
     tried = "\n".join(str(p) for p in candidates)
     raise FileNotFoundError(
-        f"Could not find '{TEMPLATE_FILENAME}' in your repo.\n\n"
-        f"Tried:\n{tried}\n\n"
-        f"Fix: Commit '{TEMPLATE_FILENAME}' to your GitHub repo."
+        f"Could not find any template file.\n\nTried:\n{tried}\n\n"
+        f"Fix: commit one of these to your repo: {', '.join(TEMPLATE_FILENAMES)}"
     )
 
 
@@ -246,9 +519,14 @@ def today_et() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
-# ------------------------------------------------------------------
-# GENERAL HELPERS
-# ------------------------------------------------------------------
+def quarter_end_for_run(run_dt: date) -> date:
+    if FORCE_QUARTER_END is not None:
+        return FORCE_QUARTER_END
+    q_month = ((run_dt.month - 1) // 3 + 1) * 3
+    last_day = calendar.monthrange(run_dt.year, q_month)[1]
+    return date(run_dt.year, q_month, last_day)
+
+
 def norm_id_series(s: pd.Series) -> pd.Series:
     return (
         s.astype("string")
@@ -315,18 +593,15 @@ def clean_text(val) -> str:
 
 
 def blankish_mask(s: pd.Series) -> pd.Series:
-    s2 = pd.Series(s, copy=False)
-    s_text = s2.astype("string").str.strip().str.lower()
-    return s2.isna() | s_text.isin(["", "nan", "none", "<na>", "nat"])
+    base = pd.Series(list(pd.Series(s, copy=False)), index=pd.Series(s, copy=False).index, dtype="object")
+    s_text = base.astype("string").str.strip().str.lower()
+    return base.isna() | s_text.isin(["", "nan", "none", "<na>", "nat"])
 
 
 def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series:
-    p = pd.Series(primary, copy=False)
-    f = pd.Series(fallback, index=p.index)
-    out = p.copy()
-    mask = blankish_mask(out)
-    out.loc[mask] = f.loc[mask]
-    return out
+    p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index)
+    f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index)
+    return p.where(~blankish_mask(p), f)
 
 
 def deal_key(value) -> str:
@@ -396,7 +671,8 @@ def _yn_from_bool_series(s: pd.Series) -> pd.Series:
                 return "N"
         return "Y" if bool(x) else "N"
 
-    return pd.Series(s, index=s.index, dtype="object").map(_one)
+    base = pd.Series(list(pd.Series(s, copy=False)), index=pd.Series(s, copy=False).index, dtype="object")
+    return base.map(_one)
 
 
 LIKELY_DATE_PATTERNS = (
@@ -450,6 +726,62 @@ def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
     return out
+
+
+def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+    numeric_hints = ("amount", "value", "upb", "balance", "feet", "units", "year", "rate", "commitment", "ala")
+
+    def _is_date_like(col_name: str) -> bool:
+        cl = str(col_name).lower()
+        if "status" in cl:
+            return False
+        return (
+            "date" in cl
+            or "funding" in cl
+            or "close" in cl
+            or "order" in cl
+            or "resolved" in cl
+            or "maturity" in cl
+        )
+
+    for c in out.columns:
+        s = out[c]
+        cl = str(c).lower()
+
+        if _is_date_like(c) and not pd.api.types.is_datetime64_any_dtype(s):
+            s_str = s.astype("string").str.strip()
+            nonblank_mask = s_str.notna() & s_str.ne("")
+            nonblank_count = int(nonblank_mask.sum())
+
+            if nonblank_count > 0:
+                likely_date_mask = s_str.map(_looks_like_date_string)
+                likely_count = int((likely_date_mask & nonblank_mask).sum())
+
+                if likely_count > 0 and (likely_count / nonblank_count) >= 0.60:
+                    parsed_input = s_str.where(likely_date_mask, pd.NA)
+                    parsed = _to_datetime_series_mixed(parsed_input)
+                    parsed_count = int(parsed[nonblank_mask].notna().sum())
+
+                    if parsed_count > 0 and (parsed_count / nonblank_count) >= 0.60:
+                        out[c] = parsed
+                        continue
+
+        if any(h in cl for h in numeric_hints):
+            cleaned = (
+                s.astype("string")
+                .str.replace(",", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("%", "", regex=False)
+            )
+            parsed = pd.to_numeric(cleaned, errors="coerce")
+            if parsed.notna().sum() > 0:
+                out[c] = parsed
+
+    return downcast_numeric_frame(out)
 
 
 def _soql_quote(v: str) -> str:
@@ -515,9 +847,6 @@ def _run_bulk_union(soql_list, rename_map=None):
     return downcast_numeric_frame(out)
 
 
-# ------------------------------------------------------------------
-# SALESFORCE AUTH + HTTP
-# ------------------------------------------------------------------
 def b64url_no_pad(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode("utf-8")
 
@@ -572,7 +901,7 @@ def show_salesforce_login_helper():
     st.info(
         "Step 1: Log in to Salesforce.\n\n"
         "Step 2: Approve access.\n\n"
-        "Step 3: Click Build. This app uses the Salesforce API and Bulk API 2.0 to pull larger datasets."
+        "Step 3: Click Build. This app uses Salesforce Bulk API 2.0 to pull the full datasets."
     )
 
 
@@ -770,53 +1099,6 @@ def run_bulk_query(soql: str, rename_map: Optional[Dict[str, str]] = None) -> pd
     return downcast_numeric_frame(out)
 
 
-def _rest_query(soql: str) -> dict:
-    return _sf_request("query", method="GET", params={"q": soql})
-
-
-def _rest_query_more(next_records_url: str) -> dict:
-    path = next_records_url
-    marker = f"/services/data/{API_VERSION}/"
-    if marker in path:
-        path = path.split(marker, 1)[-1]
-    return _sf_request(path, method="GET")
-
-
-def run_rest_query_all(soql: str) -> pd.DataFrame:
-    js = _rest_query(soql)
-    records = list(js.get("records") or [])
-    while not js.get("done", True):
-        next_url = js.get("nextRecordsUrl")
-        if not next_url:
-            break
-        js = _rest_query_more(next_url)
-        records.extend(js.get("records") or [])
-    if not records:
-        return pd.DataFrame()
-
-    def _flatten_record(rec: dict) -> dict:
-        out = {}
-        for k, v in rec.items():
-            if k == "attributes":
-                continue
-            if isinstance(v, dict):
-                for sub_k, sub_v in v.items():
-                    if sub_k != "attributes":
-                        out[f"{k}.{sub_k}"] = sub_v
-            else:
-                out[k] = v
-        return out
-
-    out = pd.DataFrame([_flatten_record(r) for r in records])
-    del records
-    gc.collect()
-    return downcast_numeric_frame(out)
-
-
-# ------------------------------------------------------------------
-# MINIMAL SALESFORCE METADATA HELPERS
-# only the ones actually needed for relationship names
-# ------------------------------------------------------------------
 def describe_sobject(sobject: str) -> dict:
     cache = _session_cache("sobject_describe_cache")
     if sobject in cache:
@@ -861,13 +1143,10 @@ def property_opportunity_relationship_name() -> str:
 def appraisal_property_relationship_name() -> str:
     field_api = first_existing_field_name("Appraisal__c", ["Property__c", "Subject_Property__c"])
     if not field_api:
-        raise KeyError("Could not find Appraisal__c -> Property__c relationship field.")
+        raise KeyError("Could not find Appraisal__c -> Property relationship field.")
     return relationship_name_for("Appraisal__c", field_api)
 
 
-# ------------------------------------------------------------------
-# LOOKUP MAPS FROM TEMPLATE / WORKBOOK TABS
-# ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_template_lookup_maps(template_bytes: bytes) -> dict:
     maps = {
@@ -970,69 +1249,6 @@ def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number,
     return "Active Term", "Mortgage Banking", "N"
 
 
-# ------------------------------------------------------------------
-# NORMALIZATION
-# ------------------------------------------------------------------
-def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    out = df.copy()
-    numeric_hints = ("amount", "value", "upb", "balance", "feet", "units", "year", "rate", "commitment", "ala")
-
-    def _is_date_like(col_name: str) -> bool:
-        cl = str(col_name).lower()
-        if "status" in cl:
-            return False
-        return (
-            "date" in cl
-            or "funding" in cl
-            or "close" in cl
-            or "order" in cl
-            or "resolved" in cl
-            or "maturity" in cl
-        )
-
-    for c in out.columns:
-        s = out[c]
-        cl = str(c).lower()
-
-        if _is_date_like(c) and not pd.api.types.is_datetime64_any_dtype(s):
-            s_str = s.astype("string").str.strip()
-            nonblank_mask = s_str.notna() & s_str.ne("")
-            nonblank_count = int(nonblank_mask.sum())
-
-            if nonblank_count > 0:
-                likely_date_mask = s_str.map(_looks_like_date_string)
-                likely_count = int((likely_date_mask & nonblank_mask).sum())
-
-                if likely_count > 0 and (likely_count / nonblank_count) >= 0.60:
-                    parsed_input = s_str.where(likely_date_mask, pd.NA)
-                    parsed = _to_datetime_series_mixed(parsed_input)
-                    parsed_count = int(parsed[nonblank_mask].notna().sum())
-
-                    if parsed_count > 0 and (parsed_count / nonblank_count) >= 0.60:
-                        out[c] = parsed
-                        continue
-
-        if any(h in cl for h in numeric_hints):
-            cleaned = (
-                s.astype("string")
-                .str.replace(",", "", regex=False)
-                .str.replace("$", "", regex=False)
-                .str.replace("%", "", regex=False)
-            )
-            parsed = pd.to_numeric(cleaned, errors="coerce")
-            if parsed.notna().sum() > 0:
-                out[c] = parsed
-
-    return downcast_numeric_frame(out)
-
-
-# ------------------------------------------------------------------
-# SALESFORCE DATA BUILDS
-# explicit field/API paths based on your metadata map
-# ------------------------------------------------------------------
 def _build_bridge_spine_like() -> pd.DataFrame:
     opp_rel = property_opportunity_relationship_name()
 
@@ -1059,9 +1275,6 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Borrower Entity: Business Entity Name", f"{opp_rel}.Borrower_Entity__r.Name"),
         ("Account Name: Account Name", f"{opp_rel}.Account.Name"),
         ("Primary Contact: Full Name", primary_contact_expr),
-        ("Do Not Lend", f"{opp_rel}.Account.Do_Not_Lend__c"),
-        ("CAF Originator: Active", f"{opp_rel}.Owner.IsActive"),
-        ("Originator", f"{opp_rel}.Owner.Name"),
         ("Address", "Name"),
         ("City", "City__c"),
         ("State", "State__c"),
@@ -1076,7 +1289,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Close Date", f"{opp_rel}.CloseDate"),
         ("First Funding Date", "First_Funding_Date__c"),
         ("Last Funding Date", "Funding_Date__c"),
-        ("SF Next Payment Date", "Next_Payment_Date__c"),
+        ("Property Next Payment Date", "Next_Payment_Date__c"),
+        ("Opportunity Next Payment Date", f"{opp_rel}.Next_Payment_Date__c"),
         ("Original Loan Maturity Date", f"{opp_rel}.Stated_Maturity_Date__c"),
         ("Current Loan Maturity date", f"{opp_rel}.Current_Line_Maturity_Date__c"),
         ("Original Asset Maturity Date", "Asset_Maturity_Date_Override__c"),
@@ -1109,6 +1323,7 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Transaction Type", f"{opp_rel}.Transaction_Type__c"),
         ("Project Strategy", f"{opp_rel}.Project_Strategy__c"),
         ("Property Type", "Property_Type__c"),
+        ("Originator: Originating Company", f"{opp_rel}.Owner.Originating_Company__c"),
         ("Deal Intro Sub-Source", f"{opp_rel}.Deal_Intro_Sub_Source__c"),
         ("Referral Source Account: Account Name", f"{opp_rel}.Referral_Source__r.Name"),
         ("Referral Source Contact: Full Name", f"{opp_rel}.Referral_Source_Contact__r.Name"),
@@ -1160,36 +1375,55 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     return downcast_numeric_frame(df)
 
 
+def _build_do_not_lend_like() -> pd.DataFrame:
+    soql = (
+        "SELECT Deal_Loan_Number__c, Account.Name, Account.Do_Not_Lend__c "
+        "FROM Opportunity WHERE "
+        "Account.Do_Not_Lend__c = TRUE "
+        f"AND {_soql_in('StageName', DNL_STAGES)} "
+        "AND Deal_Loan_Number__c != NULL"
+    )
+    df = run_bulk_query(soql)
+    rename_map = {
+        "Deal_Loan_Number__c": "Deal Loan Number",
+        "Account.Name": "Account Name",
+        "Account.Do_Not_Lend__c": "Do Not Lend",
+    }
+    return downcast_numeric_frame(_normalize_bulk_df(df.rename(columns=rename_map)))
+
+
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     prop_rel = appraisal_property_relationship_name()
     asset_ids = _nonblank_unique(asset_ids or [])
-
-    exprs = {
-        "Asset ID": f"{prop_rel}.Asset_ID__c",
-        "Order Date": "Order_Received_Date__c",
-        "Current Appraisal Date": f"{prop_rel}.BPO_Appraisal_Date__c",
-        "Current Appraised As-Is Value": f"{prop_rel}.Appraised_Value_Amount__c",
-        "Current Appraised After Repair Value": f"{prop_rel}.After_Repair_Value__c",
-        "Origination Valuation Date": f"{prop_rel}.Origination_Date_Valuation_Date__c",
-        "Origination As-Is Value": f"{prop_rel}.Origination_Date_Value__c",
-        "Origination After Repair Value": f"{prop_rel}.Origination_After_Repair_Value__c",
-        "Appraisal: Created Date": "CreatedDate",
-    }
-
-    rename_map = {expr: label for label, expr in exprs.items()}
     soqls = []
+
+    select_pairs = [
+        ("Asset ID", f"{prop_rel}.Asset_ID__c"),
+        ("Order Date", "Order_Received_Date__c"),
+        ("Current Appraisal Date", f"{prop_rel}.BPO_Appraisal_Date__c"),
+        ("Current Appraised As-Is Value", f"{prop_rel}.Appraised_Value_Amount__c"),
+        ("Current Appraised After Repair Value", f"{prop_rel}.After_Repair_Value__c"),
+        ("Origination Valuation Date", f"{prop_rel}.Origination_Date_Valuation_Date__c"),
+        ("Origination As-Is Value", f"{prop_rel}.Origination_Date_Value__c"),
+        ("Origination After Repair Value", f"{prop_rel}.Origination_After_Repair_Value__c"),
+        ("Appraisal: Created Date", "CreatedDate"),
+    ]
+    rename_map = {expr: label for label, expr in select_pairs}
 
     if asset_ids:
         for chunk in _chunked(asset_ids, size=200):
-            where_parts = [_soql_in(f"{prop_rel}.Asset_ID__c", chunk)]
             soqls.append(
                 "SELECT "
-                + ", ".join(exprs.values())
+                + ", ".join(expr for _label, expr in select_pairs)
                 + " FROM Appraisal__c WHERE "
-                + " AND ".join(where_parts)
+                + _soql_in(f"{prop_rel}.Asset_ID__c", chunk)
             )
     else:
-        soqls.append("SELECT " + ", ".join(exprs.values()) + " FROM Appraisal__c")
+        soqls.append(
+            "SELECT "
+            + ", ".join(expr for _label, expr in select_pairs)
+            + " FROM Appraisal__c"
+        )
 
     df = _run_bulk_union(soqls, rename_map=rename_map)
 
@@ -1207,79 +1441,17 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     return downcast_numeric_frame(df)
 
 
-def _build_term_wide_like() -> pd.DataFrame:
-    sold_pool_field = first_existing_field_name("Opportunity", ["FK_Sold_Loan_Pool__c", "Sold_Loan_Pool__c"])
-    sold_pool_rel = relationship_name_for("Opportunity", sold_pool_field) if sold_pool_field else None
-    sold_to_expr = f"{sold_pool_rel}.Sold_To__r.Name" if sold_pool_rel else "Account.Name"
-
-    exprs = {
-        "Deal Loan Number": "Deal_Loan_Number__c",
-        "Deal Name": "Name",
-        "Account Name": "Account.Name",
-        "Do Not Lend": "Account.Do_Not_Lend__c",
-        "Borrower Entity": "Borrower_Entity__r.Name",
-        "CAF Originator": "Owner.Name",
-        "CAF Originator Active": "Owner.IsActive",
-        "Close Date": "CloseDate",
-        "Current Funding Vehicle": "Current_Funding_Vehicle__c",
-        "Servicer Name": "Servicer_Name__c",
-        "Next Payment Date": "Next_Payment_Date__c",
-        "Original Loan Maturity Date": "Stated_Maturity_Date__c",
-        "Loan Amount": "Amount",
-        "Comments AM": "Asset_Management_Comments__c",
-        "Deal Intro Sub-Source": "Deal_Intro_Sub_Source__c",
-        "Referral Source Account": "Referral_Source__r.Name",
-        "Referral Source Contact": "Referral_Source_Contact__r.Name",
-        "Servicer Commitment Id": "Servicer_Commitment_Id__c",
-        "Yardi ID": "Yardi_ID__c",
-        "Stage": "StageName",
-        "Type": "Type",
-        "Current Servicer UPB": "Current_UPB__c",
-        "Sold Loan: Sold To": sold_to_expr,
-    }
-
-    rename_map = {expr: label for label, expr in exprs.items()}
-
-    where_parts = [
-        "Deal_Loan_Number__c != NULL",
-        _soql_in("Type", TERM_TYPES),
-        _soql_in("StageName", TERM_ACTIVE_STAGES),
-        "Probability > 0",
-    ]
-
-    soql = (
-        "SELECT "
-        + ", ".join(exprs.values())
-        + " FROM Opportunity WHERE "
-        + " AND ".join(where_parts)
-    )
-
-    return run_bulk_query(soql, rename_map=rename_map)
-
-
 def _build_am_assignments_like() -> pd.DataFrame:
-    where_parts = [
-        "Opportunity.Deal_Loan_Number__c != NULL",
-        _soql_parent_name_not_equal_or_no_parent("Opportunity.AccountId", "Opportunity.Account.Name", EXCLUDED_TEST_ACCOUNT_NAME),
-        _soql_in("TeamMemberRole", AM_ASSIGNMENT_ROLES),
-    ]
-
     soql = (
-        "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, User.Name, "
-        "TeamMemberRole, Date_Assigned__c "
+        "SELECT Opportunity.Deal_Loan_Number__c, Opportunity.Name, User.Name, TeamMemberRole, Date_Assigned__c "
         "FROM OpportunityTeamMember WHERE "
-        + " AND ".join(where_parts)
+        "Opportunity.Deal_Loan_Number__c != NULL AND "
+        + _soql_parent_name_not_equal_or_no_parent("Opportunity.AccountId", "Opportunity.Account.Name", EXCLUDED_TEST_ACCOUNT_NAME)
+        + " AND "
+        + _soql_in("TeamMemberRole", AM_ASSIGNMENT_ROLES)
     )
 
-    try:
-        df = run_bulk_query(soql)
-    except Exception:
-        st.warning("OpportunityTeamMember bulk pull failed, so the app is using REST query fallback for AM assignments.")
-        df = run_rest_query_all(soql)
-
-    if df.empty:
-        return df
-
+    df = run_bulk_query(soql)
     rename_map = {
         "Opportunity.Deal_Loan_Number__c": "Deal Loan Number",
         "Opportunity.Name": "Deal Name",
@@ -1291,52 +1463,157 @@ def _build_am_assignments_like() -> pd.DataFrame:
     return downcast_numeric_frame(_normalize_bulk_df(df))
 
 
+def _build_active_rm_like() -> pd.DataFrame:
+    soql = (
+        "SELECT Opportunity.Deal_Loan_Number__c "
+        "FROM OpportunityTeamMember WHERE "
+        "Opportunity.Deal_Loan_Number__c != NULL AND "
+        + _soql_parent_name_not_equal_or_no_parent("Opportunity.AccountId", "Opportunity.Account.Name", EXCLUDED_TEST_ACCOUNT_NAME)
+        + " AND "
+        + _soql_in("Opportunity.StageName", ACTIVE_RM_STAGES)
+    )
+    df = run_bulk_query(soql)
+    if df.empty:
+        return df
+    df = df.rename(columns={"Opportunity.Deal_Loan_Number__c": "Deal Loan Number"})
+    return downcast_numeric_frame(_normalize_bulk_df(df))
+
+
+def _build_sold_term_like() -> pd.DataFrame:
+    sold_pool_field = first_existing_field_name("Opportunity", ["FK_Sold_Loan_Pool__c", "Sold_Loan_Pool__c"])
+    sold_pool_rel = relationship_name_for("Opportunity", sold_pool_field) if sold_pool_field else None
+
+    select_pairs = [
+        ("Deal Loan Number", "Deal_Loan_Number__c"),
+        ("Yardi ID", "Yardi_ID__c"),
+        ("Servicer Commitment Id", "Servicer_Commitment_Id__c"),
+        ("Deal Name", "Name"),
+        ("Type", "Type"),
+    ]
+    if sold_pool_rel:
+        select_pairs.extend(
+            [
+                ("Sold Loan: Sold To", f"{sold_pool_rel}.Sold_To__r.Name"),
+                ("Sold Loan: Sold Date", f"{sold_pool_rel}.Sold_Date__c"),
+                ("Sold Loan: Servicing Status", f"{sold_pool_rel}.Servicing_Status__c"),
+            ]
+        )
+    rename_map = {expr: label for label, expr in select_pairs}
+
+    soql = (
+        "SELECT "
+        + ", ".join(expr for _label, expr in select_pairs)
+        + " FROM Opportunity WHERE "
+        + _soql_in("Type", ["DSCR", "Term Loan"])
+        + " AND Deal_Loan_Number__c != NULL AND Probability > 0"
+    )
+    return run_bulk_query(soql, rename_map=rename_map)
+
+
+def _build_term_wide_like() -> pd.DataFrame:
+    contact_field = first_existing_field_name("Opportunity", ["Contact__c", "Primary_Contact__c"])
+    contact_rel = relationship_name_for("Opportunity", contact_field) if contact_field else None
+    primary_contact_expr = f"{contact_rel}.Name" if contact_rel else "Account.Name"
+
+    select_pairs = [
+        ("Servicer Name", "Servicer_Name__c"),
+        ("Servicer Commitment Id", "Servicer_Commitment_Id__c"),
+        ("Deal Loan Number", "Deal_Loan_Number__c"),
+        ("Yardi ID", "Yardi_ID__c"),
+        ("Deal Name", "Name"),
+        ("Borrower Entity", "Borrower_Entity__r.Name"),
+        ("Account Name", "Account.Name"),
+        ("Do Not Lend", "Account.Do_Not_Lend__c"),
+        ("Primary Contact", primary_contact_expr),
+        ("Close Date", "CloseDate"),
+        ("Stage", "StageName"),
+        ("Current Funding Vehicle", "Current_Funding_Vehicle__c"),
+        ("Next Payment Date", "Next_Payment_Date__c"),
+        ("Loan Amount", "Amount"),
+        ("Current Servicer UPB", "Current_UPB__c"),
+        ("Original Loan Maturity Date", "Stated_Maturity_Date__c"),
+        ("CAF Originator", "Owner.Name"),
+        ("CAF Originator: Active", "Owner.IsActive"),
+        ("Product Type", "LOC_Loan_Type__c"),
+        ("Product Sub-Type", "Product_Sub_Type__c"),
+        ("Type", "Type"),
+        ("Comments AM", "Asset_Management_Comments__c"),
+        ("Deal Intro Sub-Source", "Deal_Intro_Sub_Source__c"),
+        ("Referral Source Account", "Referral_Source__r.Name"),
+        ("Referral Source Contact", "Referral_Source_Contact__r.Name"),
+    ]
+    rename_map = {expr: label for label, expr in select_pairs}
+
+    soql = (
+        "SELECT "
+        + ", ".join(expr for _label, expr in select_pairs)
+        + " FROM Opportunity WHERE "
+        "Deal_Loan_Number__c != NULL AND Probability > 0 AND "
+        + _soql_in("Type", TERM_TYPES)
+        + " AND "
+        + _soql_in("StageName", TERM_ACTIVE_STAGES)
+    )
+
+    term_df = run_bulk_query(soql, rename_map=rename_map)
+    sold_df = _build_sold_term_like()
+
+    if term_df.empty:
+        return term_df
+
+    if not sold_df.empty and "Deal Loan Number" in sold_df.columns:
+        sold_keep = [c for c in ["Deal Loan Number", "Sold Loan: Sold To"] if c in sold_df.columns]
+        sold_df["_deal_key"] = norm_id_series(sold_df["Deal Loan Number"])
+        sold_df = sold_df[["_deal_key"] + [c for c in sold_keep if c != "Deal Loan Number"]].drop_duplicates("_deal_key")
+        term_df["_deal_key"] = norm_id_series(term_df["Deal Loan Number"])
+        term_df = term_df.merge(sold_df, on="_deal_key", how="left")
+
+    return downcast_numeric_frame(term_df)
+
+
 def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     opp_rel = property_opportunity_relationship_name()
     deal_numbers = _nonblank_unique(deal_numbers or [])
     soqls = []
 
-    exprs = {
-        "Deal Loan Number": f"{opp_rel}.Deal_Loan_Number__c",
-        "Asset ID": "Asset_ID__c",
-        "Address": "Name",
-        "City": "City__c",
-        "State": "State__c",
-        "Zip": "ZipCode__c",
-        "CBSA": "MSA__c",
-        "# of Units": "Number_of_Units__c",
-        "Property Type": "Property_Type__c",
-        "ALA": "ALA__c",
-        "Value Date": "BPO_Appraisal_Date__c",
-        "As-Is Value": "Appraised_Value_Amount__c",
-    }
+    select_pairs = [
+        ("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c"),
+        ("Asset ID", "Asset_ID__c"),
+        ("Address", "Name"),
+        ("City", "City__c"),
+        ("State", "State__c"),
+        ("Zip", "ZipCode__c"),
+        ("CBSA", "MSA__c"),
+        ("# of Units", "Number_of_Units__c"),
+        ("Property Type", "Property_Type__c"),
+        ("ALA", "ALA__c"),
+        ("Value Date", "BPO_Appraisal_Date__c"),
+        ("As-Is Value", "Appraised_Value_Amount__c"),
+    ]
+    rename_map = {expr: label for label, expr in select_pairs}
 
-    rename_map = {expr: label for label, expr in exprs.items()}
+    base_where = [
+        f"{opp_rel}.Deal_Loan_Number__c != NULL",
+        f"{opp_rel}.Probability > 0",
+        _soql_in(f"{opp_rel}.Type", TERM_TYPES),
+        _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
+        "ALA__c > 0",
+    ]
 
     if deal_numbers:
         for chunk in _chunked(deal_numbers, size=200):
-            where_parts = [
-                f"{opp_rel}.Deal_Loan_Number__c != NULL",
-                _soql_in(f"{opp_rel}.Deal_Loan_Number__c", chunk),
-            ]
+            where_parts = base_where + [_soql_in(f"{opp_rel}.Deal_Loan_Number__c", chunk)]
             soqls.append(
                 "SELECT "
-                + ", ".join(exprs.values())
-                + f" FROM Property__c WHERE "
+                + ", ".join(expr for _label, expr in select_pairs)
+                + " FROM Property__c WHERE "
                 + " AND ".join(where_parts)
             )
     else:
-        where_parts = [
-            f"{opp_rel}.Deal_Loan_Number__c != NULL",
-            _soql_in(f"{opp_rel}.Type", TERM_TYPES),
-            _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
-            f"{opp_rel}.Probability > 0",
-        ]
         soqls.append(
             "SELECT "
-            + ", ".join(exprs.values())
-            + f" FROM Property__c WHERE "
-            + " AND ".join(where_parts)
+            + ", ".join(expr for _label, expr in select_pairs)
+            + " FROM Property__c WHERE "
+            + " AND ".join(base_where)
         )
 
     return _run_bulk_union(soqls, rename_map=rename_map)
@@ -1354,11 +1631,6 @@ def _term_deal_numbers_from_wide(term_wide: pd.DataFrame):
     return _nonblank_unique(term_wide["Deal Loan Number"].tolist())
 
 
-# ------------------------------------------------------------------
-# SERVICER FILE PARSING
-# uses file contents for as-of dates where possible
-# and keeps Salesforce Servicer ID values unchanged in outputs
-# ------------------------------------------------------------------
 @dataclass(frozen=True)
 class UploadBlob:
     filename: str
@@ -1622,11 +1894,6 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
     return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
 
 
-# ------------------------------------------------------------------
-# LAST WEEK REPORT / COMPLETED REPORT CARRY-FORWARD
-# this is where the uploaded finished workbook gets used
-# for columns that are manual / mapped / not reliably derivable from SF
-# ------------------------------------------------------------------
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
     df = df.dropna(how="all")
@@ -1656,7 +1923,6 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
     try:
         bl = read_tab_df_from_active_loans(prev_bytes, "Bridge Loan")
-
         keep = [c for c in ["Deal Number", "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)", "AM Commentary"] if c in bl.columns]
         if "Deal Number" in keep and len(keep) > 1:
             tmp = bl[keep].copy()
@@ -1674,7 +1940,6 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
     try:
         tl = read_tab_df_from_active_loans(prev_bytes, "Term Loan")
-
         if "Deal Number" in tl.columns and "REO Date" in tl.columns:
             tmp = tl[["Deal Number", "REO Date"]].copy()
             tmp["_deal_key"] = norm_id_series(tmp["Deal Number"])
@@ -1699,13 +1964,12 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     return out
 
 
-# ------------------------------------------------------------------
-# BUILDERS
-# ------------------------------------------------------------------
 def build_bridge_asset(
     sf_spine: pd.DataFrame,
+    sf_dnl: pd.DataFrame,
     sf_val: pd.DataFrame,
     sf_am: pd.DataFrame,
+    sf_active_rm: pd.DataFrame,
     serv_lookup: pd.DataFrame,
     upb_col: str,
     prev_maps: dict,
@@ -1723,12 +1987,30 @@ def build_bridge_asset(
     out["Portfolio"] = pd.NA
     out["Segment"] = pd.NA
     out["Strategy Grouping"] = pd.NA
-    out["Do Not Lend (Y/N)"] = _yn_from_bool_series(sf_spine["Do Not Lend"]) if "Do Not Lend" in sf_spine.columns else "N"
-    out["Active RM"] = _yn_from_bool_series(sf_spine["CAF Originator: Active"]) if "CAF Originator: Active" in sf_spine.columns else "N"
+    out["Do Not Lend (Y/N)"] = "N"
+    out["Active RM"] = "N"
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
     out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
+
+    if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
+        dnl = sf_dnl.copy()
+        dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
+        if "Do Not Lend" in dnl.columns:
+            dnl = dnl[["_deal_key", "Do Not Lend"]].drop_duplicates("_deal_key")
+            out = out.merge(dnl, on="_deal_key", how="left")
+            out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend"])
+            out = out.drop(columns=["Do Not Lend"], errors="ignore")
+
+    if not sf_active_rm.empty and "Deal Loan Number" in sf_active_rm.columns:
+        arm = sf_active_rm.copy()
+        arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
+        arm = arm[["_deal_key"]].drop_duplicates("_deal_key")
+        arm["Active RM"] = "Y"
+        out = out.merge(arm, on="_deal_key", how="left", suffixes=("", "_active"))
+        out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM_active", pd.Series([pd.NA] * len(out))), out["Active RM"])
+        out = out.drop(columns=["Active RM_active"], errors="ignore")
 
     if not sf_val.empty and "Asset ID" in sf_val.columns:
         v = sf_val.copy()
@@ -1767,7 +2049,6 @@ def build_bridge_asset(
         out = out.merge(piv_name, on="_deal_key", how="left")
         out = out.merge(piv_date, on="_deal_key", how="left")
 
-    # manual carry-forward from uploaded completed report
     if "bridge_asset_manual" in prev_maps:
         man = prev_maps["bridge_asset_manual"].copy()
         out = out.merge(
@@ -1781,7 +2062,6 @@ def build_bridge_asset(
                 out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out[c])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
-    # derive mapping columns for blanks
     seg_guess = out.apply(
         lambda r: derive_bridge_segment(r.get("Deal Number"), r.get("Financing"), r.get("Loan Buyer"), template_maps),
         axis=1,
@@ -1802,9 +2082,9 @@ def build_bridge_asset(
     out["Strategy Grouping"] = coalesce_keep_nonblank(out["Strategy Grouping"], strat_guess)
     out["Portfolio"] = coalesce_keep_nonblank(out["Portfolio"], port_guess)
 
-    # servicer enrichment
-    sf_next_payment = pd.to_datetime(sf_spine.get("SF Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
-    sf_suspense = pd.to_numeric(sf_spine.get("Salesforce Suspense Balance", pd.Series([np.nan] * len(out))), errors="coerce")
+    prop_npd = pd.to_datetime(sf_spine.get("Property Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
+    opp_npd = pd.to_datetime(sf_spine.get("Opportunity Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
+    sf_next_payment = prop_npd.where(prop_npd.notna(), opp_npd)
     sf_current_upb = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
 
     if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
@@ -1850,28 +2130,12 @@ def build_bridge_asset(
             out["_loan_upb"] / out["_n_in_loan"],
         )
 
-        # Salesforce suspense is deal-level, so only use it as fallback when servicer suspense missing
-        deal_sf_suspense = pd.to_numeric(out.groupby("_deal_key")["_deal_key"].transform(lambda x: np.nan), errors="coerce")
-        deal_sf_suspense = out["_deal_key"].map(out.groupby("_deal_key")[sf_suspense.rename("_sf_suspense").groupby(out["_deal_key"]).transform("first").name] if False else {})
-        # simple and stable fallback instead:
-        out["_deal_sf_suspense"] = out.groupby("_deal_key")["_deal_key"].transform(lambda x: np.nan)
-        first_suspense_by_deal = pd.Series(sf_suspense.values, index=out.index).groupby(out["_deal_key"]).transform("first")
-        out["_deal_sf_suspense"] = pd.to_numeric(first_suspense_by_deal, errors="coerce")
-        out["_deal_w_sum"] = out.groupby("_deal_key")["_w"].transform("sum")
-        sf_suspense_alloc = np.where(
-            out["_deal_w_sum"].fillna(0) > 0,
-            out["_deal_sf_suspense"] * (out["_w"] / out["_deal_w_sum"]),
-            out["_deal_sf_suspense"],
-        )
-
         serv_suspense_alloc = np.where(
             out["_w_sum"].fillna(0) > 0,
             out["_loan_suspense"] * (out["_w"] / out["_w_sum"]),
             out["_loan_suspense"] / out["_n_in_loan"],
         )
-
         out["Suspense Balance"] = pd.to_numeric(serv_suspense_alloc, errors="coerce")
-        out["Suspense Balance"] = pd.Series(out["Suspense Balance"]).where(pd.Series(out["Suspense Balance"]).notna(), sf_suspense_alloc)
 
         current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
         out[upb_col] = current_upb_series.where(current_upb_series.notna(), sf_current_upb)
@@ -1889,19 +2153,20 @@ def build_bridge_asset(
         out["Next Payment Date"] = sf_next_payment
         out["Servicer Maturity Date"] = pd.NaT
         out["Servicer Status"] = pd.NA
-        first_suspense_by_deal = pd.Series(sf_suspense.values, index=out.index).groupby(out["_deal_key"]).transform("first")
-        out["_w"] = sf_current_upb
-        out["_deal_w_sum"] = out.groupby("_deal_key")["_w"].transform("sum")
-        out["Suspense Balance"] = np.where(
-            out["_deal_w_sum"].fillna(0) > 0,
-            first_suspense_by_deal * (out["_w"] / out["_deal_w_sum"]),
-            first_suspense_by_deal,
+        out["Suspense Balance"] = np.nan
+
+    if "Approved Advance Amount Funded" in sf_spine.columns:
+        out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
+    else:
+        out["SF Funded Amount"] = (
+            pd.to_numeric(out.get("Initial Disbursement Funded", 0), errors="coerce").fillna(0)
+            + pd.to_numeric(out.get("Renovation Holdback Funded", 0), errors="coerce").fillna(0)
+            + pd.to_numeric(out.get("Interest Allocation Funded", 0), errors="coerce").fillna(0)
         )
 
     if "Is Special Asset (Y/N)" in out.columns:
         out["Is Special Asset (Y/N)"] = _yn_from_bool_series(out["Is Special Asset (Y/N)"])
 
-    # keep blanks as blanks
     for c in ["Portfolio", "Segment", "Strategy Grouping", "Servicer", "Servicer Status", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "Comments AM"]:
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
@@ -1912,6 +2177,7 @@ def build_bridge_asset(
 def build_term_loan(
     sf_term: pd.DataFrame,
     sf_am: pd.DataFrame,
+    sf_active_rm: pd.DataFrame,
     serv_lookup: pd.DataFrame,
     upb_col: str,
     prev_maps: dict,
@@ -1928,12 +2194,20 @@ def build_term_loan(
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
 
     out["Loan Buyer"] = sf_term["Sold Loan: Sold To"] if "Sold Loan: Sold To" in sf_term.columns else pd.NA
-    out["Active RM"] = _yn_from_bool_series(sf_term["CAF Originator Active"]) if "CAF Originator Active" in sf_term.columns else "N"
+    out["Active RM"] = "N"
     out["Servicer"] = sf_term["Servicer Name"] if "Servicer Name" in sf_term.columns else pd.NA
     out["Maturity Date"] = pd.to_datetime(sf_term["Original Loan Maturity Date"], errors="coerce") if "Original Loan Maturity Date" in sf_term.columns else pd.NaT
     out["Next Payment Date"] = pd.to_datetime(sf_term["Next Payment Date"], errors="coerce") if "Next Payment Date" in sf_term.columns else pd.NaT
 
-    # derive portfolio / segment / cpp first
+    if not sf_active_rm.empty and "Deal Loan Number" in sf_active_rm.columns:
+        arm = sf_active_rm.copy()
+        arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
+        arm = arm[["_deal_key"]].drop_duplicates("_deal_key")
+        arm["Active RM"] = "Y"
+        out = out.merge(arm, on="_deal_key", how="left", suffixes=("", "_active"))
+        out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM_active", pd.Series([pd.NA] * len(out))), out["Active RM"])
+        out = out.drop(columns=["Active RM_active"], errors="ignore")
+
     cls = sf_term.apply(
         lambda r: pd.Series(
             derive_term_portfolio_segment(
@@ -1951,7 +2225,6 @@ def build_term_loan(
     out["Segment"] = cls["Segment"]
     out["CPP JV"] = cls["CPP JV"]
 
-    # exact manual carry-forward from uploaded completed workbook overrides the heuristics
     if "term_loan_manual" in prev_maps:
         man = prev_maps["term_loan_manual"].copy()
         out = out.merge(
@@ -2000,7 +2273,6 @@ def build_term_loan(
 
         out = out.merge(s2, on="_sid_key", how="left")
 
-        # keep Salesforce Servicer ID exactly as-is; do NOT overwrite with padded file ids
         out["Servicer"] = coalesce_keep_nonblank(out["_servicer_file"], out["Servicer"])
         out["Maturity Date"] = pd.to_datetime(out["_servicer_maturity_date"], errors="coerce").where(
             pd.to_datetime(out["_servicer_maturity_date"], errors="coerce").notna(),
@@ -2185,40 +2457,142 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict)
     return downcast_numeric_frame(out)
 
 
-# ------------------------------------------------------------------
-# EXCEL WRITING HELPERS
-# ------------------------------------------------------------------
-def header_tuples_from_ws(ws, header_row: int = 4) -> List[Tuple[int, str]]:
+def _set_scaffold_cell(ws, row_idx: int, col_idx: int, value):
+    cell = ws.cell(row_idx, col_idx)
+    cell.value = value
+    if isinstance(value, (date, datetime)):
+        cell.number_format = DATE_NUMBER_FORMAT
+
+
+def restore_template_scaffold(wb, run_dt: date, upb_header: str):
+    q_end = quarter_end_for_run(run_dt)
+
+    for sheet_name, blueprint in SHEET_BLUEPRINTS.items():
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+
+        for col_idx, val in blueprint.get("row1", {}).items():
+            _set_scaffold_cell(ws, 1, col_idx, q_end if val == "__QEND__" else val)
+
+        for col_idx, val in blueprint.get("row2", {}).items():
+            _set_scaffold_cell(ws, 2, col_idx, q_end if val == "__QEND__" else val)
+
+        subtotal_col = blueprint.get("subtotal_col")
+        for col_idx, val in blueprint.get("row3", {}).items():
+            if val == "__RUN_DT__":
+                _set_scaffold_cell(ws, 3, col_idx, run_dt)
+            elif val == "__SUBTOTAL__":
+                col_letter = get_column_letter(subtotal_col)
+                ws.cell(3, col_idx).value = f"=SUBTOTAL(9,{col_letter}5:{col_letter}{max(5, ws.max_row)})"
+            else:
+                ws.cell(3, col_idx).value = val
+
+        for col_idx, val in blueprint.get("row4", {}).items():
+            ws.cell(4, col_idx).value = upb_header if val == "__UPB__" else val
+
+
+def _parse_direct_ref_formula(formula_text: str):
+    if not isinstance(formula_text, str):
+        return None
+    txt = formula_text.strip()
+    if not txt.startswith("="):
+        return None
+    txt = txt[1:].lstrip("+").strip()
+
+    m = re.fullmatch(r"'([^']+)'!\$?([A-Z]{1,3})\$?(\d+)", txt)
+    if m:
+        return m.group(1), f"{m.group(2)}{m.group(3)}"
+
+    m = re.fullmatch(r"([A-Za-z0-9_ ]+)!\$?([A-Z]{1,3})\$?(\d+)", txt)
+    if m:
+        return m.group(1), f"{m.group(2)}{m.group(3)}"
+
+    return None
+
+
+def _resolve_header_value(wb, ws, cell, upb_header: str, max_depth: int = 6) -> str:
+    cur_val = cell.value
+
+    for _ in range(max_depth):
+        if cur_val is None:
+            return ""
+        if not isinstance(cur_val, str):
+            return str(cur_val).strip()
+
+        txt = cur_val.strip()
+        if UPB_HEADER_RE.search(txt):
+            return upb_header
+
+        ref = _parse_direct_ref_formula(txt)
+        if not ref:
+            return txt
+
+        ref_sheet, ref_cell = ref
+        if ref_sheet not in wb.sheetnames:
+            return txt
+        cur_val = wb[ref_sheet][ref_cell].value
+
+    if cur_val is None:
+        return ""
+    if isinstance(cur_val, str) and UPB_HEADER_RE.search(cur_val.strip()):
+        return upb_header
+    return str(cur_val).strip()
+
+
+def header_tuples_from_ws(ws, header_row: int = 4, wb=None, upb_header: Optional[str] = None) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
     row = list(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
+
     for col_idx, cell in enumerate(row, start=1):
-        v = cell.value
-        h = "" if v is None else str(v).strip()
-        if h:
-            out.append((col_idx, h))
+        if wb is not None and upb_header is not None:
+            header = _resolve_header_value(wb, ws, cell, upb_header)
+        else:
+            v = cell.value
+            header = "" if v is None else str(v).strip()
+        if header:
+            out.append((col_idx, header.strip()))
     return out
 
 
-def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4) -> Set[int]:
+def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4, scan_rows: int = 50) -> Set[int]:
     fcols: Set[int] = set()
-    row = list(ws_formula.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
-    for col_idx, _cell in enumerate(row, start=1):
-        v = ws_formula.cell(start_row, col_idx).value
-        if isinstance(v, str) and v.startswith("="):
-            fcols.add(col_idx)
+    max_scan_row = min(ws_formula.max_row, start_row + scan_rows - 1)
+
+    for r in range(start_row, max_scan_row + 1):
+        for col_idx in range(1, ws_formula.max_column + 1):
+            v = ws_formula.cell(r, col_idx).value
+            if isinstance(v, str) and v.startswith("="):
+                fcols.add(col_idx)
     return fcols
 
 
-def normalize_header_name(h: str, upb_header: str) -> str:
-    if isinstance(h, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", h):
-        return upb_header
-    return h.strip()
+def _capture_formula_seeds(ws_formula, formula_cols: Set[int], start_row: int = 5, scan_rows: int = 50):
+    seeds = {}
+    max_scan_row = min(ws_formula.max_row, start_row + scan_rows - 1)
+
+    for col_idx in sorted(formula_cols):
+        for r in range(start_row, max_scan_row + 1):
+            v = ws_formula.cell(r, col_idx).value
+            if isinstance(v, str) and v.startswith("="):
+                seeds[col_idx] = {"origin_row": r, "formula": v}
+                break
+    return seeds
 
 
-def clear_columns(ws, col_indices: List[int], start_row: int = 5):
+def _used_output_columns(ws, wb, upb_header: str, header_row: int = 4, start_row: int = 5) -> Set[int]:
+    hdr = header_tuples_from_ws(ws, header_row=header_row, wb=wb, upb_header=upb_header)
+    cols = {c for c, _h in hdr}
+    cols |= formula_col_indices(ws, start_row=start_row, header_row=header_row)
+    return cols
+
+
+def _clear_sheet_body(ws, used_cols: Set[int], start_row: int = 5):
+    if not used_cols:
+        return
     max_r = ws.max_row
     for r in range(start_row, max_r + 1):
-        for c in col_indices:
+        for c in used_cols:
             ws.cell(r, c).value = None
 
 
@@ -2237,6 +2611,26 @@ def _excel_safe_value(val):
     except Exception:
         pass
     return val
+
+
+def _coerce_excel_date_value(val):
+    if val is None:
+        return None
+    if isinstance(val, pd.Timestamp):
+        if pd.isna(val):
+            return None
+        return val.to_pydatetime().date()
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    try:
+        parsed = pd.to_datetime(val, errors="coerce")
+        if pd.isna(parsed):
+            return val
+        return parsed.to_pydatetime().date()
+    except Exception:
+        return val
 
 
 def _money_format_for_header(sheet_name: str, header: str, upb_header: str) -> Optional[str]:
@@ -2262,7 +2656,6 @@ def _copy_reference_row_style(ws_formula, col_idx: int, target_cell):
 def _apply_display_style(ws_formula, row_idx: int, col_idx: int, header: str, upb_header: str):
     cell = ws_formula.cell(row_idx, col_idx)
     _copy_reference_row_style(ws_formula, col_idx, cell)
-
     cell.font = copy(BASE_FONT)
     cell.alignment = copy(BASE_ALIGNMENT)
 
@@ -2274,6 +2667,36 @@ def _apply_display_style(ws_formula, row_idx: int, col_idx: int, header: str, up
             cell.number_format = money_fmt
 
 
+def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, start_row: int = 5):
+    if row_count <= 0:
+        return
+
+    for col_idx, seed in formula_seeds.items():
+        origin_row = seed["origin_row"]
+        origin_formula = seed["formula"]
+        origin_ref = f"{get_column_letter(col_idx)}{origin_row}"
+
+        for r in range(start_row, start_row + row_count):
+            target = ws_formula.cell(r, col_idx)
+            if r == origin_row:
+                target.value = origin_formula
+            else:
+                target.value = Translator(origin_formula, origin=origin_ref).translate_formula(
+                    f"{get_column_letter(col_idx)}{r}"
+                )
+            _copy_reference_row_style(ws_formula, col_idx, target)
+
+
+def _refresh_subtotal_formula(ws_formula, row_count: int, subtotal_row: int = 3, start_row: int = 5):
+    blueprint = SHEET_BLUEPRINTS.get(ws_formula.title, {})
+    subtotal_col = blueprint.get("subtotal_col")
+    if not subtotal_col:
+        return
+    col_letter = get_column_letter(subtotal_col)
+    end_row = max(start_row, start_row + row_count - 1)
+    ws_formula.cell(subtotal_row, subtotal_col).value = f"=SUBTOTAL(9,{col_letter}{start_row}:{col_letter}{end_row})"
+
+
 def write_df_to_sheet_preserve_formulas(
     ws_formula,
     df: pd.DataFrame,
@@ -2283,91 +2706,39 @@ def write_df_to_sheet_preserve_formulas(
     start_row: int = 5,
 ):
     write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
-    col_indices = [c for c, _h in write_cols]
     headers = [h for _c, h in write_cols]
 
     missing = {h: pd.NA for h in headers if h not in df.columns}
     df_out = df.assign(**missing) if missing else df
     df_out = df_out[headers]
 
-    clear_columns(ws_formula, col_indices, start_row=start_row)
-
     for r_offset, row in enumerate(df_out.itertuples(index=False, name=None), start=0):
         r = start_row + r_offset
         for (c, h), val in zip(write_cols, row):
             safe_val = _excel_safe_value(val)
-            try:
-                ws_formula.cell(r, c).value = safe_val
-                _apply_display_style(ws_formula, r, c, h, upb_header)
-            except Exception as e:
-                raise ValueError(
-                    f"Sheet={ws_formula.title}, row={r}, col={c}, header={h}, "
-                    f"value={safe_val!r}, original={val!r}, type={type(val).__name__}"
-                ) from e
+            if _is_date_header(ws_formula.title, h):
+                safe_val = _coerce_excel_date_value(safe_val)
+            ws_formula.cell(r, c).value = safe_val
+            _apply_display_style(ws_formula, r, c, h, upb_header)
 
 
-def _parse_mmdd_from_upb_header(h: str) -> Optional[Tuple[int, int]]:
-    if not isinstance(h, str):
-        return None
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})\s*UPB\b", h)
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
-
-
-def _existing_upb_mmdd(ws, header_row: int = 4) -> Optional[Tuple[int, int]]:
-    hdr = header_tuples_from_ws(ws, header_row=header_row)
-    for _c, h in hdr:
-        mmdd = _parse_mmdd_from_upb_header(h)
-        if mmdd:
-            return mmdd
-    return None
-
-
-def set_upb_header_in_sheet(ws_formula, new_upb_header: str, header_row: int = 4):
-    hdr = header_tuples_from_ws(ws_formula, header_row=header_row)
-    for col_idx, h in hdr:
-        if isinstance(h, str) and re.search(r"\b\d{1,2}/\d{1,2}\s*UPB\b", h):
-            ws_formula.cell(header_row, col_idx).value = new_upb_header
-            return
-
-
-def update_run_date_in_row3(ws_formula, run_dt: date, old_mmdd: Optional[Tuple[int, int]], date_row: int = 3):
-    if not old_mmdd:
-        return
-
-    old_m, old_d = old_mmdd
-    row = list(ws_formula.iter_rows(min_row=date_row, max_row=date_row, values_only=False))[0]
-    for col_idx, cell in enumerate(row, start=1):
-        v = cell.value
-        if isinstance(v, datetime):
-            if v.month == old_m and v.day == old_d:
-                ws_formula.cell(date_row, col_idx).value = run_dt
-        elif isinstance(v, date):
-            if v.month == old_m and v.day == old_d:
-                ws_formula.cell(date_row, col_idx).value = run_dt
-
-
-def prepare_sheet_for_run(ws, upb_col: str, run_dt: date):
-    old_mmdd = _existing_upb_mmdd(ws, header_row=4)
-    update_run_date_in_row3(ws, run_dt, old_mmdd, date_row=3)
-    set_upb_header_in_sheet(ws, upb_col, header_row=4)
-
-
-def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str, run_dt: date):
+def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     if sheet_name not in wb.sheetnames:
         return
+
     ws = wb[sheet_name]
-    prepare_sheet_for_run(ws, upb_col, run_dt)
-    hdr = header_tuples_from_ws(ws, header_row=4)
-    hdr = [(c, normalize_header_name(h, upb_col)) for (c, h) in hdr]
+    hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    formula_seeds = _capture_formula_seeds(ws, fcols, start_row=5)
+
+    used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=4, start_row=5)
+    _clear_sheet_body(ws, used_cols, start_row=5)
+
     write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=5)
+    _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), start_row=5)
+    _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
 
 
-# ------------------------------------------------------------------
-# APP STATE
-# ------------------------------------------------------------------
 def init_build_state():
     if "built_workbook_bytes" not in st.session_state:
         st.session_state.built_workbook_bytes = None
@@ -2389,9 +2760,6 @@ def reset_build_state():
     st.session_state.download_choice = "Not yet"
 
 
-# ------------------------------------------------------------------
-# STREAMLIT UI
-# ------------------------------------------------------------------
 st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
 st.subheader(hey())
@@ -2402,16 +2770,13 @@ init_build_state()
 
 st.markdown(
     f"""
-Welcome! This tool builds the **Active Loans** workbook using **Salesforce** and optional **servicer uploads**.
+Welcome! This tool builds the **Active Loans** workbook using **Salesforce Bulk API 2.0** and optional **servicer uploads**.
 
 ### What you’ll do
 1) Upload the **current servicer files** or skip them
 2) (Optional) Upload **last week’s / completed Active Loans report** for carry-forward
 3) Log in to **Salesforce**
 4) Choose **which sheet to build** or **All**
-
-### Template (from GitHub repo)
-This app always uses: **{TEMPLATE_FILENAME}**
 
 ### UPB header
 Always uses today's date (ET): **{run_dt.isoformat()}** → **{upb_col}**
@@ -2427,8 +2792,9 @@ except Exception as e:
     st.stop()
 
 st.caption(
-    "This version uses your metadata map directly, keeps Salesforce Servicer IDs unchanged, uses the servicer files for UPB / maturity / next payment / status, "
-    "and uses the uploaded completed report to carry forward manual columns like Portfolio / Segment / Strategy Grouping / CPP JV."
+    "This version reads your repo template, rebuilds the row 1-4 scaffold, resolves formula-linked UPB headers, "
+    "fills formulas down, writes report-style Excel dates without 0:00, applies money/date formats, "
+    "keeps Salesforce Servicer IDs unchanged, and names the output file active loan report test."
 )
 
 col_a, col_b = st.columns([1.3, 1.0])
@@ -2469,7 +2835,7 @@ if use_sf:
         st.success("✅ Logged in to Salesforce API")
         if inst:
             st.caption(f"Connected to: {inst}")
-            st.caption("Bulk API 2.0 is used with smaller page sizes and explicit report filters to reduce memory pressure.")
+            st.caption("Bulk API 2.0 is used with chunked result pages so the pull is not capped at report-api row counts.")
     with c2:
         if st.button("Log out"):
             st.session_state.sf_token = None
@@ -2520,12 +2886,13 @@ if build_btn:
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest servicer report date from file contents / report tabs: **{detected_run_date.isoformat()}**")
                 st.caption(f"UPB header (always today): **{upb_col}**")
-                st.dataframe(serv_preview.head(30), use_container_width=True)
+                st.dataframe(serv_preview.head(30), width="stretch")
 
             status.update(label="Loading Excel template...")
             tmpl_bytes, tmpl_path_used = load_repo_template_bytes()
             template_maps = load_template_lookup_maps(tmpl_bytes)
-            wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
+            wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=True)
+            restore_template_scaffold(wb, run_dt, upb_col)
 
             need_bridge = build_target in ("Bridge Asset", "Bridge Loan", "All")
             need_term = build_target in ("Term Loan", "Term Asset", "All")
@@ -2537,10 +2904,16 @@ if build_btn:
                 status.update(label="Pulling AM assignments from Salesforce...")
                 sf_am = _build_am_assignments_like()
 
+            status.update(label="Pulling Active RM deals from Salesforce...")
+            sf_active_rm = _build_active_rm_like()
+
             if need_bridge:
                 status.update(label="Pulling bridge/property data from Salesforce...")
                 bridge_spine = _build_bridge_spine_like()
                 bridge_asset_ids = _bridge_asset_ids_from_spine(bridge_spine)
+
+                status.update(label="Pulling Do Not Lend deals from Salesforce...")
+                bridge_dnl = _build_do_not_lend_like()
 
                 status.update(label="Pulling valuation data from Salesforce...")
                 bridge_val = _build_valuation_like(asset_ids=bridge_asset_ids)
@@ -2548,8 +2921,10 @@ if build_btn:
                 status.update(label="Building Bridge Asset...")
                 bridge_asset_df = build_bridge_asset(
                     bridge_spine,
+                    bridge_dnl,
                     bridge_val,
                     sf_am,
+                    sf_active_rm,
                     serv_join,
                     upb_col,
                     prev_maps,
@@ -2565,17 +2940,17 @@ if build_btn:
 
                 if build_target in ("Bridge Asset", "All"):
                     status.update(label="Writing Bridge Asset sheet...")
-                    write_output_sheet(wb, "Bridge Asset", bridge_asset_df, upb_col, run_dt)
+                    write_output_sheet(wb, "Bridge Asset", bridge_asset_df, upb_col)
 
                 if build_target in ("Bridge Loan", "All"):
                     status.update(label="Building Bridge Loan...")
                     bridge_loan_df = build_bridge_loan(bridge_asset_df, upb_col, prev_maps)
 
                     status.update(label="Writing Bridge Loan sheet...")
-                    write_output_sheet(wb, "Bridge Loan", bridge_loan_df, upb_col, run_dt)
+                    write_output_sheet(wb, "Bridge Loan", bridge_loan_df, upb_col)
                     del bridge_loan_df
 
-                del bridge_spine, bridge_asset_ids, bridge_val, bridge_asset_df
+                del bridge_spine, bridge_dnl, bridge_asset_ids, bridge_val, bridge_asset_df
                 gc.collect()
 
             if need_term:
@@ -2586,6 +2961,7 @@ if build_btn:
                 term_loan_df = build_term_loan(
                     term_wide,
                     sf_am,
+                    sf_active_rm,
                     serv_join,
                     upb_col,
                     prev_maps,
@@ -2601,7 +2977,7 @@ if build_btn:
 
                 if build_target in ("Term Loan", "All"):
                     status.update(label="Writing Term Loan sheet...")
-                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col, run_dt)
+                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
 
                 if need_term_asset:
                     term_deal_numbers = _term_deal_numbers_from_wide(term_wide)
@@ -2613,13 +2989,13 @@ if build_btn:
                     term_asset_df = build_term_asset(term_asset_source, term_loan_df, upb_col)
 
                     status.update(label="Writing Term Asset sheet...")
-                    write_output_sheet(wb, "Term Asset", term_asset_df, upb_col, run_dt)
+                    write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
                     del term_deal_numbers, term_asset_source, term_asset_df
 
                 del term_wide, term_loan_df
                 gc.collect()
 
-            del sf_am, serv_join, serv_preview
+            del sf_am, sf_active_rm, serv_join, serv_preview
             gc.collect()
 
             status.update(label="Saving workbook...")
@@ -2628,9 +3004,8 @@ if build_btn:
             out_bytes.seek(0)
             wb.close()
 
-            fname_target = build_target.replace(" ", "_")
             st.session_state.built_workbook_bytes = out_bytes.getvalue()
-            st.session_state.built_workbook_name = f"Active_Loans_{fname_target}_{run_dt.isoformat()}.xlsx"
+            st.session_state.built_workbook_name = OUTPUT_TEST_FILENAME
             st.session_state.built_template_path = tmpl_path_used
             st.session_state.show_download_prompt = True
             st.session_state.download_choice = "Not yet"
@@ -2669,7 +3044,7 @@ if st.session_state.get("show_download_prompt") and st.session_state.get("built_
             data=st.session_state["built_workbook_bytes"],
             file_name=st.session_state["built_workbook_name"],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.caption("No problem — the file is ready whenever you want to download it during this session.")
