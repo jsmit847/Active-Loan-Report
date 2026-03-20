@@ -620,176 +620,6 @@ def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series
     return p.where(~blankish_mask(p), f)
 
 
-TERM_ASSET_DIRECTION_MAP = {
-    "north": "n",
-    "south": "s",
-    "east": "e",
-    "west": "w",
-    "northeast": "ne",
-    "northwest": "nw",
-    "southeast": "se",
-    "southwest": "sw",
-}
-
-TERM_ASSET_STREET_MAP = {
-    "street": "st",
-    "st": "st",
-    "avenue": "ave",
-    "ave": "ave",
-    "road": "rd",
-    "rd": "rd",
-    "drive": "dr",
-    "dr": "dr",
-    "lane": "ln",
-    "ln": "ln",
-    "boulevard": "blvd",
-    "blvd": "blvd",
-    "place": "pl",
-    "pl": "pl",
-    "court": "ct",
-    "ct": "ct",
-    "circle": "cir",
-    "cir": "cir",
-    "terrace": "ter",
-    "ter": "ter",
-    "highway": "hwy",
-    "hwy": "hwy",
-    "parkway": "pkwy",
-    "pkwy": "pkwy",
-    "trail": "trl",
-    "trl": "trl",
-    "way": "way",
-}
-
-TERM_ASSET_HELPER_COLS = [
-    "_term_asset_addr_norm",
-    "_term_asset_base_addr",
-    "_term_asset_zip5",
-    "_term_asset_is_condo",
-    "_term_asset_base_row",
-    "_term_asset_addr_len",
-    "_term_asset_merge_key",
-    "_term_asset_ala_sort",
-    "_term_asset_value_dt",
-    "_term_asset_mod_dt",
-    "_term_asset_created_dt",
-]
-
-TERM_ASSET_UNIT_FRAGMENT_RE = re.compile(
-    r"(?:\s*[-,]?\s*)(?:#\s*[A-Za-z0-9-]+|(?:apt|apartment|unit|ste|suite|room|rm|lot|fl|floor)\s*[A-Za-z0-9-]+|u[A-Za-z0-9-]+)\b",
-    re.I,
-)
-
-
-def _term_asset_zip5_text(val) -> str:
-    s = clean_text(val)
-    if not s:
-        return ""
-    m = re.search(r"(\d{5})", s)
-    return m.group(1) if m else ""
-
-
-def _normalize_term_asset_address_text(val) -> str:
-    s = clean_text(val).lower()
-    if not s:
-        return ""
-    s = s.replace("'", "")
-    s = s.replace("&", " and ")
-    s = re.sub(r"[^0-9a-z# ]+", " ", s)
-    tokens = [tok for tok in s.split() if tok]
-    norm_tokens = []
-    for tok in tokens:
-        norm_tokens.append(TERM_ASSET_DIRECTION_MAP.get(tok, TERM_ASSET_STREET_MAP.get(tok, tok)))
-    return re.sub(r"\s+", " ", " ".join(norm_tokens)).strip()
-
-
-def _term_asset_base_address_text(val) -> str:
-    s = _normalize_term_asset_address_text(val)
-    if not s:
-        return ""
-    s = TERM_ASSET_UNIT_FRAGMENT_RE.sub("", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def _term_asset_helper_series(df: pd.DataFrame, asset_key_col: str, address_col: str, zip_col: str, property_type_col: str):
-    idx = df.index
-    asset_key = pd.Series(df[asset_key_col], index=idx) if asset_key_col in df.columns else pd.Series([pd.NA] * len(df), index=idx, dtype="object")
-    address = pd.Series(df[address_col], index=idx) if address_col in df.columns else pd.Series([pd.NA] * len(df), index=idx, dtype="object")
-    zip_raw = pd.Series(df[zip_col], index=idx) if zip_col in df.columns else pd.Series([pd.NA] * len(df), index=idx, dtype="object")
-    property_type = pd.Series(df[property_type_col], index=idx) if property_type_col in df.columns else pd.Series([pd.NA] * len(df), index=idx, dtype="object")
-
-    addr_norm = address.map(_normalize_term_asset_address_text).astype("string")
-    base_addr = address.map(_term_asset_base_address_text).astype("string")
-    zip5 = zip_raw.map(_term_asset_zip5_text).astype("string")
-    is_condo = property_type.astype("string").str.lower().str.contains("condo", na=False)
-    base_row = (addr_norm == base_addr).fillna(False)
-    addr_len = addr_norm.str.len().fillna(9999)
-
-    asset_key_clean = norm_id_series(asset_key)
-    addr_fallback = (addr_norm.fillna("") + "|" + zip5.fillna(""))
-    addr_fallback = addr_fallback.replace({"|": pd.NA, "": pd.NA})
-    base_fallback = (base_addr.fillna("") + "|" + zip5.fillna(""))
-    base_fallback = base_fallback.replace({"|": pd.NA, "": pd.NA})
-    fallback_key = asset_key_clean.where(asset_key_clean.notna(), addr_fallback)
-    use_base = (~is_condo) & base_addr.fillna("").ne("")
-    merge_key = fallback_key.where(~use_base, base_fallback)
-
-    return {
-        "_term_asset_addr_norm": addr_norm,
-        "_term_asset_base_addr": base_addr,
-        "_term_asset_zip5": zip5,
-        "_term_asset_is_condo": is_condo,
-        "_term_asset_base_row": base_row.astype("int8"),
-        "_term_asset_addr_len": addr_len,
-        "_term_asset_merge_key": merge_key,
-    }
-
-
-def _add_term_asset_helper_cols(
-    df: pd.DataFrame,
-    *,
-    asset_key_col: str,
-    address_col: str,
-    zip_col: str,
-    property_type_col: str,
-    ala_col: Optional[str] = None,
-    value_date_col: Optional[str] = None,
-    mod_date_col: Optional[str] = None,
-    created_date_col: Optional[str] = None,
-) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    helper = _term_asset_helper_series(out, asset_key_col, address_col, zip_col, property_type_col)
-    for c, s in helper.items():
-        out[c] = s
-    out["_term_asset_ala_sort"] = pd.to_numeric(out.get(ala_col, np.nan), errors="coerce").fillna(0) if ala_col else 0
-    out["_term_asset_value_dt"] = pd.to_datetime(out.get(value_date_col, pd.NaT), errors="coerce") if value_date_col else pd.NaT
-    out["_term_asset_mod_dt"] = pd.to_datetime(out.get(mod_date_col, pd.NaT), errors="coerce") if mod_date_col else pd.NaT
-    out["_term_asset_created_dt"] = pd.to_datetime(out.get(created_date_col, pd.NaT), errors="coerce") if created_date_col else pd.NaT
-    return out
-
-
-def _dedupe_term_asset_rows(df: pd.DataFrame, deal_key_col: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    sort_cols = [
-        deal_key_col,
-        "_term_asset_merge_key",
-        "_term_asset_base_row",
-        "_term_asset_addr_len",
-        "_term_asset_ala_sort",
-        "_term_asset_value_dt",
-        "_term_asset_mod_dt",
-        "_term_asset_created_dt",
-    ]
-    ascending = [True, True, False, True, False, False, False, False]
-    out = out.sort_values(sort_cols, ascending=ascending, kind="mergesort")
-    out = out.drop_duplicates([deal_key_col, "_term_asset_merge_key"], keep="first")
-    return out
-
-
 def deal_key(value) -> str:
     s = clean_text(value)
     if not s:
@@ -1925,7 +1755,16 @@ def _build_term_wide_like() -> pd.DataFrame:
     term_df["_deal_key"] = norm_id_series(term_df["Deal Loan Number"])
 
     if not sold_df.empty and "Deal Loan Number" in sold_df.columns:
-        sold_keep = [c for c in ["Deal Loan Number", "Sold Loan: Sold To"] if c in sold_df.columns]
+        sold_keep = [
+            c
+            for c in [
+                "Deal Loan Number",
+                "Sold Loan: Sold To",
+                "Sold Loan: Sold Date",
+                "Sold Loan: Servicing Status",
+            ]
+            if c in sold_df.columns
+        ]
         sold_df["_deal_key"] = norm_id_series(sold_df["Deal Loan Number"])
         sold_df = sold_df[["_deal_key"] + [c for c in sold_keep if c != "Deal Loan Number"]].drop_duplicates("_deal_key")
         term_df = term_df.merge(sold_df, on="_deal_key", how="left")
@@ -1992,18 +1831,18 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
 
     df["_deal_key"] = norm_id_series(df.get("Deal Loan Number", pd.Series([None] * len(df), index=df.index)))
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
-    df = _add_term_asset_helper_cols(
-        df,
-        asset_key_col="_asset_key",
-        address_col="Address",
-        zip_col="Zip",
-        property_type_col="Property Type",
-        ala_col="ALA",
-        value_date_col="Value Date",
-        mod_date_col="Property Last Modified Date",
-        created_date_col="Property Created Date",
-    )
-    df = _dedupe_term_asset_rows(df, deal_key_col="_deal_key")
+    addr_key = (
+        df.get("Address", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
+        + "|"
+        + df.get("Zip", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
+    ).replace({"|": pd.NA})
+    df["_asset_dedupe_key"] = df["_asset_key"].where(df["_asset_key"].notna(), addr_key)
+    df["_ala_sort"] = pd.to_numeric(df.get("ALA", np.nan), errors="coerce").fillna(0)
+    df["_value_dt"] = pd.to_datetime(df.get("Value Date"), errors="coerce")
+    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
+    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df = df.sort_values(["_deal_key", "_asset_dedupe_key", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt"])
+    df = df.drop_duplicates(["_deal_key", "_asset_dedupe_key"], keep="last")
     return downcast_numeric_frame(df)
 
 
@@ -2248,43 +2087,202 @@ def _prev_term_keys(prev_maps: Optional[dict]) -> Set[str]:
     return keys
 
 
-def _filter_term_population(sf_term: pd.DataFrame, prev_keys: Optional[Set[str]] = None) -> pd.DataFrame:
+def _prev_term_positive_upb_keys(prev_maps: Optional[dict]) -> Set[str]:
+    keys: Set[str] = set()
+    if not prev_maps:
+        return keys
+    df = prev_maps.get("term_loan_upb")
+    if isinstance(df, pd.DataFrame) and not df.empty and {"_deal_key", "_prev_upb"}.issubset(df.columns):
+        tmp = df.copy()
+        tmp["_prev_upb"] = pd.to_numeric(tmp["_prev_upb"], errors="coerce").fillna(0)
+        vals = tmp.loc[tmp["_prev_upb"] > 0, "_deal_key"].dropna().astype("string").tolist()
+        keys.update([clean_text(v) for v in vals if clean_text(v)])
+    return keys
+
+
+def _recent_close_mask(close_series: pd.Series, run_date: date, days: int = 45) -> pd.Series:
+    close_dt = pd.to_datetime(close_series, errors="coerce")
+    lower = pd.Timestamp(run_date) - pd.Timedelta(days=days)
+    upper = pd.Timestamp(run_date) + pd.Timedelta(days=7)
+    return close_dt.notna() & close_dt.ge(lower) & close_dt.le(upper)
+
+
+def _sold_servicing_retained_mask(servicing_status: pd.Series) -> pd.Series:
+    txt = pd.Series(servicing_status, copy=False).astype("string").str.lower().str.strip()
+    retained = txt.str.contains(r"retain|retained|servic", regex=True, na=False)
+    bad = txt.str.contains(r"release|released|transfer|xfer|sold away|none|no servicing|unserviced", regex=True, na=False)
+    return retained & (~bad)
+
+
+def _id_key_no_leading_zeros_scalar(val) -> str:
+    s = clean_text(val)
+    if not s:
+        return ""
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"[^0-9A-Za-z]", "", s)
+    s = s.lstrip("0")
+    return s
+
+
+def _first_nonblank_scalar(values: Sequence) -> object:
+    for v in values:
+        if has_any_value(v):
+            return v
+    return pd.NA
+
+
+def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFrame, sf_servicer: pd.Series) -> pd.DataFrame:
+    result = pd.DataFrame(index=sf_term.index)
+    result["selected_servicer_id"] = pd.NA
+    result["selected_sid_key"] = pd.NA
+    result["matched_servicer"] = pd.NA
+    result["matched_upb"] = np.nan
+    result["matched_next_payment_date"] = pd.NaT
+    result["matched_maturity_date"] = pd.NaT
+    result["matched_source"] = pd.NA
+
+    candidate_cols = [c for c in sf_term.columns if c.startswith("Term Servicer Key ")]
+    if "Servicer Commitment Id" in sf_term.columns:
+        candidate_cols = candidate_cols + ["Servicer Commitment Id"]
+
+    if not candidate_cols:
+        return result
+
+    preferred_raw = [
+        _first_nonblank_scalar([sf_term.at[idx, c] for c in candidate_cols if c in sf_term.columns])
+        for idx in sf_term.index
+    ]
+    result["selected_servicer_id"] = pd.Series(preferred_raw, index=sf_term.index, dtype="object")
+    result["selected_sid_key"] = id_key_no_leading_zeros(pd.Series(preferred_raw, index=sf_term.index, dtype="object"))
+
+    if serv_lookup is None or serv_lookup.empty or "_sid_key" not in serv_lookup.columns:
+        return result
+
+    base = serv_lookup.dropna(subset=["_sid_key"]).copy()
+    if base.empty:
+        return result
+
+    keep_cols = [c for c in ["_sid_key", "servicer", "upb", "next_payment_date", "maturity_date"] if c in base.columns]
+    info_map = {}
+    for row in base[keep_cols].drop_duplicates("_sid_key", keep="last").itertuples(index=False):
+        rec = {keep_cols[i]: row[i] for i in range(len(keep_cols))}
+        info_map[clean_text(rec.get("_sid_key"))] = rec
+
+    selected_raw = []
+    selected_key = []
+    selected_serv = []
+    selected_upb = []
+    selected_npd = []
+    selected_mat = []
+    selected_source = []
+
+    for idx in sf_term.index:
+        sf_serv = sf_servicer.loc[idx] if idx in sf_servicer.index else pd.NA
+        best = None
+        best_score = -10**9
+        fallback = None
+        fallback_score = -10**9
+
+        for pos, col in enumerate(candidate_cols):
+            if col not in sf_term.columns:
+                continue
+            raw = sf_term.at[idx, col]
+            sid_key = _id_key_no_leading_zeros_scalar(raw)
+            if not sid_key:
+                continue
+            info = info_map.get(sid_key)
+            has_file = info is not None
+            file_serv = info.get("servicer") if info else pd.NA
+            file_upb = money_to_float(info.get("upb")) if info else np.nan
+            checkpoint_ok = bool(has_file and _servicer_checkpoint_ok(sf_serv, file_serv))
+            pref = max(0, 10 - pos) if col != "Servicer Commitment Id" else 1
+            file_bonus = 20 if has_file else 0
+            upb_bonus = 5 if (pd.notna(file_upb) and float(file_upb) > 0) else 0
+            ok_score = 100 + file_bonus + upb_bonus + pref if checkpoint_ok else -10**9
+            raw_score = file_bonus + upb_bonus + pref
+            if ok_score > best_score:
+                best_score = ok_score
+                best = (raw, sid_key, info, col)
+            if raw_score > fallback_score:
+                fallback_score = raw_score
+                fallback = (raw, sid_key, info, col)
+
+        chosen = best if best is not None else None
+        if chosen is None and not clean_text(sf_serv):
+            chosen = fallback
+
+        if chosen is not None:
+            raw, sid_key, info, col = chosen
+            selected_raw.append(raw)
+            selected_key.append(sid_key or pd.NA)
+            selected_serv.append(info.get("servicer") if info else pd.NA)
+            selected_upb.append(money_to_float(info.get("upb")) if info else np.nan)
+            selected_npd.append(pd.to_datetime(info.get("next_payment_date"), errors="coerce") if info else pd.NaT)
+            selected_mat.append(pd.to_datetime(info.get("maturity_date"), errors="coerce") if info else pd.NaT)
+            selected_source.append(col)
+        else:
+            raw = result.at[idx, "selected_servicer_id"]
+            selected_raw.append(raw)
+            selected_key.append(_id_key_no_leading_zeros_scalar(raw) or pd.NA)
+            selected_serv.append(pd.NA)
+            selected_upb.append(np.nan)
+            selected_npd.append(pd.NaT)
+            selected_mat.append(pd.NaT)
+            selected_source.append(pd.NA)
+
+    result["selected_servicer_id"] = pd.Series(selected_raw, index=sf_term.index, dtype="object")
+    result["selected_sid_key"] = pd.Series(selected_key, index=sf_term.index, dtype="object")
+    result["matched_servicer"] = pd.Series(selected_serv, index=sf_term.index, dtype="object")
+    result["matched_upb"] = pd.to_numeric(pd.Series(selected_upb, index=sf_term.index), errors="coerce")
+    result["matched_next_payment_date"] = pd.to_datetime(pd.Series(selected_npd, index=sf_term.index), errors="coerce")
+    result["matched_maturity_date"] = pd.to_datetime(pd.Series(selected_mat, index=sf_term.index), errors="coerce")
+    result["matched_source"] = pd.Series(selected_source, index=sf_term.index, dtype="object")
+    return result
+
+def _filter_term_population(
+    sf_term: pd.DataFrame,
+    prev_keys: Optional[Set[str]] = None,
+    prev_positive_keys: Optional[Set[str]] = None,
+) -> pd.DataFrame:
     if sf_term is None or sf_term.empty:
         return sf_term
 
     out = sf_term.copy()
     prev_keys = prev_keys or set()
+    prev_positive_keys = prev_positive_keys or set()
 
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
     in_prev = out["_deal_key"].isin(prev_keys)
+    in_prev_positive = out["_deal_key"].isin(prev_positive_keys)
 
     typ = out.get("Type", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
     stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
     deal_name = out.get("Deal Name", pd.Series([pd.NA] * len(out), index=out.index)).astype("string")
     servicer_name = out.get("Servicer Name", pd.Series([pd.NA] * len(out), index=out.index)).astype("string")
-    servicer_id_guess = coalesce_columns(out, [c for c in out.columns if c.startswith("Term Servicer Key ")] + ["Servicer Commitment Id"], index=out.index)
+    servicer_id_guess = coalesce_columns(
+        out,
+        [c for c in out.columns if c.startswith("Term Servicer Key ")] + ["Servicer Commitment Id"],
+        index=out.index,
+    )
     current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
-    loan_amount = pd.to_numeric(out.get("Loan Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
-    current_funding = out.get("Current Funding Vehicle", pd.Series([pd.NA] * len(out), index=out.index))
-    warehouse_line = out.get("Warehouse Line", pd.Series([pd.NA] * len(out), index=out.index))
+    close_date = out.get("Close Date", pd.Series([pd.NaT] * len(out), index=out.index))
+    sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
 
-    has_current_signal = (
+    has_candidate_servicer = (~blankish_mask(servicer_name)) | (~blankish_mask(servicer_id_guess))
+    recently_closed = _recent_close_mask(close_date, run_dt, days=45)
+    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
+    is_reo = stage.isin(["REO", "REO-Sold"])
+    vision = deal_name.str.contains("Vision & Beyond", case=False, na=False)
+
+    active_evidence = (
         current_upb.gt(0)
-        | loan_amount.gt(0)
-        | (~blankish_mask(servicer_name))
-        | (~blankish_mask(servicer_id_guess))
-        | (~blankish_mask(pd.Series(current_funding, index=out.index)))
-        | (~blankish_mask(pd.Series(warehouse_line, index=out.index)))
+        | (recently_closed & has_candidate_servicer)
+        | (sold_servicing_retained & has_candidate_servicer)
+        | (is_reo & (has_candidate_servicer | in_prev | in_prev_positive))
     )
 
-    continuity = in_prev | deal_name.str.contains("Vision & Beyond", case=False, na=False)
-    active_stage = stage.isin(["Closed Won", "Sold", "Paid Off", "REO", "REO-Sold"])
-    approved_stage = stage.eq("Approved by Committee")
-
-    keep_mask = typ.isin(TERM_TYPES) & (continuity | (active_stage & has_current_signal) | (approved_stage & (continuity | has_current_signal)))
+    keep_mask = typ.isin(TERM_TYPES) & (vision | in_prev | in_prev_positive | active_evidence)
     return out.loc[keep_mask].copy()
-
-
 
 def _best_header_read_excel(
     file_bytes: bytes,
@@ -2708,19 +2706,12 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     try:
         ta = read_tab_df_from_active_loans(prev_bytes, "Term Asset")
         if "Deal Number" in ta.columns and "Asset ID" in ta.columns:
-            keep = [c for c in ["Deal Number", "Asset ID", "Address", "Zip", "Property Type", "Special (Y/N)"] if c in ta.columns]
+            keep = [c for c in ["Deal Number", "Asset ID", "Special (Y/N)"] if c in ta.columns]
             if len(keep) >= 2:
                 tmpa = ta[keep].copy()
                 tmpa["_deal_key"] = norm_id_series(tmpa["Deal Number"])
                 tmpa["_asset_key"] = norm_id_series(tmpa["Asset ID"])
-                tmpa = _add_term_asset_helper_cols(
-                    tmpa,
-                    asset_key_col="_asset_key",
-                    address_col="Address",
-                    zip_col="Zip",
-                    property_type_col="Property Type",
-                )
-                out["term_asset_manual"] = tmpa.dropna(subset=["_deal_key", "_term_asset_merge_key"]).drop_duplicates(["_deal_key", "_term_asset_merge_key"])
+                out["term_asset_manual"] = tmpa.dropna(subset=["_deal_key", "_asset_key"]).drop_duplicates(["_deal_key", "_asset_key"])
     except Exception:
         pass
 
@@ -3093,7 +3084,8 @@ def build_term_loan(
     template_maps: dict,
 ) -> pd.DataFrame:
     prev_keys = _prev_term_keys(prev_maps)
-    sf_term = _filter_term_population(sf_term, prev_keys=prev_keys)
+    prev_positive_keys = _prev_term_positive_upb_keys(prev_maps)
+    sf_term = _filter_term_population(sf_term, prev_keys=prev_keys, prev_positive_keys=prev_positive_keys)
     out = pd.DataFrame(index=sf_term.index)
 
     for col, label in TERM_LOAN_FROM_TERM_WIDE.items():
@@ -3165,56 +3157,28 @@ def build_term_loan(
     else:
         out["Asset Manager"] = out.get("Asset Manager", blank_obj)
 
-    primary_id_cols = [c for c in sf_term.columns if c.startswith("Term Servicer Key ")]
-    primary_id = coalesce_columns(sf_term, primary_id_cols, index=out.index)
-    commitment_id = pd.Series(sf_term["Servicer Commitment Id"], index=out.index) if "Servicer Commitment Id" in sf_term.columns else blank_obj.copy()
-    out["Servicer ID"] = coalesce_keep_nonblank(primary_id, commitment_id)
-
-    out["_sid_key_primary"] = id_key_no_leading_zeros(primary_id.astype("string"))
-    out["_sid_key_commitment"] = id_key_no_leading_zeros(commitment_id.astype("string"))
+    base_sf_servicer = pd.Series(out.get("Servicer", blank_obj), index=out.index, dtype="object")
+    match_df = _select_term_servicer_matches(sf_term, serv_lookup, base_sf_servicer)
+    out["Servicer ID"] = coalesce_keep_nonblank(match_df["selected_servicer_id"], out.get("Servicer ID", blank_obj))
 
     sf_upb_fallback = pd.to_numeric(
         sf_term["Current Servicer UPB"] if "Current Servicer UPB" in sf_term.columns else pd.Series([np.nan] * len(out)),
         errors="coerce",
     )
 
-    if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
-        s = serv_lookup.dropna(subset=["_sid_key"]).copy()
-        base = s.rename(
-            columns={
-                "servicer": "_servicer_file",
-                "upb": "_servicer_upb",
-                "next_payment_date": "_servicer_next_payment_date",
-                "maturity_date": "_servicer_maturity_date",
-            }
-        )[["_sid_key", "_servicer_file", "_servicer_upb", "_servicer_next_payment_date", "_servicer_maturity_date"]]
-
-        primary = base.rename(columns={c: f"{c}_primary" for c in base.columns if c != "_sid_key"})
-        primary = primary.rename(columns={"_sid_key": "_sid_key_primary"})
-        commit = base.rename(columns={c: f"{c}_commit" for c in base.columns if c != "_sid_key"})
-        commit = commit.rename(columns={"_sid_key": "_sid_key_commitment"})
-
-        out = out.merge(primary, on="_sid_key_primary", how="left")
-        out = out.merge(commit, on="_sid_key_commitment", how="left")
-
-        primary_match = ~blankish_mask(out.get("_servicer_file_primary", blank_obj))
-        commit_match = ~blankish_mask(out.get("_servicer_file_commit", blank_obj))
-        use_commit = (~primary_match) & commit_match
-
-        file_serv = pd.Series(out.get("_servicer_file_primary", blank_obj), index=out.index).where(primary_match, out.get("_servicer_file_commit", blank_obj))
-        file_upb = pd.to_numeric(out.get("_servicer_upb_primary", np.nan), errors="coerce").where(primary_match, pd.to_numeric(out.get("_servicer_upb_commit", np.nan), errors="coerce"))
-        file_npd = pd.to_datetime(out.get("_servicer_next_payment_date_primary", pd.NaT), errors="coerce").where(primary_match, pd.to_datetime(out.get("_servicer_next_payment_date_commit", pd.NaT), errors="coerce"))
-        file_mat = pd.to_datetime(out.get("_servicer_maturity_date_primary", pd.NaT), errors="coerce").where(primary_match, pd.to_datetime(out.get("_servicer_maturity_date_commit", pd.NaT), errors="coerce"))
-
-        out["Servicer ID"] = out["Servicer ID"].where(~use_commit, commitment_id)
-        out["Servicer"] = coalesce_keep_nonblank(file_serv, out["Servicer"])
-        out["Maturity Date"] = file_mat.where(file_mat.notna(), pd.to_datetime(out["Maturity Date"], errors="coerce"))
-        out["Next Payment Date"] = file_npd.where(file_npd.notna(), pd.to_datetime(out["Next Payment Date"], errors="coerce"))
-        out[upb_col] = file_upb.where(file_upb.notna(), sf_upb_fallback)
-
-        out = out.drop(columns=[c for c in out.columns if c.endswith("_primary") or c.endswith("_commit")], errors="ignore")
-    else:
-        out[upb_col] = sf_upb_fallback
+    out["Servicer"] = coalesce_keep_nonblank(match_df["matched_servicer"], out["Servicer"])
+    out["Maturity Date"] = pd.to_datetime(match_df["matched_maturity_date"], errors="coerce").where(
+        pd.to_datetime(match_df["matched_maturity_date"], errors="coerce").notna(),
+        pd.to_datetime(out["Maturity Date"], errors="coerce"),
+    )
+    out["Next Payment Date"] = pd.to_datetime(match_df["matched_next_payment_date"], errors="coerce").where(
+        pd.to_datetime(match_df["matched_next_payment_date"], errors="coerce").notna(),
+        pd.to_datetime(out["Next Payment Date"], errors="coerce"),
+    )
+    out[upb_col] = pd.to_numeric(match_df["matched_upb"], errors="coerce").where(
+        pd.to_numeric(match_df["matched_upb"], errors="coerce").notna(),
+        sf_upb_fallback,
+    )
 
     if "term_loan_manual" in prev_maps and "Servicer ID" in prev_maps["term_loan_manual"].columns:
         prev_sid = prev_maps["term_loan_manual"][["_deal_key", "Servicer ID"]].copy()
@@ -3246,21 +3210,17 @@ def build_term_loan(
 
     stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string").str.strip()
     deal_name = pd.Series(sf_term.get("Deal Name", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string")
-    loan_amount = pd.to_numeric(out.get("Loan Amount", np.nan), errors="coerce").fillna(0)
     final_upb = pd.to_numeric(out[upb_col], errors="coerce").fillna(0)
     servicer_id_present = ~blankish_mask(out.get("Servicer ID", blank_obj))
     servicer_present = ~blankish_mask(out.get("Servicer", blank_obj))
-    has_current_signal = final_upb.gt(0) | loan_amount.gt(0) | servicer_id_present | servicer_present
     is_reo = pd.to_datetime(out["REO Date"], errors="coerce").notna() | stage_series.isin(["REO", "REO-Sold"])
     vision = deal_name.str.contains("Vision & Beyond", case=False, na=False)
+    prev_positive = out["_deal_key"].isin(prev_positive_keys)
 
     keep_mask = (
         final_upb.gt(0)
-        | out["_deal_key"].isin(prev_keys)
-        | is_reo
         | vision
-        | (stage_series.eq("Approved by Committee") & has_current_signal)
-        | (stage_series.isin(["Closed Won", "Sold", "Paid Off", "REO", "REO-Sold"]) & has_current_signal)
+        | (is_reo & (prev_positive | servicer_id_present | servicer_present))
     )
     out = out.loc[keep_mask].copy()
 
@@ -3280,8 +3240,6 @@ def build_term_loan(
 
     return downcast_numeric_frame(out)
 
-
-
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
     out = pd.DataFrame(index=sf_term_asset.index)
 
@@ -3298,24 +3256,23 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 
     valid_deals = set(tl["_deal_key"].dropna().tolist())
     out = out[out["_deal_key"].isin(valid_deals)].copy()
-    if out.empty:
-        return out
 
-    source_slice = sf_term_asset.loc[out.index].copy()
-    out = _add_term_asset_helper_cols(
-        out,
-        asset_key_col="_asset_key",
-        address_col="Address",
-        zip_col="Zip",
-        property_type_col="Property Type",
-        ala_col="Property ALA",
-        value_date_col="Value Date",
-        mod_date_col=None,
-        created_date_col=None,
-    )
-    out["_term_asset_mod_dt"] = pd.to_datetime(source_slice.get("Property Last Modified Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-    out["_term_asset_created_dt"] = pd.to_datetime(source_slice.get("Property Created Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-    out = _dedupe_term_asset_rows(out, deal_key_col="_deal_key")
+    addr_key = (
+        out.get("Address", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
+        + "|"
+        + out.get("Zip", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
+    ).replace({"|": pd.NA})
+    out["_asset_dedupe_key"] = out["_asset_key"].where(out["_asset_key"].notna(), addr_key)
+
+    value_dt = pd.to_datetime(sf_term_asset.get("Value Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+    mod_dt = pd.to_datetime(sf_term_asset.get("Property Last Modified Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+    created_dt = pd.to_datetime(sf_term_asset.get("Property Created Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+    ala_sort = pd.to_numeric(out.get("Property ALA", np.nan), errors="coerce").fillna(0)
+    out["_value_dt"] = value_dt
+    out["_mod_dt"] = mod_dt
+    out["_created_dt"] = created_dt
+    out["_ala_sort"] = ala_sort
+    out = out.sort_values(["_deal_key", "_asset_dedupe_key", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt"]).drop_duplicates(["_deal_key", "_asset_dedupe_key"], keep="last")
 
     if "CPP JV" in tl.columns:
         tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
@@ -3333,20 +3290,12 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 
     if prev_maps and "term_asset_manual" in prev_maps:
         prev = prev_maps["term_asset_manual"].copy()
-        keep = ["_deal_key", "_asset_key", "_term_asset_merge_key"] + [c for c in ["Special (Y/N)"] if c in prev.columns]
-        prev = prev[keep].drop_duplicates(["_deal_key", "_term_asset_merge_key"])
-
-        prev_asset = prev[["_deal_key", "_asset_key", "Special (Y/N)"]].dropna(subset=["_asset_key"]).drop_duplicates(["_deal_key", "_asset_key"])
-        out = out.merge(prev_asset, on=["_deal_key", "_asset_key"], how="left", suffixes=("", "_prev_asset"))
-        if "Special (Y/N)_prev_asset" in out.columns:
-            out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out["Special (Y/N)_prev_asset"])
-            out = out.drop(columns=["Special (Y/N)_prev_asset"], errors="ignore")
-
-        prev_merge = prev[["_deal_key", "_term_asset_merge_key", "Special (Y/N)"]].drop_duplicates(["_deal_key", "_term_asset_merge_key"])
-        out = out.merge(prev_merge, on=["_deal_key", "_term_asset_merge_key"], how="left", suffixes=("", "_prev_merge"))
-        if "Special (Y/N)_prev_merge" in out.columns:
-            out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out["Special (Y/N)_prev_merge"])
-            out = out.drop(columns=["Special (Y/N)_prev_merge"], errors="ignore")
+        keep = ["_deal_key", "_asset_key"] + [c for c in ["Special (Y/N)"] if c in prev.columns]
+        prev = prev[keep].drop_duplicates(["_deal_key", "_asset_key"])
+        out = out.merge(prev, on=["_deal_key", "_asset_key"], how="left", suffixes=("", "_prev"))
+        if "Special (Y/N)_prev" in out.columns:
+            out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out["Special (Y/N)_prev"])
+            out = out.drop(columns=["Special (Y/N)_prev"], errors="ignore")
 
     out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
 
@@ -3354,7 +3303,7 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
 
-    return downcast_numeric_frame(out.drop(columns=TERM_ASSET_HELPER_COLS, errors="ignore"))
+    return downcast_numeric_frame(out.drop(columns=["_asset_dedupe_key", "_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
 
 
