@@ -1721,8 +1721,8 @@ def date_from_filename(name: str) -> Optional[date]:
 
 def detect_servicer_type(filename: str) -> str:
     n = filename.lower()
-    if n.endswith(".csv"):
-        return "CHL"
+    if "shellpoint" in n:
+        return "Shellpoint"
     if "corevest_data_tape" in n:
         return "CoreVest_Data_Tape"
     if "corevestloandata" in n:
@@ -1731,9 +1731,11 @@ def detect_servicer_type(filename: str) -> str:
         return "Midland"
     if "fci" in n:
         return "FCI"
+    if n.endswith(".csv"):
+        return "CHL"
     raise ValueError(
         "Could not detect servicer file type from the filename. "
-        "Use one of these naming patterns: CHL, CoreVest_Data_Tape, CoreVestLoanData, FCI, Midland."
+        "Use one of these naming patterns: Shellpoint, CHL, CoreVest_Data_Tape, CoreVestLoanData, FCI, Midland."
     )
 
 
@@ -1753,6 +1755,73 @@ def read_fci_report_date(file_bytes: bytes, sheet_name: str) -> Optional[date]:
         return None
     return None
 
+
+
+def _servicer_specificity_rank(val) -> int:
+    s = clean_text(val).lower()
+    if not s:
+        return 0
+    if s == "fci chl streamline":
+        return 6
+    if "fci 2012632" in s or "fci v1805510" in s:
+        return 5
+    if "shellpoint" in s:
+        return 4
+    if any(x in s for x in ["statebridge", "berkadia", "midland", "selene", "sps", "fay", "cornerstone"]):
+        return 3
+    if "fci" in s or "chl" in s:
+        return 2
+    return 1
+
+
+def _servicer_checkpoint_ok(sf_servicer, file_servicer) -> bool:
+    file_txt = clean_text(file_servicer)
+    if not file_txt:
+        return False
+
+    sf_txt = clean_text(sf_servicer)
+    if not sf_txt or sf_txt.upper() == "N/A":
+        return True
+
+    sf_fam = normalize_servicer_family(sf_txt)
+    file_fam = normalize_servicer_family(file_txt)
+    if sf_fam and file_fam and sf_fam == file_fam:
+        return True
+
+    sf_low = sf_txt.lower()
+    file_low = file_txt.lower()
+    return sf_low in file_low or file_low in sf_low
+
+
+def _fill_text_defaults(df: pd.DataFrame, columns: Sequence[str], default: str = "N/A") -> pd.DataFrame:
+    out = df
+    for c in columns:
+        if c in out.columns:
+            s = pd.Series(out[c], index=out.index)
+            out[c] = s.where(~blankish_mask(s), default)
+    return out
+
+
+def _filter_term_population(sf_term: pd.DataFrame) -> pd.DataFrame:
+    if sf_term is None or sf_term.empty:
+        return sf_term
+
+    out = sf_term.copy()
+    typ = out.get("Type", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
+    stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
+    funding = out.get("Current Funding Vehicle", pd.Series([pd.NA] * len(out), index=out.index))
+    current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
+    dscr_like = typ.isin(["DSCR", "Investor DSCR", "Single Rental Loan"])
+    term_like = typ.eq("Term Loan")
+
+    dscr_mask = dscr_like & stage.isin(["Approved by Committee", "Closed Won", "REO", "REO-Sold"])
+    sold_term_mask = term_like & stage.eq("Sold") & (
+        current_upb.fillna(0).gt(0) | (~blankish_mask(pd.Series(funding, index=out.index)))
+    )
+    live_term_mask = term_like & stage.isin(["Approved by Committee", "Closed Won", "REO", "REO-Sold"])
+
+    return out.loc[dscr_mask | sold_term_mask | live_term_mask].copy()
 
 def _best_header_read_excel(
     file_bytes: bytes,
@@ -1863,6 +1932,34 @@ def _as_of_for_df(df: pd.DataFrame, filename: str, aliases: Sequence[str]) -> da
 
 def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     servicer_type = detect_servicer_type(filename)
+
+    if servicer_type == "Shellpoint":
+        df, _hdr, _score = _best_header_read_csv(
+            b,
+            [["LoanID", "Servicer Loan ID", "Loan Number"], ["PrincipalBalance", "UPB", "Current UPB"]],
+            max_header_scan=2,
+        )
+        sid_col = first_matching_col(df, ["LoanID", "Servicer Loan ID", "Loan Number"])
+        if not sid_col:
+            sid_col = first_matching_col(df, ["InvestorLoanID", "Investor Loan ID"])
+        if not sid_col:
+            raise ValueError("Shellpoint file is missing a loan identifier column.")
+
+        out = pd.DataFrame(
+            {
+                "source_file": filename,
+                "servicer": "Shellpoint",
+                "servicer_family": "shellpoint",
+                "servicer_id": norm_id_series(df[sid_col]),
+                "upb": _series_to_num(df, ["PrincipalBalance", "UPB", "Current UPB"]),
+                "suspense": _series_to_num(df, ["SuspenseBalance", "Suspense Balance"]),
+                "next_payment_date": _series_to_dt(df, ["NextDueDate", "Next Due Date", "Next Payment Date"]),
+                "maturity_date": pd.Series([pd.NaT] * len(df), index=df.index),
+                "status": _series_to_text(df, ["LoanStatus", "Status", "PayString"]),
+                "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["DataAsOf", "Report Date", "As Of Date", "Run Date"])),
+            }
+        )
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     if servicer_type == "CHL":
         df, _hdr, _score = _best_header_read_csv(
@@ -1993,6 +2090,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     raise ValueError("Unhandled servicer type.")
 
 
+
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60, max_entries=128, hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"})
 def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
@@ -2017,12 +2115,11 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         if d:
             file_dates.append(d)
 
-    if frames:
-        full = pd.concat(frames, ignore_index=True, copy=False)
-    else:
-        full = pd.DataFrame(
-            columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"]
-        )
+    full = (
+        pd.concat(frames, ignore_index=True, copy=False)
+        if frames
+        else pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
+    )
 
     if not full.empty:
         full = full.dropna(subset=["servicer_id"]).copy()
@@ -2034,16 +2131,18 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_has_suspense"] = full["suspense"].notna().astype("int8")
         full["_has_npd"] = full["next_payment_date"].notna().astype("int8")
         full["_has_mat"] = full["maturity_date"].notna().astype("int8")
+        full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
 
         full = full.sort_values(
-            ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "upb"],
-            ascending=[True, True, True, True, True, True, True, True],
+            ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
+            ascending=[True, True, True, True, True, True, True, True, True],
         )
 
         join = full.drop_duplicates(["_sid_key"], keep="last").drop(
-            columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat"], errors="ignore"
+            columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore"
         )
         preview = full.head(200).copy()
+        full = full.drop(columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
     else:
         full["_sid_key"] = pd.Series(dtype="string")
         join = full.copy()
@@ -2051,6 +2150,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
     run_date = max(file_dates) if file_dates else today_et()
     return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
+
 
 
 def _find_upb_col(cols: Sequence[str]) -> Optional[str]:
@@ -2073,7 +2173,16 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
     try:
         ba = read_tab_df_from_active_loans(prev_bytes, "Bridge Asset")
         if "Asset ID" in ba.columns:
-            keep = [c for c in ["Asset ID", "Portfolio", "Segment", "Strategy Grouping", "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag"] if c in ba.columns]
+            keep = [
+                c for c in [
+                    "Asset ID", "Portfolio", "Segment", "Strategy Grouping", "REO Date",
+                    "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
+                    "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+                    "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
+                    "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+                    "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+                ] if c in ba.columns
+            ]
             tmp = ba[keep].copy()
             tmp["_asset_key"] = norm_id_series(tmp["Asset ID"])
             out["bridge_asset_manual"] = tmp.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key")
@@ -2082,7 +2191,14 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
     try:
         bl = read_tab_df_from_active_loans(prev_bytes, "Bridge Loan")
-        keep = [c for c in ["Deal Number", "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value"] if c in bl.columns]
+        keep = [
+            c for c in [
+                "Deal Number", "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency",
+                "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value",
+                "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+                "Construction Mgr.", "CM Assigned Date",
+            ] if c in bl.columns
+        ]
         if "Deal Number" in keep and len(keep) > 1:
             tmp = bl[keep].copy()
             tmp["_deal_key"] = norm_id_series(tmp["Deal Number"])
@@ -2104,7 +2220,13 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             tmp["_deal_key"] = norm_id_series(tmp["Deal Number"])
             out["term_loan_reo"] = tmp.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key")
 
-        keep = [c for c in ["Deal Number", "Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)"] if c in tl.columns]
+        keep = [
+            c for c in [
+                "Deal Number", "Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)",
+                "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
+                "Referral Source Contact", "AM Commentary", "Servicer", "Loan Buyer",
+            ] if c in tl.columns
+        ]
         if "Deal Number" in keep and len(keep) > 1:
             tmpm = tl[keep].copy()
             tmpm["_deal_key"] = norm_id_series(tmpm["Deal Number"])
@@ -2121,6 +2243,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 
     gc.collect()
     return out
+
 
 
 def _parse_npl_or_reo_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
@@ -2280,7 +2403,6 @@ def build_bridge_asset(
 
         piv_name = am.pivot_table(index="_deal_key", columns="Team Role", values="Team Member Name", aggfunc="first")
         piv_date = am.pivot_table(index="_deal_key", columns="Team Role", values="Date Assigned", aggfunc="first")
-
         piv_name = piv_name.rename(columns=role_to_namecol).reset_index()
         piv_date = piv_date.rename(columns=role_to_datecol).reset_index()
 
@@ -2309,11 +2431,25 @@ def build_bridge_asset(
 
     if "bridge_asset_manual" in prev_maps:
         man = prev_maps["bridge_asset_manual"].copy()
-        keep_cols = ["_asset_key"] + [c for c in ["Portfolio", "Segment", "Strategy Grouping", "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag"] if c in man.columns]
+        keep_cols = ["_asset_key"] + [c for c in [
+            "Portfolio", "Segment", "Strategy Grouping", "REO Date",
+            "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
+            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+            "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
+            "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+            "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
-        for c in ["Portfolio", "Segment", "Strategy Grouping", "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag"]:
+        for c in [
+            "Portfolio", "Segment", "Strategy Grouping", "REO Date",
+            "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
+            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+            "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
+            "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+            "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        ]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out[c])
+                out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, pd.Series([pd.NA] * len(out))))
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
     seg_guess = out.apply(
@@ -2425,14 +2561,23 @@ def build_bridge_asset(
     out["Needs NPL Value"] = coalesce_keep_nonblank(out["Needs NPL Value"], pd.Series(["N"] * len(out), index=out.index))
     out["Special Flag"] = coalesce_keep_nonblank(out["Special Flag"], pd.Series(["N"] * len(out), index=out.index))
 
-    for c in [
-        "Portfolio", "Segment", "Strategy Grouping", "Servicer", "Servicer Status", "Deal Intro Sub-Source",
-        "Referral Source Account", "Referral Source Contact", "Comments AM", "Asset Manager 1", "Asset Manager 2", "Construction Mgr.",
-    ]:
-        if c in out.columns:
-            out[c] = out[c].replace({"": pd.NA})
+    out = _fill_text_defaults(
+        out,
+        [
+            "Loan Buyer", "Servicer", "Primary Contact",
+            "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
+            "Remedy Plan", "Delinquency Notes", "Maturity Status",
+            "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
+            "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date",
+            "Most Recent Appraisal Order Date", "Updated Valuation Date",
+            "Title Company", "Tax Due Date", "Tax Frequency", "Tax Commentary",
+            "Originator", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+            "Servicer Status", "Asset Manager 1", "Asset Manager 2", "Construction Mgr.",
+        ],
+    )
 
     return downcast_numeric_frame(out)
+
 
 
 def build_term_loan(
@@ -2444,6 +2589,7 @@ def build_term_loan(
     prev_maps: dict,
     template_maps: dict,
 ) -> pd.DataFrame:
+    sf_term = _filter_term_population(sf_term)
     out = pd.DataFrame(index=sf_term.index)
 
     for col, label in TERM_LOAN_FROM_TERM_WIDE.items():
@@ -2489,12 +2635,20 @@ def build_term_loan(
     if "term_loan_manual" in prev_maps:
         man = prev_maps["term_loan_manual"].copy()
         out = out.merge(
-            man[["_deal_key"] + [c for c in ["Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)"] if c in man.columns]],
+            man[["_deal_key"] + [c for c in [
+                "Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)",
+                "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
+                "Referral Source Contact", "AM Commentary", "Servicer", "Loan Buyer",
+            ] if c in man.columns]],
             on="_deal_key",
             how="left",
             suffixes=("", "_prev"),
         )
-        for c in ["Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)"]:
+        for c in [
+            "Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)",
+            "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
+            "Referral Source Contact", "AM Commentary", "Servicer", "Loan Buyer",
+        ]:
             if f"{c}_prev" in out.columns:
                 out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, pd.Series([pd.NA] * len(out))))
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
@@ -2508,10 +2662,10 @@ def build_term_loan(
         am1 = am[am["Team Role"].astype("string").str.strip().eq("Asset Manager")][["_deal_key", "Team Member Name"]]
         am1 = am1.drop_duplicates("_deal_key")
         out = out.merge(am1, on="_deal_key", how="left")
-        out["Asset Manager"] = out["Team Member Name"].replace({"": pd.NA})
+        out["Asset Manager"] = coalesce_keep_nonblank(out.get("Asset Manager", pd.Series([pd.NA] * len(out))), out["Team Member Name"])
         out = out.drop(columns=["Team Member Name"], errors="ignore")
     else:
-        out["Asset Manager"] = pd.NA
+        out["Asset Manager"] = out.get("Asset Manager", pd.Series([pd.NA] * len(out)))
 
     out["Servicer ID"] = sf_term["Servicer Commitment Id"] if "Servicer Commitment Id" in sf_term.columns else pd.NA
     out["_sid_key"] = id_key_no_leading_zeros(out["Servicer ID"].astype("string"))
@@ -2533,21 +2687,24 @@ def build_term_loan(
         )[["_sid_key", "_servicer_file", "_servicer_upb", "_servicer_next_payment_date", "_servicer_maturity_date"]]
 
         out = out.merge(s2, on="_sid_key", how="left")
-
-        out["Servicer"] = coalesce_keep_nonblank(out["_servicer_file"], out["Servicer"])
-        out["Maturity Date"] = pd.to_datetime(out["_servicer_maturity_date"], errors="coerce").where(
-            pd.to_datetime(out["_servicer_maturity_date"], errors="coerce").notna(),
-            pd.to_datetime(out["Maturity Date"], errors="coerce"),
-        )
-        out["Next Payment Date"] = pd.to_datetime(out["_servicer_next_payment_date"], errors="coerce").where(
-            pd.to_datetime(out["_servicer_next_payment_date"], errors="coerce").notna(),
-            pd.to_datetime(out["Next Payment Date"], errors="coerce"),
+        checkpoint_ok = pd.Series(
+            [_servicer_checkpoint_ok(sf_val, file_val) for sf_val, file_val in zip(out["Servicer"], out["_servicer_file"])],
+            index=out.index,
         )
 
-        out[upb_col] = pd.to_numeric(out["_servicer_upb"], errors="coerce").where(
-            pd.to_numeric(out["_servicer_upb"], errors="coerce").notna(),
-            sf_upb_fallback,
-        )
+        file_serv = pd.Series(out["_servicer_file"], index=out.index)
+        out["Servicer"] = file_serv.where(checkpoint_ok & (~blankish_mask(file_serv)), out["Servicer"])
+
+        file_mat = pd.to_datetime(out["_servicer_maturity_date"], errors="coerce")
+        cur_mat = pd.to_datetime(out["Maturity Date"], errors="coerce")
+        out["Maturity Date"] = file_mat.where(checkpoint_ok & file_mat.notna(), cur_mat)
+
+        file_npd = pd.to_datetime(out["_servicer_next_payment_date"], errors="coerce")
+        cur_npd = pd.to_datetime(out["Next Payment Date"], errors="coerce")
+        out["Next Payment Date"] = file_npd.where(checkpoint_ok & file_npd.notna(), cur_npd)
+
+        file_upb = pd.to_numeric(out["_servicer_upb"], errors="coerce")
+        out[upb_col] = file_upb.where(checkpoint_ok & file_upb.notna(), sf_upb_fallback)
         out = out.drop(columns=["_servicer_file", "_servicer_upb", "_servicer_next_payment_date", "_servicer_maturity_date"], errors="ignore")
     else:
         out[upb_col] = sf_upb_fallback
@@ -2581,11 +2738,16 @@ def build_term_loan(
         pd.Series(["N"] * len(out), index=out.index),
     )
 
-    for c in ["Portfolio", "Segment", "CPP JV", "Servicer", "Loan Buyer", "Asset Manager", "AM Commentary", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact"]:
-        if c in out.columns:
-            out[c] = out[c].replace({"": pd.NA})
+    out = _fill_text_defaults(
+        out,
+        [
+            "Servicer ID", "Servicer", "Loan Buyer", "REO Date", "Asset Manager",
+            "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary",
+        ],
+    )
 
     return downcast_numeric_frame(out)
+
 
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
@@ -2722,26 +2884,32 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict,
     if "bridge_loan_manual" in prev_maps and not out.empty:
         man = prev_maps["bridge_loan_manual"].copy()
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
-        for c in ["Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value"]:
+        for c in [
+            "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)",
+            "AM Commentary", "3/31 NPL", "Needs NPL Value",
+            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+            "Construction Mgr.", "CM Assigned Date",
+        ]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out[c])
+                out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, pd.Series([pd.NA] * len(out))))
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
     out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out["Special Focus (Y/N)"], pd.Series(["N"] * len(out), index=out.index))
     out["3/31 NPL"] = coalesce_keep_nonblank(out["3/31 NPL"], pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out["Needs NPL Value"], pd.Series(["N"] * len(out), index=out.index))
 
-    for c in [
-        "Portfolio", "Loan Buyer", "Financing", "Servicer", "Deal Name", "Borrower Name", "Account",
-        "Primary Contact", "State(s)", "Loan Level Delinquency", "Segment", "Product Type",
-        "Product Sub Type", "Transaction Type", "Project Strategy", "Strategy Grouping", "CV Originator",
-        "Active RM", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
-        "Asset Manager 1", "Asset Manager 2", "Construction Mgr.", "AM Commentary",
-    ]:
-        if c in out.columns:
-            out[c] = out[c].replace({"": pd.NA})
+    out = _fill_text_defaults(
+        out,
+        [
+            "Loan Buyer", "Servicer ID", "Servicer", "Primary Contact", "Loan Level Delinquency",
+            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+            "Construction Mgr.", "CM Assigned Date", "Deal Intro Sub-Source",
+            "Referral Source Account", "Referral Source Contact", "AM Commentary",
+        ],
+    )
 
     return downcast_numeric_frame(out.drop(columns=["_deal_key"], errors="ignore"))
+
 
 
 def _set_scaffold_cell(ws, row_idx: int, col_idx: int, value):
