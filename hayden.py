@@ -1794,10 +1794,10 @@ def _servicer_checkpoint_ok(sf_servicer, file_servicer) -> bool:
 
 
 def _fill_text_defaults(df: pd.DataFrame, columns: Sequence[str], default: str = "N/A") -> pd.DataFrame:
-    out = df
+    out = df.copy()
     for c in columns:
         if c in out.columns:
-            s = pd.Series(out[c], index=out.index)
+            s = pd.Series(out[c], index=out.index, dtype="object")
             out[c] = s.where(~blankish_mask(s), default)
     return out
 
