@@ -949,8 +949,34 @@ def show_salesforce_login_helper():
     st.info(
         "Step 1: Log in to Salesforce.\n\n"
         "Step 2: Approve access.\n\n"
-        "Step 3: Click Build. This app uses Salesforce Bulk API 2.0 to pull the full datasets."
+        "Step 3: Upload your files after login.\n\n"
+        "Step 4: Click Build. This app uses Salesforce Bulk API 2.0 to pull the full datasets."
     )
+
+
+def render_salesforce_login_gate() -> dict:
+    st.markdown("### Step 1: Sign in to Salesforce")
+    st.caption(
+        "Please sign in before uploading files. The upload section stays hidden until login is complete so the Salesforce callback does not clear files you already selected."
+    )
+    show_salesforce_login_helper()
+    sf_info = ensure_sf_session()
+
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        inst = (st.session_state.get("sf_token") or {}).get("instance_url", "")
+        st.success("✅ Logged in to Salesforce API")
+        if inst:
+            st.caption(f"Connected to: {inst}")
+            st.caption("Bulk API 2.0 is used with chunked result pages so the pull is not capped at report-api row counts.")
+    with c2:
+        if st.button("Log out"):
+            st.session_state.sf_token = None
+            st.query_params.clear()
+            st.rerun()
+
+    st.divider()
+    return sf_info
 
 
 def ensure_sf_session() -> dict:
@@ -3372,8 +3398,11 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
         if isinstance(prev_sid, pd.DataFrame) and not prev_sid.empty and {"_sid_key", "_deal_key"}.issubset(prev_sid.columns):
             sid_to_prev_deal = prev_sid.dropna(subset=["_sid_key"]).drop_duplicates("_sid_key").set_index("_sid_key")["_deal_key"].to_dict()
             prev_deal = key_df["_sid_key"].map(sid_to_prev_deal)
-            key_df["_prev_sid_present"] = prev_deal.notna().astype("int8")
-            key_df["_prev_sid_match"] = (key_df["_deal_key"] == prev_deal).astype("int8")
+            prev_sid_present = prev_deal.notna()
+            deal_key_present = key_df["_deal_key"].notna()
+            prev_sid_match = prev_sid_present & deal_key_present & key_df["_deal_key"].eq(prev_deal)
+            key_df["_prev_sid_present"] = prev_sid_present.astype("int8")
+            key_df["_prev_sid_match"] = prev_sid_match.astype("int8")
 
     key_df = key_df.sort_values(
         [
@@ -4197,10 +4226,10 @@ st.markdown(
 Welcome! This tool builds the **Active Loans** workbook using **Salesforce Bulk API 2.0** and optional **servicer uploads**.
 
 ### What you’ll do
-1) Upload the **current servicer files** or skip them
-2) (Optional) Upload **last week’s / completed Active Loans report** for carry-forward
-3) (Optional) Upload **CV NPL / REO workbook**
-4) Log in to **Salesforce**
+1) Log in to **Salesforce**
+2) Upload the **current servicer files** or skip them
+3) (Optional) Upload **last week’s / completed Active Loans report** for carry-forward
+4) (Optional) Upload **CV NPL / REO workbook**
 5) Choose **which sheet to build** or **All**
 
 ### UPB header
@@ -4226,6 +4255,11 @@ st.caption(
     "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, and keeps row-level Salesforce Servicer IDs intact."
 )
 
+sf_info = render_salesforce_login_gate()
+sf_ready = bool(sf_info)
+use_sf = True
+
+st.markdown("### Step 2: Upload files")
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
     prev_upload = st.file_uploader(
@@ -4244,6 +4278,7 @@ npl_reo_upload = st.file_uploader(
     type=["xlsx"],
 )
 
+st.markdown("### Step 3: Build options")
 skip_servicer_files = st.checkbox(
     "Skip servicer files and build Salesforce-only version",
     value=False,
@@ -4255,25 +4290,6 @@ build_target = st.selectbox(
     options=["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset", "All"],
     index=0,
 )
-
-use_sf = st.checkbox("Use Salesforce API (recommended)", value=True)
-sf_ready = False
-if use_sf:
-    show_salesforce_login_helper()
-    sf_info = ensure_sf_session()
-    sf_ready = bool(sf_info)
-
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        inst = (st.session_state.get("sf_token") or {}).get("instance_url", "")
-        st.success("✅ Logged in to Salesforce API")
-        if inst:
-            st.caption(f"Connected to: {inst}")
-            st.caption("Bulk API 2.0 is used with chunked result pages so the pull is not capped at report-api row counts.")
-    with c2:
-        if st.button("Log out"):
-            st.session_state.sf_token = None
-            st.rerun()
 
 if st.button("Clear cached Salesforce metadata", type="secondary"):
     st.session_state.sobject_describe_cache = {}
