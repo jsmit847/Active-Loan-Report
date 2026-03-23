@@ -35,7 +35,7 @@ OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
 FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
-BRIDGE_ACTIVE_STAGES = ["Closed Won", "Expired", "Matured", "REO", "Sold"]
+BRIDGE_ACTIVE_STAGES = ["Closed Won", "REO", "REO-Sold", "Sold"]
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan"]
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
@@ -48,13 +48,12 @@ DNL_STAGES = [
 VALUATION_STAGES = ["Closed Won", "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold"]
 VALUATION_PROPERTY_STATUSES = ["Active", "Paid Off", "REO", "REO-Sold"]
 
-TERM_ACTIVE_STAGES = ["Approved by Committee", "Closed Won", "Paid Off", "REO", "REO-Sold", "Sold"]
+TERM_ACTIVE_STAGES = ["Closed Won", "REO", "REO-Sold", "Sold"]
 TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
 TERM_DSCR_TYPES = {"DSCR", "Investor DSCR"}
 
 ACTIVE_RM_STAGES = [
-    "Approved by Committee", "Closed Won", "Purchased", "Brokered- Closed Won",
-    "Expired", "Matured", "Sold", "Paid Off", "REO", "REO-Sold",
+    "Closed Won", "Sold", "REO", "REO-Sold",
 ]
 
 ACTIVE_RM_DIRECT_FIELD_CANDIDATES = [
@@ -2248,40 +2247,44 @@ def _filter_term_population(
         return sf_term
 
     out = sf_term.copy()
-    prev_keys = prev_keys or set()
     prev_positive_keys = prev_positive_keys or set()
 
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
-    in_prev = out["_deal_key"].isin(prev_keys)
     in_prev_positive = out["_deal_key"].isin(prev_positive_keys)
 
     typ = out.get("Type", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
     stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
-    deal_name = out.get("Deal Name", pd.Series([pd.NA] * len(out), index=out.index)).astype("string")
     servicer_name = out.get("Servicer Name", pd.Series([pd.NA] * len(out), index=out.index)).astype("string")
     servicer_id_guess = coalesce_columns(
         out,
         [c for c in out.columns if c.startswith("Term Servicer Key ")] + ["Servicer Commitment Id"],
         index=out.index,
     )
-    current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
-    close_date = out.get("Close Date", pd.Series([pd.NaT] * len(out), index=out.index))
+    current_upb = pd.to_numeric(
+        out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
+        errors="coerce",
+    ).fillna(0)
     sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
 
     has_candidate_servicer = (~blankish_mask(servicer_name)) | (~blankish_mask(servicer_id_guess))
-    recently_closed = _recent_close_mask(close_date, run_dt, days=45)
     sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
+
+    is_closed_won = stage.eq("Closed Won")
+    is_sold = stage.eq("Sold")
     is_reo = stage.isin(["REO", "REO-Sold"])
-    vision = deal_name.str.contains("Vision & Beyond", case=False, na=False)
 
-    active_evidence = (
-        current_upb.gt(0)
-        | (recently_closed & has_candidate_servicer)
-        | (sold_servicing_retained & has_candidate_servicer)
-        | (is_reo & (has_candidate_servicer | in_prev | in_prev_positive))
+    keep_mask = typ.isin(TERM_TYPES) & (
+        is_closed_won
+        | is_reo
+        | (
+            is_sold
+            & (
+                current_upb.gt(0)
+                | (sold_servicing_retained & has_candidate_servicer)
+                | in_prev_positive
+            )
+        )
     )
-
-    keep_mask = typ.isin(TERM_TYPES) & (vision | in_prev | in_prev_positive | active_evidence)
     return out.loc[keep_mask].copy()
 
 def _best_header_read_excel(
@@ -3070,6 +3073,15 @@ def build_bridge_asset(
         ],
     )
 
+    stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    current_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
+    is_closed_won = stage_series.eq("Closed Won")
+    is_sold = stage_series.eq("Sold")
+    is_reo = stage_series.isin(["REO", "REO-Sold"]) | pd.to_datetime(out.get("REO Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna()
+
+    keep_mask = is_closed_won | is_reo | (is_sold & current_upb.gt(0))
+    out = out.loc[keep_mask].copy()
+
     return downcast_numeric_frame(out)
 
 
@@ -3209,18 +3221,30 @@ def build_term_loan(
         out = out.drop(columns=["_prev_upb"], errors="ignore")
 
     stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string").str.strip()
-    deal_name = pd.Series(sf_term.get("Deal Name", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string")
+    sold_servicing_status = pd.Series(
+        sf_term.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out))).values,
+        index=out.index,
+    )
     final_upb = pd.to_numeric(out[upb_col], errors="coerce").fillna(0)
     servicer_id_present = ~blankish_mask(out.get("Servicer ID", blank_obj))
     servicer_present = ~blankish_mask(out.get("Servicer", blank_obj))
+    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
+    is_closed_won = stage_series.eq("Closed Won")
+    is_sold = stage_series.eq("Sold")
     is_reo = pd.to_datetime(out["REO Date"], errors="coerce").notna() | stage_series.isin(["REO", "REO-Sold"])
-    vision = deal_name.str.contains("Vision & Beyond", case=False, na=False)
     prev_positive = out["_deal_key"].isin(prev_positive_keys)
 
     keep_mask = (
-        final_upb.gt(0)
-        | vision
-        | (is_reo & (prev_positive | servicer_id_present | servicer_present))
+        is_closed_won
+        | is_reo
+        | (
+            is_sold
+            & (
+                final_upb.gt(0)
+                | (sold_servicing_retained & (servicer_id_present | servicer_present))
+                | prev_positive
+            )
+        )
     )
     out = out.loc[keep_mask].copy()
 
@@ -3423,6 +3447,15 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict,
     out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out["Special Focus (Y/N)"], pd.Series(["N"] * len(out), index=out.index))
     out["3/31 NPL"] = coalesce_keep_nonblank(out["3/31 NPL"], pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out["Needs NPL Value"], pd.Series(["N"] * len(out), index=out.index))
+
+    stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    current_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
+    is_closed_won = stage_series.eq("Closed Won")
+    is_sold = stage_series.eq("Sold")
+    is_reo = stage_series.isin(["REO", "REO-Sold"])
+
+    keep_mask = is_closed_won | is_reo | (is_sold & current_upb.gt(0))
+    out = out.loc[keep_mask].copy()
 
     out = _fill_text_defaults(
         out,
