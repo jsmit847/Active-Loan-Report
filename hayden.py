@@ -36,6 +36,7 @@ FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
 BRIDGE_ACTIVE_STAGES = ["Closed Won", "Expired", "Matured", "REO", "REO-Sold", "Sold"]
+BRIDGE_LOAN_SOURCE_STAGES = BRIDGE_ACTIVE_STAGES + ["Paid Off"]
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan"]
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
@@ -1533,6 +1534,153 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         )
 
     return downcast_numeric_frame(df)
+
+
+def _build_bridge_loan_wide_like() -> pd.DataFrame:
+    sold_pool_field = first_existing_field_name("Opportunity", ["Sold_Loan_Pool__c", "FK_Sold_Loan_Pool__c"])
+    sold_pool_rel = relationship_name_for("Opportunity", sold_pool_field) if sold_pool_field else None
+
+    contact_field = first_existing_field_name("Opportunity", ["Contact__c", "Primary_Contact__c"])
+    contact_rel = relationship_name_for("Opportunity", contact_field) if contact_field else None
+
+    servicer_primary_field = first_existing_field_name(
+        "Opportunity",
+        [
+            "Servicer_Loan_Number__c",
+            "Servicer_Loan_Num__c",
+            "Servicer_Loan_ID__c",
+            "Servicer_Loan_Id__c",
+        ],
+    )
+    servicer_commitment_field = first_existing_field_name("Opportunity", TERM_SERVICER_FALLBACK_FIELD_CANDIDATES)
+
+    sold_to_expr = f"{sold_pool_rel}.Sold_To__r.Name" if sold_pool_rel else "Account.Name"
+    primary_contact_expr = f"{contact_rel}.Name" if contact_rel else "Account.Name"
+
+    select_pairs = [
+        ("Loan Buyer", sold_to_expr),
+        ("Financing", "Warehouse_Line__c"),
+        ("Deal Number", "Deal_Loan_Number__c"),
+        ("Deal Name", "Name"),
+        ("Borrower Name", "Borrower_Entity__r.Name"),
+        ("Account", "Account.Name"),
+        ("Do Not Lend", "Account.Do_Not_Lend__c"),
+        ("Primary Contact", primary_contact_expr),
+        ("Origination Date", "CloseDate"),
+        ("Next Payment Date", "Next_Payment_Date__c"),
+        ("Original Maturity Date", "Stated_Maturity_Date__c"),
+        ("Current Maturity Date", "Current_Line_Maturity_Date__c"),
+        ("Loan Commitment", "LOC_Commitment__c"),
+        ("Remaining Commitment", "Outstanding_Facility_Amount__c"),
+        ("SF Suspense Balance", "Suspense_Balance__c"),
+        ("SF Current UPB", "Current_UPB__c"),
+        ("Loan Stage", "StageName"),
+        ("Product Type", "LOC_Loan_Type__c"),
+        ("Product Sub Type", "Product_Sub_Type__c"),
+        ("Transaction Type", "Transaction_Type__c"),
+        ("Project Strategy", "Project_Strategy__c"),
+        ("CV Originator", "Owner.Name"),
+        ("CV Originator: Active", "Owner.IsActive"),
+        ("Deal Intro Sub-Source", "Deal_Intro_Sub_Source__c"),
+        ("Referral Source Account", "Referral_Source__r.Name"),
+        ("Referral Source Contact", "Referral_Source_Contact__r.Name"),
+        ("AM Commentary", "Asset_Management_Comments__c"),
+        ("Type", "Type"),
+    ]
+    if servicer_primary_field:
+        select_pairs.insert(3, ("Opportunity Servicer Loan Number", servicer_primary_field))
+    if servicer_commitment_field:
+        select_pairs.insert(4 if servicer_primary_field else 3, ("Opportunity Servicer Commitment Id", servicer_commitment_field))
+
+    rename_map = {expr: label for label, expr in select_pairs}
+
+    where_parts = [
+        "Deal_Loan_Number__c != NULL",
+        _soql_in("StageName", BRIDGE_LOAN_SOURCE_STAGES),
+        _soql_in("Type", BRIDGE_TYPES),
+        _soql_not_equal_or_null("LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+    ]
+
+    soql = (
+        "SELECT "
+        + ", ".join(expr for _label, expr in select_pairs)
+        + " FROM Opportunity WHERE "
+        + " AND ".join(where_parts)
+    )
+
+    df = run_bulk_query(soql, rename_map=rename_map)
+    if df.empty:
+        return df
+
+    blank_obj = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    if "Opportunity Servicer Loan Number" in df.columns:
+        df["Opportunity Servicer Loan Number"] = df["Opportunity Servicer Loan Number"].astype("string").str.strip().replace({"": pd.NA})
+    if "Opportunity Servicer Commitment Id" in df.columns:
+        df["Opportunity Servicer Commitment Id"] = df["Opportunity Servicer Commitment Id"].astype("string").str.strip().replace({"": pd.NA})
+
+    df["Servicer ID"] = coalesce_keep_nonblank(
+        df.get("Opportunity Servicer Loan Number", blank_obj),
+        df.get("Opportunity Servicer Commitment Id", blank_obj),
+    )
+    df["Deal Number"] = df.get("Deal Number", blank_obj).astype("string").str.strip().replace({"": pd.NA})
+    return downcast_numeric_frame(df)
+
+
+def _build_bridge_property_rollup_like() -> pd.DataFrame:
+    opp_rel = property_opportunity_relationship_name()
+
+    select_pairs = [
+        ("Deal Number", f"{opp_rel}.Deal_Loan_Number__c"),
+        ("Asset ID", "Asset_ID__c"),
+        ("State", "State__c"),
+        ("# of Units", "Number_of_Units__c"),
+        ("Last Funding Date", "Funding_Date__c"),
+        ("Property Status", "Status__c"),
+        ("Property Current UPB", "Current_UPB__c"),
+    ]
+    rename_map = {expr: label for label, expr in select_pairs}
+
+    where_parts = [
+        f"{opp_rel}.Deal_Loan_Number__c != NULL",
+        _soql_in(f"{opp_rel}.StageName", BRIDGE_LOAN_SOURCE_STAGES),
+        _soql_in(f"{opp_rel}.Type", BRIDGE_TYPES),
+        _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+    ]
+
+    soql = (
+        "SELECT "
+        + ", ".join(expr for _label, expr in select_pairs)
+        + " FROM Property__c WHERE "
+        + " AND ".join(where_parts)
+    )
+
+    df = run_bulk_query(soql, rename_map=rename_map)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "_deal_key", "Number of Assets", "# of Units", "State(s)", "Last Funding Date",
+            "Active Asset Count", "Active Asset UPB",
+        ])
+
+    df["_deal_key"] = norm_id_series(df.get("Deal Number", pd.Series([None] * len(df), index=df.index)))
+    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+    status = df.get("Property Status", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.strip()
+    asset_upb = pd.to_numeric(df.get("Property Current UPB", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce").fillna(0)
+    is_active_asset = status.isin(BRIDGE_ACTIVE_PROPERTY_STATUSES) | asset_upb.gt(0)
+    df["_active_asset_upb"] = asset_upb.where(is_active_asset, 0.0)
+    df["_is_active_asset"] = is_active_asset.astype("int8")
+
+    g = df.groupby("_deal_key", dropna=True)
+    out = pd.DataFrame(
+        {
+            "Number of Assets": g["_asset_key"].nunique(),
+            "# of Units": pd.to_numeric(g["# of Units"].sum(min_count=1), errors="coerce") if "# of Units" in df.columns else np.nan,
+            "State(s)": g["State"].apply(lambda s: ", ".join(sorted({clean_text(x) for x in s if clean_text(x)}))) if "State" in df.columns else pd.Series(dtype="string"),
+            "Last Funding Date": g["Last Funding Date"].apply(lambda s: pd.to_datetime(s, errors="coerce").dropna().max() if len(pd.to_datetime(s, errors="coerce").dropna()) else pd.NaT),
+            "Active Asset Count": g["_is_active_asset"].sum(),
+            "Active Asset UPB": pd.to_numeric(g["_active_asset_upb"].sum(min_count=1), errors="coerce"),
+        }
+    ).reset_index()
+    return downcast_numeric_frame(out)
 
 
 def _build_do_not_lend_like() -> pd.DataFrame:
@@ -3812,103 +3960,213 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 
 
 
-def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict, npl_maps: Optional[dict] = None) -> pd.DataFrame:
-    ba = bridge_asset.copy()
-    g = ba.groupby("_deal_key", dropna=True)
+def build_bridge_loan(
+    bridge_loan_wide: pd.DataFrame,
+    bridge_asset: pd.DataFrame,
+    bridge_property_rollup: pd.DataFrame,
+    serv_lookup: pd.DataFrame,
+    upb_col: str,
+    prev_maps: dict,
+    template_maps: dict,
+    npl_maps: Optional[dict] = None,
+) -> pd.DataFrame:
+    out = bridge_loan_wide.copy()
+    if out.empty:
+        return out
 
-    def _first(series: pd.Series):
-        return first_nonblank(series)
+    blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
+    out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
+    out["Servicer ID"] = coalesce_keep_nonblank(out.get("Servicer ID", blank_obj), blank_obj)
 
-    def _max_dt(series: pd.Series):
-        s = pd.to_datetime(series, errors="coerce").dropna()
-        return s.max() if len(s) else pd.NaT
+    if "Do Not Lend" in out.columns:
+        out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend"])
+        out = out.drop(columns=["Do Not Lend"], errors="ignore")
+    elif "Do Not Lend (Y/N)" not in out.columns:
+        out["Do Not Lend (Y/N)"] = "N"
 
-    def _min_dt(series: pd.Series):
-        s = pd.to_datetime(series, errors="coerce").dropna()
-        return s.min() if len(s) else pd.NaT
+    seg_guess = out.apply(
+        lambda r: derive_bridge_segment(r.get("Deal Number"), r.get("Financing"), r.get("Loan Buyer"), template_maps),
+        axis=1,
+    )
+    strat_guess = out.get("Project Strategy", pd.Series([pd.NA] * len(out), index=out.index)).map(
+        lambda x: strategy_grouping_from_project_strategy(x, template_maps.get("strategy_map", {}))
+    )
+    port_guess = out.apply(
+        lambda r: derive_bridge_portfolio(
+            r.get("Product Type"),
+            r.get("Segment") if has_any_value(r.get("Segment")) else derive_bridge_segment(r.get("Deal Number"), r.get("Financing"), r.get("Loan Buyer"), template_maps),
+            r.get("Financing"),
+            r.get("Deal Intro Sub-Source"),
+            r.get("Deal Number"),
+        ),
+        axis=1,
+    )
+    out["Segment"] = coalesce_keep_nonblank(out.get("Segment", blank_obj), seg_guess)
+    out["Strategy Grouping"] = coalesce_keep_nonblank(out.get("Strategy Grouping", blank_obj), strat_guess)
+    out["Portfolio"] = coalesce_keep_nonblank(out.get("Portfolio", blank_obj), port_guess)
 
-    def _yn_any(series: pd.Series):
-        vals = pd.Series(series).astype("string").str.strip().str.upper()
-        return "Y" if vals.eq("Y").any() else "N"
+    if bridge_property_rollup is not None and not bridge_property_rollup.empty:
+        out = out.merge(bridge_property_rollup, on="_deal_key", how="left")
+    else:
+        out["Number of Assets"] = np.nan
+        out["# of Units"] = np.nan
+        out["State(s)"] = pd.NA
+        out["Active Asset Count"] = 0
+        out["Active Asset UPB"] = np.nan
 
-    out = pd.DataFrame(
-        {
-            "Deal Number": g["Deal Number"].first() if "Deal Number" in ba.columns else pd.Series(dtype="string"),
-            "Portfolio": g["Portfolio"].apply(_first) if "Portfolio" in ba.columns else pd.Series(dtype="string"),
-            "Loan Buyer": g["Loan Buyer"].apply(_first) if "Loan Buyer" in ba.columns else pd.Series(dtype="string"),
-            "Financing": g["Financing"].apply(_first) if "Financing" in ba.columns else pd.Series(dtype="string"),
-            "Servicer ID": g["Servicer ID"].apply(first_or_various) if "Servicer ID" in ba.columns else pd.Series(dtype="string"),
-            "Servicer": g["Servicer"].apply(first_or_various) if "Servicer" in ba.columns else pd.Series(dtype="string"),
-            "Deal Name": g["Deal Name"].apply(_first) if "Deal Name" in ba.columns else pd.Series(dtype="string"),
-            "Borrower Name": g["Borrower Entity"].apply(_first) if "Borrower Entity" in ba.columns else pd.Series(dtype="string"),
-            "Account": g["Account Name"].apply(_first) if "Account Name" in ba.columns else pd.Series(dtype="string"),
-            "Do Not Lend (Y/N)": g["Do Not Lend (Y/N)"].max() if "Do Not Lend (Y/N)" in ba.columns else pd.Series(dtype="string"),
-            "Primary Contact": g["Primary Contact"].apply(_first) if "Primary Contact" in ba.columns else pd.Series(dtype="string"),
-            "Number of Assets": g["Asset ID"].nunique() if "Asset ID" in ba.columns else pd.Series(dtype="float"),
-            "# of Units": pd.to_numeric(g["# of Units"].sum(min_count=1), errors="coerce") if "# of Units" in ba.columns else np.nan,
-            "State(s)": g["State"].apply(lambda s: ", ".join(sorted({clean_text(x) for x in s if clean_text(x)}))) if "State" in ba.columns else pd.Series(dtype="string"),
-            "Origination Date": g["Origination Date"].apply(_min_dt) if "Origination Date" in ba.columns else pd.NaT,
-            "Last Funding Date": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else pd.NaT,
-            "Original Maturity Date": g["Original Loan Maturity date"].apply(_first) if "Original Loan Maturity date" in ba.columns else pd.NaT,
-            "Current Maturity Date": g["Current Loan Maturity date"].apply(_first) if "Current Loan Maturity date" in ba.columns else pd.NaT,
-            "Next Advance Maturity Date": g["Servicer Maturity Date"].apply(_first) if "Servicer Maturity Date" in ba.columns else pd.NaT,
-            "Next Payment Date": g["Next Payment Date"].apply(_min_dt) if "Next Payment Date" in ba.columns else pd.NaT,
-            "Days Past Due": pd.to_numeric(g["_bridge_dpd_num"].max(), errors="coerce") if "_bridge_dpd_num" in ba.columns else pd.Series(dtype="float"),
-            "Loan Level Delinquency": g["_bridge_dq_bucket"].apply(_worst_bridge_bucket) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
-            "Loan Commitment": g["Loan Commitment"].apply(_first) if "Loan Commitment" in ba.columns else np.nan,
-            "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
-            upb_col: pd.to_numeric(g[upb_col].sum(min_count=1), errors="coerce") if upb_col in ba.columns else np.nan,
-            "Suspense Balance": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
-            "Remaining Commitment": g["Remaining Commitment"].apply(_first) if "Remaining Commitment" in ba.columns else np.nan,
-            "Most Recent Valuation Date": g["Updated Valuation Date"].apply(_max_dt) if "Updated Valuation Date" in ba.columns else pd.NaT,
-            "Most Recent As-Is Value": pd.to_numeric(g["Updated As-Is Value"].sum(min_count=1), errors="coerce") if "Updated As-Is Value" in ba.columns else np.nan,
-            "Most Recent ARV": pd.to_numeric(g["Updated ARV"].sum(min_count=1), errors="coerce") if "Updated ARV" in ba.columns else np.nan,
-            "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
-            "Renovation Holdback": pd.to_numeric(g["Renovation Holdback"].sum(min_count=1), errors="coerce") if "Renovation Holdback" in ba.columns else np.nan,
-            "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce") if "Renovation Holdback Funded" in ba.columns else np.nan,
-            "Renovation HB Remaining": pd.to_numeric(g["Renovation Holdback Remaining"].sum(min_count=1), errors="coerce") if "Renovation Holdback Remaining" in ba.columns else np.nan,
-            "Interest Allocation": pd.to_numeric(g["Interest Allocation"].sum(min_count=1), errors="coerce") if "Interest Allocation" in ba.columns else np.nan,
-            "Interest Allocation Funded": pd.to_numeric(g["Interest Allocation Funded"].sum(min_count=1), errors="coerce") if "Interest Allocation Funded" in ba.columns else np.nan,
-            "Loan Stage": g["Loan Stage"].apply(_first) if "Loan Stage" in ba.columns else pd.Series(dtype="string"),
-            "Segment": g["Segment"].apply(_first) if "Segment" in ba.columns else pd.Series(dtype="string"),
-            "Product Type": g["Product Type"].apply(_first) if "Product Type" in ba.columns else pd.Series(dtype="string"),
-            "Product Sub Type": g["Product Sub-Type"].apply(_first) if "Product Sub-Type" in ba.columns else pd.Series(dtype="string"),
-            "Transaction Type": g["Transaction Type"].apply(_first) if "Transaction Type" in ba.columns else pd.Series(dtype="string"),
-            "Project Strategy": g["Project Strategy"].apply(_first) if "Project Strategy" in ba.columns else pd.Series(dtype="string"),
-            "Strategy Grouping": g["Strategy Grouping"].apply(_first) if "Strategy Grouping" in ba.columns else pd.Series(dtype="string"),
-            "CV Originator": g["Originator"].apply(_first) if "Originator" in ba.columns else pd.Series(dtype="string"),
-            "Active RM": g["Active RM"].apply(_first) if "Active RM" in ba.columns else pd.Series(dtype="string"),
-            "Deal Intro Sub-Source": g["Deal Intro Sub-Source"].apply(_first) if "Deal Intro Sub-Source" in ba.columns else pd.Series(dtype="string"),
-            "Referral Source Account": g["Referral Source Account"].apply(_first) if "Referral Source Account" in ba.columns else pd.Series(dtype="string"),
-            "Referral Source Contact": g["Referral Source Contact"].apply(_first) if "Referral Source Contact" in ba.columns else pd.Series(dtype="string"),
-            "3/31 NPL": g["3/31 NPL (Y/N)"].apply(_yn_any) if "3/31 NPL (Y/N)" in ba.columns else "N",
-            "Needs NPL Value": g["Needs NPL Value"].apply(_yn_any) if "Needs NPL Value" in ba.columns else "N",
-            "Special Focus (Y/N)": g["Special Flag"].apply(_yn_any) if "Special Flag" in ba.columns else "N",
-            "Asset Manager 1": g["Asset Manager 1"].apply(_first) if "Asset Manager 1" in ba.columns else pd.Series(dtype="string"),
-            "AM 1 Assigned Date": g["AM 1 Assigned Date"].apply(_first) if "AM 1 Assigned Date" in ba.columns else pd.NaT,
-            "Asset Manager 2": g["Asset Manager 2"].apply(_first) if "Asset Manager 2" in ba.columns else pd.Series(dtype="string"),
-            "AM 2 Assigned Date": g["AM 2 Assigned Date"].apply(_first) if "AM 2 Assigned Date" in ba.columns else pd.NaT,
-            "Construction Mgr.": g["Construction Mgr."].apply(_first) if "Construction Mgr." in ba.columns else pd.Series(dtype="string"),
-            "CM Assigned Date": g["CM Assigned Date"].apply(_first) if "CM Assigned Date" in ba.columns else pd.NaT,
-            "AM Commentary": g["Comments AM"].apply(_first) if "Comments AM" in ba.columns else pd.Series(dtype="string"),
-        }
-    ).reset_index(drop=True)
+    if bridge_asset is not None and not bridge_asset.empty:
+        ba = bridge_asset.copy()
+        g = ba.groupby("_deal_key", dropna=True)
 
-    out["_deal_key"] = norm_id_series(out["Deal Number"])
+        def _first(series: pd.Series):
+            return first_nonblank(series)
 
-    if "Loan Level Delinquency" in out.columns:
-        derived_bucket = out["Days Past Due"].map(_bridge_bucket_from_days)
-        out["Loan Level Delinquency"] = coalesce_keep_nonblank(out["Loan Level Delinquency"], derived_bucket)
+        def _max_dt(series: pd.Series):
+            s = pd.to_datetime(series, errors="coerce").dropna()
+            return s.max() if len(s) else pd.NaT
+
+        def _min_dt(series: pd.Series):
+            s = pd.to_datetime(series, errors="coerce").dropna()
+            return s.min() if len(s) else pd.NaT
+
+        def _yn_any(series: pd.Series):
+            vals = pd.Series(series).astype("string").str.strip().str.upper()
+            return "Y" if vals.eq("Y").any() else "N"
+
+        active_roll = pd.DataFrame(
+            {
+                "Servicer ID_active": g["Servicer ID"].apply(first_or_various) if "Servicer ID" in ba.columns else pd.Series(dtype="string"),
+                "Servicer_active": g["Servicer"].apply(first_or_various) if "Servicer" in ba.columns else pd.Series(dtype="string"),
+                "Primary Contact_active": g["Primary Contact"].apply(_first) if "Primary Contact" in ba.columns else pd.Series(dtype="string"),
+                "Last Funding Date_active": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else pd.NaT,
+                "Days Past Due_active": pd.to_numeric(g["_bridge_dpd_num"].max(), errors="coerce") if "_bridge_dpd_num" in ba.columns else pd.Series(dtype="float"),
+                "Loan Level Delinquency_active": g["_bridge_dq_bucket"].apply(_worst_bridge_bucket) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
+                "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
+                "Suspense Balance_active": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
+                "Most Recent Valuation Date": g["Updated Valuation Date"].apply(_max_dt) if "Updated Valuation Date" in ba.columns else pd.NaT,
+                "Most Recent As-Is Value": pd.to_numeric(g["Updated As-Is Value"].sum(min_count=1), errors="coerce") if "Updated As-Is Value" in ba.columns else np.nan,
+                "Most Recent ARV": pd.to_numeric(g["Updated ARV"].sum(min_count=1), errors="coerce") if "Updated ARV" in ba.columns else np.nan,
+                "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
+                "Renovation Holdback": pd.to_numeric(g["Renovation Holdback"].sum(min_count=1), errors="coerce") if "Renovation Holdback" in ba.columns else np.nan,
+                "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce") if "Renovation Holdback Funded" in ba.columns else np.nan,
+                "Renovation HB Remaining": pd.to_numeric(g["Renovation Holdback Remaining"].sum(min_count=1), errors="coerce") if "Renovation Holdback Remaining" in ba.columns else np.nan,
+                "Interest Allocation": pd.to_numeric(g["Interest Allocation"].sum(min_count=1), errors="coerce") if "Interest Allocation" in ba.columns else np.nan,
+                "Interest Allocation Funded": pd.to_numeric(g["Interest Allocation Funded"].sum(min_count=1), errors="coerce") if "Interest Allocation Funded" in ba.columns else np.nan,
+                "3/31 NPL": g["3/31 NPL (Y/N)"].apply(_yn_any) if "3/31 NPL (Y/N)" in ba.columns else "N",
+                "Needs NPL Value": g["Needs NPL Value"].apply(_yn_any) if "Needs NPL Value" in ba.columns else "N",
+                "Special Focus (Y/N)": g["Special Flag"].apply(_yn_any) if "Special Flag" in ba.columns else "N",
+                "Asset Manager 1": g["Asset Manager 1"].apply(_first) if "Asset Manager 1" in ba.columns else pd.Series(dtype="string"),
+                "AM 1 Assigned Date": g["AM 1 Assigned Date"].apply(_first) if "AM 1 Assigned Date" in ba.columns else pd.NaT,
+                "Asset Manager 2": g["Asset Manager 2"].apply(_first) if "Asset Manager 2" in ba.columns else pd.Series(dtype="string"),
+                "AM 2 Assigned Date": g["AM 2 Assigned Date"].apply(_first) if "AM 2 Assigned Date" in ba.columns else pd.NaT,
+                "Construction Mgr.": g["Construction Mgr."].apply(_first) if "Construction Mgr." in ba.columns else pd.Series(dtype="string"),
+                "CM Assigned Date": g["CM Assigned Date"].apply(_first) if "CM Assigned Date" in ba.columns else pd.NaT,
+                "Active RM": g["Active RM"].apply(_first) if "Active RM" in ba.columns else pd.Series(dtype="string"),
+                "AM Commentary": g["Comments AM"].apply(_first) if "Comments AM" in ba.columns else pd.Series(dtype="string"),
+            }
+        ).reset_index()
+        out = out.merge(active_roll, on="_deal_key", how="left")
+    else:
+        out["3/31 NPL"] = "N"
+        out["Needs NPL Value"] = "N"
+        out["Special Focus (Y/N)"] = "N"
+
+    out["Primary Contact"] = coalesce_keep_nonblank(out.get("Primary Contact_active", blank_obj), out.get("Primary Contact", blank_obj))
+    out["Last Funding Date"] = pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_datetime(out.get("Last Funding Date_active", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Servicer ID"] = coalesce_keep_nonblank(out.get("Servicer ID_active", blank_obj), out.get("Servicer ID", blank_obj))
+    out["Servicer"] = coalesce_keep_nonblank(out.get("Servicer_active", blank_obj), out.get("Servicer", blank_obj))
+
+    out["Active Asset Count"] = pd.to_numeric(out.get("Active Asset Count", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0)
+    out["Active Asset UPB"] = pd.to_numeric(out.get("Active Asset UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    out["SF Current UPB"] = pd.to_numeric(out.get("SF Current UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    out["Suspense Balance"] = pd.to_numeric(out.get("Suspense Balance_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
+    out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out), index=out.index)))
+    if not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
+        s = serv_lookup.dropna(subset=["_sid_key"]).copy().rename(
+            columns={
+                "servicer": "_servicer_file",
+                "upb": "_loan_upb",
+                "suspense": "_loan_suspense",
+                "next_payment_date": "_serv_next_payment_date",
+                "maturity_date": "_servicer_maturity_file",
+                "status": "_servicer_status_file",
+            }
+        )
+        out = out.merge(
+            s[["_sid_key", "_servicer_file", "_loan_upb", "_loan_suspense", "_serv_next_payment_date", "_servicer_maturity_file", "_servicer_status_file"]],
+            on="_sid_key",
+            how="left",
+        )
+
+    if "bridge_loan_upb" in prev_maps:
+        prev_upb = prev_maps["bridge_loan_upb"].copy()
+        out = out.merge(prev_upb, on="_deal_key", how="left")
+    else:
+        out["_prev_upb"] = np.nan
+
+    stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    final_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    final_upb = final_upb.where(final_upb.notna(), out["Active Asset UPB"])
+    final_upb = final_upb.where(final_upb.notna(), out["SF Current UPB"])
+
+    late_stage_mask = stage_series.isin(EXPIRED_OR_MATURED_STAGES + ["Paid Off"])
+    prev_upb_vals = pd.to_numeric(out.get("_prev_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    final_upb = final_upb.where(~(late_stage_mask & (final_upb.isna() | final_upb.le(0))), prev_upb_vals)
+    out[upb_col] = pd.to_numeric(final_upb, errors="coerce")
+
+    out["Suspense Balance"] = pd.to_numeric(out.get("_loan_suspense", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("_loan_suspense", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Suspense Balance"] = pd.to_numeric(out["Suspense Balance"], errors="coerce").where(
+        pd.to_numeric(out["Suspense Balance"], errors="coerce").notna(),
+        pd.to_numeric(out.get("SF Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+
+    out["Next Payment Date"] = pd.to_datetime(out.get("_serv_next_payment_date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_datetime(out.get("_serv_next_payment_date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Next Advance Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+    out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
+
+    loan_status_bucket = pd.Series(
+        [
+            normalize_bridge_servicer_status(raw_status, npd, run_dt, loan_stage, None, None)
+            for raw_status, npd, loan_stage in zip(
+                out.get("_servicer_status_file", blank_obj),
+                out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)),
+                stage_series,
+            )
+        ],
+        index=out.index,
+        dtype="object",
+    )
+    out["Loan Level Delinquency"] = coalesce_keep_nonblank(out.get("Loan Level Delinquency_active", blank_obj), loan_status_bucket)
+    out["Days Past Due"] = pd.to_numeric(out.get("Days Past Due_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    derived_days = pd.Series(
+        [
+            min(_guess_days_past_due(npd, run_dt), 29.0) if has_any_value(bucket) and clean_text(bucket).upper() == "CURRENT" else _guess_days_from_bridge_bucket(bucket)
+            for bucket, npd in zip(out["Loan Level Delinquency"], out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)))
+        ],
+        index=out.index,
+        dtype="float64",
+    )
+    out["Days Past Due"] = out["Days Past Due"].where(out["Days Past Due"].notna(), derived_days)
 
     if npl_maps and not npl_maps.get("loan_flags", pd.DataFrame()).empty:
         loan_flags = npl_maps["loan_flags"].copy().drop_duplicates("_deal_key")
         out = out.merge(loan_flags, on="_deal_key", how="left", suffixes=("", "_npl"))
         if "NPL Flag_npl" in out.columns:
-            out["3/31 NPL"] = coalesce_keep_nonblank(out["3/31 NPL"], out["NPL Flag_npl"])
+            out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), out["NPL Flag_npl"])
             out = out.drop(columns=["NPL Flag_npl"], errors="ignore")
         for c in ["Needs NPL Value", "Special Focus (Y/N)"]:
             if f"{c}_npl" in out.columns:
-                out[c] = coalesce_keep_nonblank(out[c], out[f"{c}_npl"])
+                out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_npl"])
                 out = out.drop(columns=[f"{c}_npl"], errors="ignore")
 
     if "bridge_loan_manual" in prev_maps and not out.empty:
@@ -3921,22 +4179,25 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict,
             "Construction Mgr.", "CM Assigned Date",
         ]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out.get(c, pd.Series([pd.NA] * len(out), index=out.index)), out[f"{c}_prev"])
+                out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
-    out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
-    out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out["Special Focus (Y/N)"], pd.Series(["N"] * len(out), index=out.index))
-    out["3/31 NPL"] = coalesce_keep_nonblank(out["3/31 NPL"], pd.Series(["N"] * len(out), index=out.index))
-    out["Needs NPL Value"] = coalesce_keep_nonblank(out["Needs NPL Value"], pd.Series(["N"] * len(out), index=out.index))
+    out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
+    out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out.get("Special Focus (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
+    out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), pd.Series(["N"] * len(out), index=out.index))
+    out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
-    stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
     current_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
+    active_asset_count = pd.to_numeric(out.get("Active Asset Count", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0)
     is_closed_won = stage_series.eq("Closed Won")
     is_sold = stage_series.eq("Sold")
     is_reo = stage_series.isin(REO_FAMILY_STAGES)
-    is_expired_or_matured = stage_series.isin(EXPIRED_OR_MATURED_STAGES)
+    is_late_stage = stage_series.isin(EXPIRED_OR_MATURED_STAGES + ["Paid Off"])
 
-    keep_mask = is_closed_won | is_reo | is_sold | (is_expired_or_matured & current_upb.gt(0))
+    keep_mask = is_closed_won | is_reo | is_sold | (is_late_stage & (current_upb.gt(0) | active_asset_count.gt(0)))
     out = out.loc[keep_mask].copy()
 
     out = _fill_text_defaults(
@@ -3948,7 +4209,11 @@ def build_bridge_loan(bridge_asset: pd.DataFrame, upb_col: str, prev_maps: dict,
         ],
     )
 
-    return downcast_numeric_frame(out.drop(columns=["_deal_key"], errors="ignore"))
+    drop_cols = [
+        c for c in out.columns
+        if c.startswith("_") or c.endswith("_active") or c.startswith("SF ") or c.startswith("Opportunity Servicer")
+    ]
+    return downcast_numeric_frame(out.drop(columns=drop_cols, errors="ignore"))
 
 
 
@@ -4471,6 +4736,8 @@ if build_btn:
             if need_bridge:
                 status.update(label="Pulling bridge/property data from Salesforce...")
                 bridge_spine = _build_bridge_spine_like()
+                bridge_loan_wide = _build_bridge_loan_wide_like()
+                bridge_property_rollup = _build_bridge_property_rollup_like()
                 bridge_asset_ids = _bridge_asset_ids_from_spine(bridge_spine)
 
                 status.update(label="Pulling Do Not Lend deals from Salesforce...")
@@ -4506,13 +4773,29 @@ if build_btn:
 
                 if build_target in ("Bridge Loan", "All"):
                     status.update(label="Building Bridge Loan...")
-                    bridge_loan_df = build_bridge_loan(bridge_asset_df, upb_col, prev_maps, npl_maps=npl_maps)
+                    bridge_loan_df = build_bridge_loan(
+                        bridge_loan_wide,
+                        bridge_asset_df,
+                        bridge_property_rollup,
+                        serv_join,
+                        upb_col,
+                        prev_maps,
+                        template_maps,
+                        npl_maps=npl_maps,
+                    )
+
+                    diagnostics.append(f"Bridge Loan rows: {len(bridge_loan_df):,}")
+                    diagnostics.append(
+                        f"Bridge Loan nonblank {upb_col}: {bridge_loan_df[upb_col].notna().mean():.1%}"
+                        if upb_col in bridge_loan_df.columns
+                        else f"Bridge Loan nonblank {upb_col}: n/a"
+                    )
 
                     status.update(label="Writing Bridge Loan sheet...")
                     write_output_sheet(wb, "Bridge Loan", bridge_loan_df, upb_col)
                     del bridge_loan_df
 
-                del bridge_spine, bridge_dnl, bridge_asset_ids, bridge_val, bridge_asset_df
+                del bridge_spine, bridge_loan_wide, bridge_property_rollup, bridge_dnl, bridge_asset_ids, bridge_val, bridge_asset_df
                 gc.collect()
 
             if need_term:
