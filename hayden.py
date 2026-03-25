@@ -2846,6 +2846,13 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             tmp = ba[keep].copy()
             tmp["_asset_key"] = norm_id_series(tmp["Asset ID"])
             out["bridge_asset_manual"] = tmp.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key")
+
+            upb_col_prev = _find_upb_col(ba.columns)
+            if upb_col_prev:
+                tmpu = ba[["Asset ID", upb_col_prev]].copy()
+                tmpu["_asset_key"] = norm_id_series(tmpu["Asset ID"])
+                tmpu["_prev_asset_upb"] = tmpu[upb_col_prev].apply(money_to_float)
+                out["bridge_asset_upb"] = tmpu.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key")[["_asset_key", "_prev_asset_upb"]]
     except Exception:
         pass
 
@@ -3047,6 +3054,12 @@ def build_bridge_asset(
     out["_sid_key"] = id_key_no_leading_zeros(out.get("Servicer ID", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
 
+    if "bridge_asset_upb" in prev_maps:
+        prev_asset_upb = prev_maps["bridge_asset_upb"].copy()
+        out = out.merge(prev_asset_upb, on="_asset_key", how="left")
+    else:
+        out["_prev_asset_upb"] = np.nan
+
     if not sf_dnl.empty and "Deal Loan Number" in sf_dnl.columns:
         dnl = sf_dnl.copy()
         dnl["_deal_key"] = norm_id_series(dnl["Deal Loan Number"])
@@ -3137,6 +3150,10 @@ def build_bridge_asset(
     out["Strategy Grouping"] = coalesce_keep_nonblank(out["Strategy Grouping"], strat_guess)
     out["Portfolio"] = coalesce_keep_nonblank(out["Portfolio"], port_guess)
 
+    base_stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & base_stage_series.eq("Sold"), "Sold")
+
     prop_npd = pd.to_datetime(sf_spine.get("Property Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     opp_npd = pd.to_datetime(sf_spine.get("Opportunity Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     sf_next_payment = prop_npd.where(prop_npd.notna(), opp_npd)
@@ -3197,6 +3214,14 @@ def build_bridge_asset(
         current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
         out[upb_col] = current_upb_series.where(current_upb_series.notna(), sf_current_upb)
 
+        late_stage_mask = stage_series.astype("string").str.strip().isin(EXPIRED_OR_MATURED_STAGES + ["Paid Off"])
+        prev_asset_upb_vals = pd.to_numeric(out.get("_prev_asset_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
+        out[upb_col] = current_upb_series.where(
+            ~(late_stage_mask & (current_upb_series.isna() | current_upb_series.le(0))),
+            prev_asset_upb_vals,
+        )
+
         out["Next Payment Date"] = pd.to_datetime(out.get("_serv_next_payment_date"), errors="coerce")
         out["Next Payment Date"] = pd.to_datetime(out["Next Payment Date"], errors="coerce").where(
             pd.to_datetime(out["Next Payment Date"], errors="coerce").notna(),
@@ -3210,6 +3235,13 @@ def build_bridge_asset(
         out = out.drop(columns=["_prev_upb"], errors="ignore")
     else:
         out[upb_col] = sf_current_upb
+        late_stage_mask = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip().isin(EXPIRED_OR_MATURED_STAGES + ["Paid Off"])
+        prev_asset_upb_vals = pd.to_numeric(out.get("_prev_asset_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
+        out[upb_col] = current_upb_series.where(
+            ~(late_stage_mask & (current_upb_series.isna() | current_upb_series.le(0))),
+            prev_asset_upb_vals,
+        )
         out["Next Payment Date"] = sf_next_payment
         out["Servicer Maturity Date"] = pd.NaT
         out["Suspense Balance"] = np.nan
@@ -3933,6 +3965,12 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         out["CPP JV"] = coalesce_keep_nonblank(out.get("CPP JV_loan", pd.Series([pd.NA] * len(out), index=out.index)), out["CPP JV"])
         out = out.drop(columns=["CPP JV_loan"], errors="ignore")
 
+    if "Special Loans List (Y/N)" in tl.columns:
+        tl_special = tl[["_deal_key", "Special Loans List (Y/N)"]].drop_duplicates("_deal_key")
+        out = out.merge(tl_special, on="_deal_key", how="left")
+        out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Special Loans List (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)))
+        out = out.drop(columns=["Special Loans List (Y/N)"], errors="ignore")
+
     if upb_col in tl.columns:
         tl_upb = tl[["_deal_key", upb_col]].drop_duplicates("_deal_key")
         out = out.merge(tl_upb, on="_deal_key", how="left")
@@ -4004,6 +4042,10 @@ def build_bridge_loan(
     out["Segment"] = coalesce_keep_nonblank(out.get("Segment", blank_obj), seg_guess)
     out["Strategy Grouping"] = coalesce_keep_nonblank(out.get("Strategy Grouping", blank_obj), strat_guess)
     out["Portfolio"] = coalesce_keep_nonblank(out.get("Portfolio", blank_obj), port_guess)
+
+    sold_stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    out["Financing"] = pd.Series(out.get("Financing", blank_obj), index=out.index, dtype="object")
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
 
     if bridge_property_rollup is not None and not bridge_property_rollup.empty:
         out = out.merge(bridge_property_rollup, on="_deal_key", how="left")
@@ -4537,6 +4579,12 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
+
+    if sheet_name == "Term Asset":
+        force_write_headers = {upb_col, "Special (Y/N)"}
+        force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
+        fcols = {c for c in fcols if c not in force_write_cols}
+
     formula_seeds = _capture_formula_seeds(ws, fcols, start_row=5)
 
     used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=4, start_row=5)
