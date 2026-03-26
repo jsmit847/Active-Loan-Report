@@ -201,6 +201,13 @@ BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Special Asset: Resolved Date": "Special Asset: Resolved Date",
     "Forbearance Term Date": "Forbearance Term Date",
     "REO Date": "REO Date",
+    "Origination Value Dt": "Origination Valuation Date",
+    "Origination As-Is Value": "Origination As-Is Value",
+    "Origination ARV": "Origination After Repair Value",
+    "Most Recent Appraisal Order Date": "Most Recent Appraisal Order Date",
+    "Updated Valuation Date": "Current Appraisal Date",
+    "Updated As-Is Value": "Current Appraised As-Is Value",
+    "Updated ARV": "Current Appraised After Repair Value",
     "Initial Disbursement Funded": "Initial Disbursement Funded",
     "Renovation Holdback": "Approved Renovation Advance Amount",
     "Renovation Holdback Funded": "Renovation Advance Amount Funded",
@@ -228,7 +235,7 @@ BRIDGE_ASSET_FROM_VALUATION = {
     "Origination Value Dt": "Origination Valuation Date",
     "Origination As-Is Value": "Origination As-Is Value",
     "Origination ARV": "Origination After Repair Value",
-    "Most Recent Appraisal Order Date": "Order Date",
+    "Most Recent Appraisal Order Date": "Most Recent Appraisal Order Date",
     "Updated Valuation Date": "Current Appraisal Date",
     "Updated As-Is Value": "Current Appraised As-Is Value",
     "Updated ARV": "Current Appraised After Repair Value",
@@ -856,6 +863,10 @@ def _soql_not_equal_or_null(field: str, bad_value: str) -> str:
     return f"({field} = NULL OR {field} != {q})"
 
 
+def _soql_false_or_null(field: str) -> str:
+    return f"({field} = FALSE OR {field} = NULL)"
+
+
 def _soql_parent_name_not_equal_or_no_parent(parent_id_field: str, parent_name_field: str, bad_value: str) -> str:
     q = _soql_quote(bad_value)
     return f"({parent_id_field} = NULL OR {parent_name_field} != {q})"
@@ -1437,6 +1448,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Servicer Commitment Id", f"{opp_rel}.Servicer_Commitment_Id__c"),
         ("Yardi ID", "Yardi_Id__c"),
         ("Asset ID", "Asset_ID__c"),
+        ("Property ID", "Id"),
+        ("Unique Active Id", "Unique_Active_Id__c"),
         ("Deal Name", f"{opp_rel}.Name"),
         ("Borrower Entity: Business Entity Name", f"{opp_rel}.Borrower_Entity__r.Name"),
         ("Account Name: Account Name", f"{opp_rel}.Account.Name"),
@@ -1461,6 +1474,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Current Loan Maturity date", f"{opp_rel}.Current_Line_Maturity_Date__c"),
         ("Original Asset Maturity Date", "Asset_Maturity_Date_Override__c"),
         ("Current Asset Maturity date", "Current_Asset_Maturity_Date__c"),
+        ("Is Parent", "Is_Parent__c"),
+        ("Is Sub Unit", "Is_Sub_Unit__c"),
         ("Loan Commitment", f"{opp_rel}.LOC_Commitment__c"),
         ("Remaining Commitment", f"{opp_rel}.Outstanding_Facility_Amount__c"),
         ("Salesforce Suspense Balance", f"{opp_rel}.Suspense_Balance__c"),
@@ -1474,6 +1489,13 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Special Asset: Resolved Date", f"{special_asset_rel}.Resolved_Date__c"),
         ("Forbearance Term Date", "Forbearance_Term_Date__c"),
         ("REO Date", "REO_Date__c"),
+        ("Most Recent Appraisal Order Date", "BPO_Appraisal_Order_Date__c"),
+        ("Current Appraisal Date", "BPO_Appraisal_Date__c"),
+        ("Current Appraised As-Is Value", "Appraised_Value_Amount__c"),
+        ("Current Appraised After Repair Value", "After_Repair_Value__c"),
+        ("Origination Valuation Date", "Origination_Date_Valuation_Date__c"),
+        ("Origination As-Is Value", "Origination_Date_Value__c"),
+        ("Origination After Repair Value", "Origination_After_Repair_Value__c"),
         ("Initial Disbursement Funded", "Initial_Disbursement_Used__c"),
         ("Approved Renovation Advance Amount", "Approved_Renovation_Holdback__c"),
         ("Renovation Advance Amount Funded", "Renovation_Advance_Amount_Used__c"),
@@ -1499,6 +1521,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Current UPB", "Current_UPB__c"),
         ("Approved Advance Amount Funded", "Approved_Advance_Amount_Used__c"),
         ("Comments AM", f"{opp_rel}.Asset_Management_Comments__c"),
+        ("Property Created Date", "CreatedDate"),
+        ("Property Last Modified Date", "LastModifiedDate"),
     ]
 
     rename_map = {expr: label for label, expr in select_pairs}
@@ -1509,6 +1533,7 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         _soql_in(f"{opp_rel}.Type", BRIDGE_TYPES),
         _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+        "Asset_ID__c != NULL",
     ]
 
     soql = (
@@ -1523,7 +1548,7 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number"]:
+    for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number", "Asset ID", "Property ID", "Unique Active Id"]:
         if c in df.columns:
             df[c] = df[c].astype("string").str.strip().replace({"": pd.NA})
 
@@ -1532,6 +1557,27 @@ def _build_bridge_spine_like() -> pd.DataFrame:
             df["Servicer Loan Number"],
             df["Servicer Commitment Id"],
         )
+
+    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+    df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
+    df["_is_sub_unit"] = _yn_from_bool_series(df.get("Is Sub Unit", pd.Series([pd.NA] * len(df), index=df.index))).eq("Y").astype("int8")
+    df["_nonnull_score"] = 0
+    for c in [
+        "Address", "City", "State", "Zip", "CBSA", "Servicer Loan Number",
+        "Origination Valuation Date", "Origination As-Is Value", "Current Appraisal Date",
+        "Current Appraised As-Is Value",
+    ]:
+        if c in df.columns:
+            df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
+    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
+    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df = df[df["_asset_key"].notna()].copy()
+    df = df.sort_values(
+        ["_asset_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt", "_property_id_key"],
+        ascending=[True, False, True, True, True, True],
+    )
+    df = df.drop_duplicates(["_asset_key"], keep="last")
+    df = df.drop(columns=["_asset_key", "_property_id_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt"], errors="ignore")
 
     return downcast_numeric_frame(df)
 
@@ -1701,20 +1747,22 @@ def _build_do_not_lend_like() -> pd.DataFrame:
 
 
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
-    prop_rel = appraisal_property_relationship_name()
     asset_ids = _nonblank_unique(asset_ids or [])
     soqls = []
 
     select_pairs = [
-        ("Asset ID", f"{prop_rel}.Asset_ID__c"),
-        ("Order Date", "Order_Received_Date__c"),
-        ("Current Appraisal Date", f"{prop_rel}.BPO_Appraisal_Date__c"),
-        ("Current Appraised As-Is Value", f"{prop_rel}.Appraised_Value_Amount__c"),
-        ("Current Appraised After Repair Value", f"{prop_rel}.After_Repair_Value__c"),
-        ("Origination Valuation Date", f"{prop_rel}.Origination_Date_Valuation_Date__c"),
-        ("Origination As-Is Value", f"{prop_rel}.Origination_Date_Value__c"),
-        ("Origination After Repair Value", f"{prop_rel}.Origination_After_Repair_Value__c"),
-        ("Appraisal: Created Date", "CreatedDate"),
+        ("Asset ID", "Asset_ID__c"),
+        ("Property ID", "Id"),
+        ("Most Recent Appraisal Order Date", "BPO_Appraisal_Order_Date__c"),
+        ("Current Appraisal Date", "BPO_Appraisal_Date__c"),
+        ("Current Appraised As-Is Value", "Appraised_Value_Amount__c"),
+        ("Current Appraised After Repair Value", "After_Repair_Value__c"),
+        ("Origination Valuation Date", "Origination_Date_Valuation_Date__c"),
+        ("Origination As-Is Value", "Origination_Date_Value__c"),
+        ("Origination After Repair Value", "Origination_After_Repair_Value__c"),
+        ("Is Sub Unit", "Is_Sub_Unit__c"),
+        ("Property Created Date", "CreatedDate"),
+        ("Property Last Modified Date", "LastModifiedDate"),
     ]
     rename_map = {expr: label for label, expr in select_pairs}
 
@@ -1723,14 +1771,14 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
             soqls.append(
                 "SELECT "
                 + ", ".join(expr for _label, expr in select_pairs)
-                + " FROM Appraisal__c WHERE "
-                + _soql_in(f"{prop_rel}.Asset_ID__c", chunk)
+                + " FROM Property__c WHERE "
+                + _soql_in("Asset_ID__c", chunk)
             )
     else:
         soqls.append(
             "SELECT "
             + ", ".join(expr for _label, expr in select_pairs)
-            + " FROM Appraisal__c"
+            + " FROM Property__c WHERE Asset_ID__c != NULL"
         )
 
     df = _run_bulk_union(soqls, rename_map=rename_map)
@@ -1738,13 +1786,26 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    if "Asset ID" in df.columns:
-        df["_asset_key"] = norm_id_series(df["Asset ID"])
-        df["_order_dt"] = pd.to_datetime(df.get("Order Date"), errors="coerce")
-        df["_created_dt"] = pd.to_datetime(df.get("Appraisal: Created Date"), errors="coerce")
-        df = df.sort_values(["_asset_key", "_order_dt", "_created_dt"], ascending=[True, True, True])
-        df = df.drop_duplicates(["_asset_key"], keep="last")
-        df = df.drop(columns=["_asset_key", "_order_dt", "_created_dt", "Appraisal: Created Date"], errors="ignore")
+    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+    df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
+    df["_is_sub_unit"] = _yn_from_bool_series(df.get("Is Sub Unit", pd.Series([pd.NA] * len(df), index=df.index))).eq("Y").astype("int8")
+    df["_nonnull_score"] = 0
+    for c in [
+        "Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value",
+        "Current Appraised After Repair Value", "Origination Valuation Date", "Origination As-Is Value",
+        "Origination After Repair Value",
+    ]:
+        if c in df.columns:
+            df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
+    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
+    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df = df[df["_asset_key"].notna()].copy()
+    df = df.sort_values(
+        ["_asset_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt", "_property_id_key"],
+        ascending=[True, False, True, True, True, True],
+    )
+    df = df.drop_duplicates(["_asset_key"], keep="last")
+    df = df.drop(columns=["_asset_key", "_property_id_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt"], errors="ignore")
 
     return downcast_numeric_frame(df)
 
@@ -1963,6 +2024,7 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
 
     select_pairs = [
         ("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c"),
+        ("Property ID", "Id"),
         ("Asset ID", "Asset_ID__c"),
         ("Address", "Name"),
         ("City", "City__c"),
@@ -1972,8 +2034,12 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         ("# of Units", "Number_of_Units__c"),
         ("Property Type", "Property_Type__c"),
         ("ALA", "ALA__c"),
-        ("Value Date", "BPO_Appraisal_Date__c"),
+        ("Updated Valuation Date", "Updated_Valuation_Date__c"),
+        ("BPO Appraisal Date", "BPO_Appraisal_Date__c"),
         ("As-Is Value", "Appraised_Value_Amount__c"),
+        ("Property Special Asset", "Is_Special_Asset__c"),
+        ("Is Parent", "Is_Parent__c"),
+        ("Is Sub Unit", "Is_Sub_Unit__c"),
         ("Property Status", "Status__c"),
         ("Property Created Date", "CreatedDate"),
         ("Property Last Modified Date", "LastModifiedDate"),
@@ -1986,6 +2052,8 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         _soql_in(f"{opp_rel}.Type", TERM_TYPES),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         "ALA__c > 0",
+        "Asset_ID__c != NULL",
+        _soql_false_or_null("Is_Sub_Unit__c"),
     ]
 
     if deal_numbers:
@@ -2009,22 +2077,31 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     if df.empty:
         return df
 
+    df["Value Date"] = coalesce_keep_nonblank(
+        df.get("Updated Valuation Date", pd.Series([pd.NA] * len(df), index=df.index)),
+        df.get("BPO Appraisal Date", pd.Series([pd.NA] * len(df), index=df.index)),
+    )
+
     df["_deal_key"] = norm_id_series(df.get("Deal Loan Number", pd.Series([None] * len(df), index=df.index)))
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
-    addr_key = (
-        df.get("Address", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
-        + "|"
-        + df.get("Zip", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
-    ).replace({"|": pd.NA})
-    df["_asset_dedupe_key"] = df["_asset_key"].where(df["_asset_key"].notna(), addr_key)
+    df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
+    df = df[df["_deal_key"].notna() & df["_asset_key"].notna()].copy()
+
+    df["_is_sub_unit"] = _yn_from_bool_series(df.get("Is Sub Unit", pd.Series([pd.NA] * len(df), index=df.index))).eq("Y").astype("int8")
+    df["_nonnull_score"] = 0
+    for c in ["Address", "City", "State", "Zip", "CBSA", "ALA", "Value Date", "As-Is Value"]:
+        if c in df.columns:
+            df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
     df["_ala_sort"] = pd.to_numeric(df.get("ALA", np.nan), errors="coerce").fillna(0)
     df["_value_dt"] = pd.to_datetime(df.get("Value Date"), errors="coerce")
     df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
     df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
-    df = df.sort_values(["_deal_key", "_asset_dedupe_key", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt"])
-    df = df.drop_duplicates(["_deal_key", "_asset_dedupe_key"], keep="last")
+    df = df.sort_values(
+        ["_deal_key", "_asset_key", "_is_sub_unit", "_nonnull_score", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt", "_property_id_key"],
+        ascending=[True, True, False, True, True, True, True, True, True],
+    )
+    df = df.drop_duplicates(["_deal_key", "_asset_key"], keep="last")
     return downcast_numeric_frame(df)
-
 
 
 def _bridge_asset_ids_from_spine(bridge_spine: pd.DataFrame):
@@ -3325,6 +3402,7 @@ def build_bridge_asset(
 
     keep_mask = is_closed_won | is_reo | is_sold | (is_expired_or_matured & current_upb.gt(0))
     out = out.loc[keep_mask].copy()
+    out = out[out["_deal_key"].notna() & out["_asset_key"].notna()].copy()
 
     return downcast_numeric_frame(out)
 
@@ -3389,6 +3467,10 @@ def _build_term_loan_salesforce_fallback(
     out["Portfolio"] = cls["Portfolio"]
     out["Segment"] = cls["Segment"]
     out["CPP JV"] = cls["CPP JV"]
+
+    sold_stage_series = sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
 
@@ -3486,6 +3568,7 @@ def _build_term_loan_salesforce_fallback(
         | (is_sold & sold_segment_retained)
     )
     out = out.loc[keep_mask].copy()
+    out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(
@@ -3843,6 +3926,10 @@ def build_term_loan(
     out["Segment"] = coalesce_keep_nonblank(out["Segment"], derived["_derived_segment"])
     out["CPP JV"] = coalesce_keep_nonblank(out["CPP JV"], derived["_derived_cpp"])
 
+    sold_stage_series = out.get("SF Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
+
     if not sf_active_rm.empty and "Deal Loan Number" in sf_active_rm.columns and "Active RM" in sf_active_rm.columns:
         arm = sf_active_rm.copy()
         arm["_deal_key"] = norm_id_series(arm["Deal Loan Number"])
@@ -3934,30 +4021,13 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
     out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
     out["CPP JV"] = pd.NA
-    out["Special (Y/N)"] = pd.NA
+    out["Special (Y/N)"] = _yn_from_bool_series(sf_term_asset.get("Property Special Asset", pd.Series([pd.NA] * len(out), index=out.index)))
 
     tl = term_loan.copy()
     tl["_deal_key"] = norm_id_series(tl.get("Deal Number", pd.Series([None] * len(tl))))
 
     valid_deals = set(tl["_deal_key"].dropna().tolist())
-    out = out[out["_deal_key"].isin(valid_deals)].copy()
-
-    addr_key = (
-        out.get("Address", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
-        + "|"
-        + out.get("Zip", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.lower().str.replace(r"[^0-9a-z]", "", regex=True)
-    ).replace({"|": pd.NA})
-    out["_asset_dedupe_key"] = out["_asset_key"].where(out["_asset_key"].notna(), addr_key)
-
-    value_dt = pd.to_datetime(sf_term_asset.get("Value Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-    mod_dt = pd.to_datetime(sf_term_asset.get("Property Last Modified Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-    created_dt = pd.to_datetime(sf_term_asset.get("Property Created Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-    ala_sort = pd.to_numeric(out.get("Property ALA", np.nan), errors="coerce").fillna(0)
-    out["_value_dt"] = value_dt
-    out["_mod_dt"] = mod_dt
-    out["_created_dt"] = created_dt
-    out["_ala_sort"] = ala_sort
-    out = out.sort_values(["_deal_key", "_asset_dedupe_key", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt"]).drop_duplicates(["_deal_key", "_asset_dedupe_key"], keep="last")
+    out = out[out["_deal_key"].isin(valid_deals) & out["_asset_key"].notna()].copy()
 
     if "CPP JV" in tl.columns:
         tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
@@ -3994,8 +4064,19 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
 
-    return downcast_numeric_frame(out.drop(columns=["_asset_dedupe_key", "_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
+    meaningful_mask = (
+        out["_deal_key"].notna()
+        & out["_asset_key"].notna()
+        & (
+            (~blankish_mask(out.get("Address", pd.Series([pd.NA] * len(out), index=out.index))))
+            | pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
+            | pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).ne(0)
+            | pd.to_numeric(out.get("As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
+        )
+    )
+    out = out.loc[meaningful_mask].copy()
 
+    return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
 
 def build_bridge_loan(
@@ -4241,6 +4322,7 @@ def build_bridge_loan(
 
     keep_mask = is_closed_won | is_reo | is_sold | (is_late_stage & (current_upb.gt(0) | active_asset_count.gt(0)))
     out = out.loc[keep_mask].copy()
+    out = out[out["_deal_key"].notna()].copy()
 
     out = _fill_text_defaults(
         out,
