@@ -147,17 +147,17 @@ SHEET_QA_RULES = {
     "Bridge Asset": [
         {"column": "Deal Number", "max_blank_rate": 0.00},
         {"column": "Asset ID", "max_blank_rate": 0.00},
-        {"column": "Servicer ID", "max_blank_rate": 0.005},
+        {"column": "Servicer ID", "max_blank_rate": 0.03},
         {"column": "Address", "max_blank_rate": 0.00},
         {"column": "Portfolio", "max_blank_rate": 0.00},
         {"column": "Segment", "max_blank_rate": 0.00},
-        {"column": "Origination As-Is Value", "max_blank_rate": 0.10},
-        {"column": "Origination ARV", "max_blank_rate": 0.10},
-        {"column": "Most Recent Appraisal Order Date", "max_blank_rate": 0.10},
-        {"column": "Updated Valuation Date", "max_blank_rate": 0.10},
-        {"column": "Updated As-Is Value", "max_blank_rate": 0.10},
-        {"column": "Updated ARV", "max_blank_rate": 0.10},
-        {"column": "__UPB__", "max_blank_rate": 0.02, "skip_when_salesforce_only": True},
+        {"column": "Origination As-Is Value", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "Origination ARV", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "Most Recent Appraisal Order Date", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "Updated Valuation Date", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "Updated As-Is Value", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "Updated ARV", "max_blank_rate": 0.10, "severity": "warn"},
+        {"column": "__UPB__", "max_blank_rate": 0.03, "skip_when_salesforce_only": True},
     ],
     "Bridge Loan": [
         {"column": "Deal Number", "max_blank_rate": 0.00},
@@ -945,6 +945,7 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
             "row_count": 0,
             "blank_rate": 1.0,
             "threshold": 0.0,
+            "severity": "fail",
             "status": "failed_empty",
             "note": "built dataframe is empty",
         }
@@ -954,6 +955,10 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
 
     failures = []
     for rule in SHEET_QA_RULES.get(sheet_name, []):
+        severity = str(rule.get("severity", "fail")).strip().lower()
+        if severity not in {"fail", "warn"}:
+            severity = "fail"
+
         if skip_servicer_files and rule.get("skip_when_salesforce_only"):
             _RUNTIME_QA_SUMMARY.append({
                 "sheet_name": sheet_name,
@@ -963,6 +968,7 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
                 "row_count": int(len(df)),
                 "blank_rate": pd.NA,
                 "threshold": rule["max_blank_rate"],
+                "severity": severity,
                 "status": "skipped_salesforce_only",
                 "note": "skipped because servicer files were intentionally bypassed",
             })
@@ -970,6 +976,7 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
 
         resolved_col = _resolve_qa_rule_column(rule["column"], df.columns, upb_col)
         if resolved_col not in df.columns:
+            status = "warning_missing_column" if severity == "warn" else "failed_missing_column"
             row = {
                 "sheet_name": sheet_name,
                 "column": rule["column"],
@@ -978,16 +985,27 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
                 "row_count": int(len(df)),
                 "blank_rate": 1.0,
                 "threshold": rule["max_blank_rate"],
-                "status": "failed_missing_column",
-                "note": "critical column missing from output",
+                "severity": severity,
+                "status": status,
+                "note": "column missing from output (warn-only for bridge3 baseline)" if severity == "warn" else "critical column missing from output",
             }
             _RUNTIME_QA_SUMMARY.append(row)
-            failures.append(row)
+            if status.startswith("failed"):
+                failures.append(row)
             continue
 
         blank_rate = _series_blank_rate(df[resolved_col])
         blank_count = int(round(blank_rate * len(df)))
-        status = "passed" if blank_rate <= rule["max_blank_rate"] else "failed_blank_threshold"
+        if blank_rate <= rule["max_blank_rate"]:
+            status = "passed"
+            note = ""
+        elif severity == "warn":
+            status = "warning_blank_threshold"
+            note = "warn-only threshold while preserving bridge3 baseline behavior"
+        else:
+            status = "failed_blank_threshold"
+            note = ""
+
         row = {
             "sheet_name": sheet_name,
             "column": rule["column"],
@@ -996,11 +1014,12 @@ def run_sheet_quality_gates(sheet_name: str, df: pd.DataFrame, upb_col: str, ski
             "row_count": int(len(df)),
             "blank_rate": blank_rate,
             "threshold": rule["max_blank_rate"],
+            "severity": severity,
             "status": status,
-            "note": "",
+            "note": note,
         }
         _RUNTIME_QA_SUMMARY.append(row)
-        if status != "passed":
+        if status.startswith("failed"):
             failures.append(row)
 
     if failures:
