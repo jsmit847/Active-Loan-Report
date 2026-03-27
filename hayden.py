@@ -853,9 +853,17 @@ def audit_keep_last_dedupe(
     preview_cols: Optional[Sequence[str]] = None,
     note: Optional[str] = None,
 ) -> pd.DataFrame:
-    subset_cols = [subset] if isinstance(subset, str) else list(subset)
-    sort_cols = [c for c in (sort_cols or []) if c in df.columns]
-    preview_cols = [c for c in (preview_cols or []) if c in df.columns and c not in subset_cols]
+    def _ordered_unique(items):
+        out = []
+        for item in items:
+            if item not in out:
+                out.append(item)
+        return out
+
+    subset_cols = _ordered_unique([subset] if isinstance(subset, str) else list(subset))
+    sort_cols = _ordered_unique([c for c in (sort_cols or []) if c in df.columns])
+    preview_cols = _ordered_unique([c for c in (preview_cols or []) if c in df.columns and c not in subset_cols])
+    context_cols = _ordered_unique([c for c in sort_cols + preview_cols if c in df.columns and c not in subset_cols])
 
     if df is None or df.empty:
         _RUNTIME_AUDIT_SUMMARY.append({
@@ -903,13 +911,11 @@ def audit_keep_last_dedupe(
 
     if rows_dropped > 0:
         dropped = tmp[tmp.duplicated(subset=subset_cols, keep="last")].copy()
-        detail_cols = []
-        for col in subset_cols + sort_cols + preview_cols:
-            if col in dropped.columns and col not in detail_cols:
-                detail_cols.append(col)
+        detail_cols = subset_cols + context_cols
         detail = dropped[detail_cols + ["_audit_row_position"]].copy()
-        winner_cols = winners[subset_cols + [c for c in sort_cols + preview_cols if c in winners.columns]].copy()
-        winner_cols = winner_cols.rename(columns={c: f"winner_{c}" for c in winner_cols.columns if c not in subset_cols})
+        winner_cols = winners[detail_cols].copy()
+        winner_cols = winner_cols.rename(columns={c: f"winner_{c}" for c in context_cols})
+        winner_cols = winner_cols.loc[:, ~winner_cols.columns.duplicated()].copy()
         detail = detail.merge(winner_cols, on=subset_cols, how="left")
         detail.insert(0, "audit_name", audit_name)
         detail["winner_rule"] = winner_note
