@@ -26,12 +26,32 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 
+try:
+    from active_loan_postbuild_audit import (
+        audit_diagnostic_lines,
+        audit_openpyxl_workbook,
+        write_audit_sheets,
+        workbook_needs_attention,
+    )
+    POSTBUILD_AUDIT_AVAILABLE = True
+    POSTBUILD_AUDIT_IMPORT_ERROR = ""
+except Exception as _audit_import_exc:
+    audit_diagnostic_lines = None
+    audit_openpyxl_workbook = None
+    write_audit_sheets = None
+    workbook_needs_attention = None
+    POSTBUILD_AUDIT_AVAILABLE = False
+    POSTBUILD_AUDIT_IMPORT_ERROR = str(_audit_import_exc)
+
+
 PRIMARY_USER_NAME = "Hayden"
 TEMPLATE_FILENAMES = ("Active Loan Template.xlsx", "Active Loan Report Template.xlsx")
 API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 600
 OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
+ENFORCE_ZERO_FILLABLE_BLANKS = True
+ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
@@ -3031,11 +3051,12 @@ def _backfill_rule_candidates(sheet_name: str) -> List[List[str]]:
     return [list(x) for x in SHEET_BASELINE_KEY_CANDIDATES.get(sheet_name, [])]
 
 
-def _resolve_backfill_keys(sheet_name: str, built_df: pd.DataFrame, baseline_df: pd.DataFrame) -> List[str]:
+def _available_backfill_keys(sheet_name: str, built_df: pd.DataFrame, baseline_df: pd.DataFrame) -> List[List[str]]:
     candidates = _backfill_rule_candidates(sheet_name)
     built_cols = set(built_df.columns)
     baseline_cols = set(baseline_df.columns)
 
+    out: List[List[str]] = []
     for candidate in candidates:
         if not set(candidate).issubset(built_cols) or not set(candidate).issubset(baseline_cols):
             continue
@@ -3044,8 +3065,8 @@ def _resolve_backfill_keys(sheet_name: str, built_df: pd.DataFrame, baseline_df:
             baseline_nonblank = id_key_no_leading_zeros(baseline_df["Servicer ID"]).notna().sum()
             if built_nonblank == 0 or baseline_nonblank == 0:
                 continue
-        return candidate
-    return []
+        out.append(list(candidate))
+    return out
 
 
 def _choose_backfill_normalizer(sheet_name: str, key_cols: Sequence[str]):
@@ -3057,35 +3078,78 @@ def _choose_backfill_normalizer(sheet_name: str, key_cols: Sequence[str]):
     return _one
 
 
+def _object_series_like(s: pd.Series) -> pd.Series:
+    base = pd.Series(s, copy=False)
+    return pd.Series(list(base), index=base.index, dtype="object")
 
-def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_bytes: Optional[bytes]) -> Tuple[pd.DataFrame, dict]:
-    if baseline_bytes is None or built_df is None or built_df.empty:
-        return built_df, {"sheet_name": sheet_name, "status": "skipped_empty", "keys": "", "fills": 0}
+
+
+def _safe_backfill_assign(sheet_name: str, out: pd.DataFrame, col: str, base_vals: pd.Series, mask: pd.Series) -> pd.DataFrame:
+    if not bool(mask.any()):
+        return out
 
     try:
-        baseline_df = read_tab_df_from_active_loans(baseline_bytes, sheet_name)
-    except Exception as exc:
-        return built_df, {"sheet_name": sheet_name, "status": f"baseline_read_failed: {exc}", "keys": "", "fills": 0}
+        out.loc[mask, col] = base_vals.loc[mask]
+        return out
+    except Exception:
+        pass
 
+    current = out[col]
+    source = base_vals
+
+    if _is_date_header(sheet_name, col):
+        parsed_current = _to_datetime_series_mixed(_object_series_like(current))
+        parsed_source = _to_datetime_series_mixed(_object_series_like(source))
+        parsed_mask = blankish_mask(parsed_current) & (~blankish_mask(parsed_source))
+        if bool((mask & parsed_mask).any()):
+            out[col] = parsed_current
+            out.loc[mask & parsed_mask, col] = parsed_source.loc[mask & parsed_mask]
+            remaining_mask = mask & (~parsed_mask)
+            if bool(remaining_mask.any()):
+                out[col] = _object_series_like(out[col])
+                out.loc[remaining_mask, col] = _object_series_like(source).loc[remaining_mask]
+            return out
+
+    if pd.api.types.is_numeric_dtype(current):
+        source_obj = _object_series_like(source)
+        numeric_source = pd.to_numeric(source_obj, errors="coerce")
+        numeric_mask = mask & numeric_source.notna()
+        if bool(numeric_mask.any()):
+            try:
+                out.loc[numeric_mask, col] = numeric_source.loc[numeric_mask]
+            except Exception:
+                out[col] = _object_series_like(out[col])
+                out.loc[numeric_mask, col] = numeric_source.loc[numeric_mask]
+        remaining_mask = mask & (~numeric_mask)
+        if bool(remaining_mask.any()):
+            out[col] = _object_series_like(out[col])
+            out.loc[remaining_mask, col] = source_obj.loc[remaining_mask]
+        return out
+
+    out[col] = _object_series_like(out[col])
+    out.loc[mask, col] = _object_series_like(source).loc[mask]
+    return out
+
+
+
+def _backfill_df_from_baseline_once(
+    sheet_name: str,
+    built_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
+    key_cols: Sequence[str],
+) -> Tuple[pd.DataFrame, int]:
     out = built_df.copy()
-    key_cols = _resolve_backfill_keys(sheet_name, out, baseline_df)
-    if not key_cols:
-        return out, {"sheet_name": sheet_name, "status": "skipped_no_keys", "keys": "", "fills": 0}
-
+    base = baseline_df.copy()
     normer = _choose_backfill_normalizer(sheet_name, key_cols)
     helper_keys = [f"_baseline_k{i}" for i in range(len(key_cols))]
 
     for i, col in enumerate(key_cols):
         out[helper_keys[i]] = normer(out[col])
-
-    base = baseline_df.copy()
-    for i, col in enumerate(key_cols):
         base[helper_keys[i]] = normer(base[col])
 
     base = base.dropna(subset=helper_keys).copy()
     if base.empty:
-        out = out.drop(columns=helper_keys, errors="ignore")
-        return out, {"sheet_name": sheet_name, "status": "skipped_no_baseline_keys", "keys": ", ".join(key_cols), "fills": 0}
+        return out.drop(columns=helper_keys, errors="ignore"), 0
 
     common_cols = [
         c for c in base.columns
@@ -3095,10 +3159,8 @@ def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_
         and not c.startswith("_")
         and not UPB_HEADER_RE.search(str(c))
     ]
-
     if not common_cols:
-        out = out.drop(columns=helper_keys, errors="ignore")
-        return out, {"sheet_name": sheet_name, "status": "skipped_no_common_cols", "keys": ", ".join(key_cols), "fills": 0}
+        return out.drop(columns=helper_keys, errors="ignore"), 0
 
     score = pd.Series([0] * len(base), index=base.index, dtype="int64")
     for col in common_cols:
@@ -3116,11 +3178,41 @@ def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_
         mask = blankish_mask(out[col]) & (~blankish_mask(base_vals))
         if mask.any():
             fills += int(mask.sum())
-            out.loc[mask, col] = base_vals.loc[mask]
+            out = _safe_backfill_assign(sheet_name, out, col, base_vals, mask)
 
     out = out.reset_index(drop=True)
     out = out.drop(columns=helper_keys + ["_baseline_score"], errors="ignore")
-    return downcast_numeric_frame(out), {"sheet_name": sheet_name, "status": "backfilled", "keys": ", ".join(key_cols), "fills": fills}
+    return downcast_numeric_frame(out), fills
+
+
+def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_bytes: Optional[bytes]) -> Tuple[pd.DataFrame, dict]:
+    if baseline_bytes is None or built_df is None or built_df.empty:
+        return built_df, {"sheet_name": sheet_name, "status": "skipped_empty", "keys": "", "fills": 0}
+
+    try:
+        baseline_df = read_tab_df_from_active_loans(baseline_bytes, sheet_name)
+    except Exception as exc:
+        return built_df, {"sheet_name": sheet_name, "status": f"baseline_read_failed: {exc}", "keys": "", "fills": 0}
+
+    out = built_df.copy()
+    key_candidates = _available_backfill_keys(sheet_name, out, baseline_df)
+    if not key_candidates:
+        return out, {"sheet_name": sheet_name, "status": "skipped_no_keys", "keys": "", "fills": 0}
+
+    fills = 0
+    used_keys: List[str] = []
+    for key_cols in key_candidates:
+        out, one_fill = _backfill_df_from_baseline_once(sheet_name, out, baseline_df, key_cols)
+        if one_fill:
+            fills += int(one_fill)
+            used_keys.append(", ".join(key_cols))
+
+    return downcast_numeric_frame(out), {
+        "sheet_name": sheet_name,
+        "status": "backfilled" if fills else "no_fills_needed",
+        "keys": " | ".join(used_keys or [", ".join(x) for x in key_candidates]),
+        "fills": fills,
+    }
 
 
 def _parse_npl_or_reo_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
@@ -4803,19 +4895,62 @@ def _sheet_header_index(wb, ws, upb_header: str) -> Dict[str, int]:
 
 
 
-def _build_sheet_row_lookup(wb, ws, key_headers: Sequence[str], upb_header: str) -> Tuple[Dict[Tuple[str, ...], int], Dict[str, int]]:
+def _normalize_sheet_key_variants(header: str, value) -> List[str]:
+    primary = _normalize_sheet_key_value(header, value)
+    if not primary:
+        return []
+    out = [primary]
+    if header == "Deal Number":
+        for raw in deal_lookup_keys(value):
+            normed = _normalize_sheet_key_value(header, raw)
+            if normed and normed not in out:
+                out.append(normed)
+    return out
+
+
+def _build_sheet_row_lookup(
+    wb,
+    ws,
+    key_headers: Sequence[str],
+    upb_header: str,
+    include_key_variants: bool = False,
+) -> Tuple[Dict[Tuple[str, ...], int], Dict[str, int]]:
     header_idx = _sheet_header_index(wb, ws, upb_header)
     if not all(h in header_idx for h in key_headers):
         return {}, header_idx
 
     out: Dict[Tuple[str, ...], int] = {}
     for r in range(5, ws.max_row + 1):
-        key = tuple(_normalize_sheet_key_value(h, ws.cell(r, header_idx[h]).value) for h in key_headers)
-        if any(not part for part in key):
+        parts: List[List[str]] = []
+        valid = True
+        for h in key_headers:
+            raw = ws.cell(r, header_idx[h]).value
+            vals = _normalize_sheet_key_variants(h, raw) if include_key_variants else [_normalize_sheet_key_value(h, raw)]
+            vals = [v for v in vals if v]
+            if not vals:
+                valid = False
+                break
+            parts.append(vals)
+        if not valid:
             continue
-        out[key] = r
+        if include_key_variants and len(parts) > 1:
+            import itertools
+            keys_to_add = list(itertools.product(*parts))
+        else:
+            keys_to_add = [tuple(part[0] for part in parts)]
+        for key in keys_to_add:
+            out.setdefault(key, r)
     return out, header_idx
 
+
+def _available_sheet_key_matches(wb, out_ws, base_wb, base_ws, sheet_name: str, upb_header: str):
+    for candidate in _backfill_rule_candidates(sheet_name):
+        out_rows_try, out_header_try = _build_sheet_row_lookup(wb, out_ws, candidate, upb_header, include_key_variants=False)
+        base_rows_try, base_header_try = _build_sheet_row_lookup(base_wb, base_ws, candidate, upb_header, include_key_variants=True)
+        if sheet_name == "Term Loan" and candidate == ["Servicer ID"] and (not out_rows_try or not base_rows_try):
+            continue
+        if out_rows_try and base_rows_try:
+            yield list(candidate), out_rows_try, base_rows_try, out_header_try, base_header_try
 
 
 def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> List[dict]:
@@ -4834,60 +4969,49 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
 
             out_ws = wb[sheet_name]
             base_ws = base_wb[sheet_name]
-            chosen_keys: List[str] = []
-            out_rows: Dict[Tuple[str, ...], int] = {}
-            base_rows: Dict[Tuple[str, ...], int] = {}
-            out_header_idx: Dict[str, int] = {}
-            base_header_idx: Dict[str, int] = {}
-
-            for candidate in _backfill_rule_candidates(sheet_name):
-                out_rows_try, out_header_try = _build_sheet_row_lookup(wb, out_ws, candidate, upb_header)
-                base_rows_try, base_header_try = _build_sheet_row_lookup(base_wb, base_ws, candidate, upb_header)
-                if sheet_name == "Term Loan" and candidate == ["Servicer ID"] and (not out_rows_try or not base_rows_try):
-                    continue
-                if out_rows_try and base_rows_try:
-                    chosen_keys = candidate
-                    out_rows = out_rows_try
-                    base_rows = base_rows_try
-                    out_header_idx = out_header_try
-                    base_header_idx = base_header_try
-                    break
-
-            if not chosen_keys:
-                summary.append({"sheet_name": sheet_name, "status": "skipped_no_sheet_keys", "keys": "", "fills": 0, "matched_rows": 0})
-                continue
-
             formula_cols = formula_col_indices(out_ws, start_row=5, header_row=4)
-            common_headers = [
-                h for h in out_header_idx
-                if h in base_header_idx
-                and h not in chosen_keys
-                and not UPB_HEADER_RE.search(str(h))
-            ]
 
             fills = 0
-            matched_rows = 0
-            for key, out_row in out_rows.items():
-                base_row = base_rows.get(key)
-                if not base_row:
-                    continue
-                matched_rows += 1
-                for header in common_headers:
-                    out_col = out_header_idx[header]
-                    if out_col in formula_cols:
+            matched_rows: Set[int] = set()
+            used_keys: List[str] = []
+            any_keys = False
+
+            for candidate, out_rows, base_rows, out_header_idx, base_header_idx in _available_sheet_key_matches(
+                wb, out_ws, base_wb, base_ws, sheet_name, upb_header
+            ):
+                any_keys = True
+                used_keys.append(", ".join(candidate))
+                common_headers = [
+                    h for h in out_header_idx
+                    if h in base_header_idx
+                    and h not in candidate
+                    and not UPB_HEADER_RE.search(str(h))
+                ]
+                for key, out_row in out_rows.items():
+                    base_row = base_rows.get(key)
+                    if not base_row:
                         continue
-                    out_cell = out_ws.cell(out_row, out_col)
-                    base_cell = base_ws.cell(base_row, base_header_idx[header])
-                    if clean_text(out_cell.value) == "" and clean_text(base_cell.value) != "":
-                        out_cell.value = base_cell.value
-                        fills += 1
+                    matched_rows.add(out_row)
+                    for header in common_headers:
+                        out_col = out_header_idx[header]
+                        if out_col in formula_cols:
+                            continue
+                        out_cell = out_ws.cell(out_row, out_col)
+                        base_cell = base_ws.cell(base_row, base_header_idx[header])
+                        if clean_text(out_cell.value) == "" and clean_text(base_cell.value) != "":
+                            out_cell.value = base_cell.value
+                            fills += 1
+
+            if not any_keys:
+                summary.append({"sheet_name": sheet_name, "status": "skipped_no_sheet_keys", "keys": "", "fills": 0, "matched_rows": 0})
+                continue
 
             summary.append({
                 "sheet_name": sheet_name,
                 "status": "repaired" if fills else "no_fills_needed",
-                "keys": ", ".join(chosen_keys),
+                "keys": " | ".join(used_keys),
                 "fills": fills,
-                "matched_rows": matched_rows,
+                "matched_rows": len(matched_rows),
             })
     finally:
         try:
@@ -4897,6 +5021,64 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
             pass
 
     return summary
+
+
+def _audit_fillable_blank_totals(audit_summary: Sequence[dict]) -> Tuple[int, int, int]:
+    critical = sum(int(item.get("critical_fillable_blanks", 0) or 0) for item in audit_summary)
+    review = sum(int(item.get("review_fillable_blanks", 0) or 0) for item in audit_summary)
+    possible_shift = sum(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary)
+    return critical, review, possible_shift
+
+
+def enforce_zero_fillable_blanks(
+    wb,
+    baseline_bytes: Optional[bytes],
+    upb_header: str,
+    sheet_names: Optional[Sequence[str]] = None,
+    max_rounds: int = ZERO_BLANK_MAX_ROUNDS,
+) -> Tuple[bool, List[str], List[dict], List[dict]]:
+    diagnostics: List[str] = []
+    audit_summary: List[dict] = []
+    audit_exceptions: List[dict] = []
+
+    if not baseline_bytes:
+        diagnostics.append("Zero-blank enforcement skipped: no prior completed workbook was uploaded.")
+        return False, diagnostics, audit_summary, audit_exceptions
+
+    if not POSTBUILD_AUDIT_AVAILABLE or audit_openpyxl_workbook is None:
+        diagnostics.append("Zero-blank enforcement skipped: post-build audit helper is not available in this runtime.")
+        return False, diagnostics, audit_summary, audit_exceptions
+
+    prev_blank_total: Optional[int] = None
+    for round_no in range(1, max_rounds + 1):
+        repair_summary = repair_workbook_from_baseline(wb, baseline_bytes, upb_header, sheet_names=sheet_names)
+        fills = sum(int(item.get("fills", 0) or 0) for item in repair_summary)
+        for item in repair_summary:
+            if item.get("fills"):
+                diagnostics.append(
+                    f"Zero-blank round {round_no}: {item['sheet_name']} filled {int(item['fills']):,} cells using {item.get('keys', 'n/a')}"
+                )
+
+        audit_summary, audit_exceptions = audit_openpyxl_workbook(
+            wb,
+            baseline_bytes=baseline_bytes,
+            upb_header=upb_header,
+            sheet_names=sheet_names,
+        )
+        critical, review, possible_shift = _audit_fillable_blank_totals(audit_summary)
+        blank_total = critical + review
+        diagnostics.append(
+            f"Zero-blank round {round_no}: remaining fillable blanks {blank_total:,} (critical {critical:,}, review {review:,}); possible shifts {possible_shift:,}."
+        )
+
+        if blank_total == 0:
+            return True, diagnostics, audit_summary, audit_exceptions
+
+        if prev_blank_total is not None and blank_total >= prev_blank_total and fills == 0:
+            break
+        prev_blank_total = blank_total
+
+    return False, diagnostics, audit_summary, audit_exceptions
 
 
 def mark_workbook_for_recalc(wb):
@@ -4969,8 +5151,14 @@ st.caption(
     "This merged version uses your repo template by default, can use the uploaded completed report as the build base, "
     "adds NPL/REO flag integration, uses Midland / FCI / Berkadia as the term active-loan spine when available, "
     "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, keeps row-level Salesforce Servicer IDs intact, "
-    "and runs both dataframe-level and workbook-level blank repair against the uploaded known-good report when you provide one."
+    "runs both dataframe-level and workbook-level blank repair against the uploaded known-good report when you provide one, "
+    "and writes QA Summary / QA Exceptions tabs after the build when the post-build audit helper is available."
 )
+
+if POSTBUILD_AUDIT_AVAILABLE:
+    st.caption("Post-build QA audit helper loaded. Completed workbooks will include QA Summary and QA Exceptions tabs.")
+else:
+    st.warning(f"Post-build QA audit helper was not loaded: {POSTBUILD_AUDIT_IMPORT_ERROR}")
 
 sf_info = render_salesforce_login_gate()
 sf_ready = bool(sf_info)
@@ -4980,7 +5168,7 @@ st.markdown("### Step 2: Upload files")
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
     prev_upload = st.file_uploader(
-        "Upload LAST WEEK'S or COMPLETED Active Loans report (.xlsx) for carry-forward (optional)",
+        "Upload LAST WEEK'S or COMPLETED Active Loans report (.xlsx) for carry-forward (required for blank-free weekly build)",
         type=["xlsx"],
     )
 with col_b:
@@ -5023,6 +5211,8 @@ if build_btn:
 
     if not use_sf:
         st.error("This version requires Salesforce API to build the report.")
+    elif prev_upload is None:
+        st.error("Upload the prior completed Active Loans workbook. The weekly build now enforces a zero-blank carry-forward repair pass and requires a known-good baseline.")
     elif not skip_servicer_files and not servicer_uploads:
         st.error("Upload the servicer files, or check 'Skip servicer files and build Salesforce-only version'.")
     elif not sf_ready:
@@ -5213,12 +5403,43 @@ if build_btn:
                 for sheet_name in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
                 if build_target in (sheet_name, "All")
             ]
-            repair_summary = repair_workbook_from_baseline(wb, prev_bytes, upb_col, sheet_names=selected_sheet_names)
-            for item in repair_summary:
-                if item.get("fills"):
-                    diagnostics.append(
-                        f"{item['sheet_name']} workbook repair cells: {int(item['fills']):,} using {item.get('keys', 'n/a')}"
+            audit_summary = []
+            audit_exceptions = []
+            if ENFORCE_ZERO_FILLABLE_BLANKS:
+                status.update(label="Running zero-blank enforcement...")
+                zero_blank_ok, zero_blank_diags, audit_summary, audit_exceptions = enforce_zero_fillable_blanks(
+                    wb,
+                    baseline_bytes=prev_bytes,
+                    upb_header=upb_col,
+                    sheet_names=selected_sheet_names,
+                )
+                diagnostics.extend(zero_blank_diags)
+                if write_audit_sheets is not None and audit_summary is not None:
+                    write_audit_sheets(wb, audit_summary, audit_exceptions)
+                if audit_diagnostic_lines is not None and audit_summary:
+                    diagnostics.extend(audit_diagnostic_lines(audit_summary))
+                if not zero_blank_ok:
+                    raise ValueError(
+                        "Zero-blank enforcement could not eliminate all fillable blanks. "
+                        "Use a completed workbook from the immediately prior run as the carry-forward baseline and rerun the build."
                     )
+                if any(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary):
+                    diagnostics.append("Blank enforcement passed, but possible shifted values were still detected. Review the QA Exceptions tab before weekly use.")
+            elif POSTBUILD_AUDIT_AVAILABLE and audit_openpyxl_workbook is not None and write_audit_sheets is not None:
+                status.update(label="Running post-build QA audit...")
+                audit_summary, audit_exceptions = audit_openpyxl_workbook(
+                    wb,
+                    baseline_bytes=prev_bytes,
+                    upb_header=upb_col,
+                    sheet_names=selected_sheet_names,
+                )
+                write_audit_sheets(wb, audit_summary, audit_exceptions)
+                if audit_diagnostic_lines is not None:
+                    diagnostics.extend(audit_diagnostic_lines(audit_summary))
+                if workbook_needs_attention is not None and workbook_needs_attention(audit_summary):
+                    diagnostics.append("QA attention needed: review the QA Summary and QA Exceptions tabs in the completed workbook before weekly use.")
+            else:
+                diagnostics.append("Post-build QA audit helper not available in this runtime; workbook-level QA tabs were not added.")
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
