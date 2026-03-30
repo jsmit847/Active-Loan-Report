@@ -3022,81 +3022,109 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 SHEET_BASELINE_KEY_CANDIDATES = {
     "Bridge Asset": [["Asset ID"]],
     "Bridge Loan": [["Deal Number"]],
-    "Term Loan": [["Deal Number"], ["Servicer ID"]],
+    "Term Loan": [["Servicer ID"], ["Deal Number"]],
     "Term Asset": [["Deal Number", "Asset ID"]],
 }
 
 
-def _compose_baseline_key(df: pd.DataFrame, key_cols: Sequence[str]) -> pd.Series:
-    parts = []
-    for col in key_cols:
-        if col not in df.columns:
-            return pd.Series([pd.NA] * len(df), index=df.index, dtype="string")
-        if col == "Servicer ID":
-            part = id_key_no_leading_zeros(df[col])
-        elif col in {"Deal Number", "Asset ID"}:
-            part = norm_id_series(df[col])
-        else:
-            part = df[col].astype("string").str.strip().replace({"": pd.NA})
-        parts.append(part.astype("string"))
-
-    key = parts[0]
-    for part in parts[1:]:
-        key = key.fillna("") + "|" + part.fillna("")
-    key = key.astype("string").str.strip().replace({"": pd.NA, "|": pd.NA})
-    return key
+def _backfill_rule_candidates(sheet_name: str) -> List[List[str]]:
+    return [list(x) for x in SHEET_BASELINE_KEY_CANDIDATES.get(sheet_name, [])]
 
 
+def _resolve_backfill_keys(sheet_name: str, built_df: pd.DataFrame, baseline_df: pd.DataFrame) -> List[str]:
+    candidates = _backfill_rule_candidates(sheet_name)
+    built_cols = set(built_df.columns)
+    baseline_cols = set(baseline_df.columns)
 
-def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_bytes: Optional[bytes]) -> Tuple[pd.DataFrame, int]:
+    for candidate in candidates:
+        if not set(candidate).issubset(built_cols) or not set(candidate).issubset(baseline_cols):
+            continue
+        if sheet_name == "Term Loan" and candidate == ["Servicer ID"]:
+            built_nonblank = id_key_no_leading_zeros(built_df["Servicer ID"]).notna().sum()
+            baseline_nonblank = id_key_no_leading_zeros(baseline_df["Servicer ID"]).notna().sum()
+            if built_nonblank == 0 or baseline_nonblank == 0:
+                continue
+        return candidate
+    return []
+
+
+def _choose_backfill_normalizer(sheet_name: str, key_cols: Sequence[str]):
+    prefer_no_leading_zeros = sheet_name == "Term Loan" and list(key_cols) == ["Servicer ID"]
+
+    def _one(s: pd.Series) -> pd.Series:
+        return id_key_no_leading_zeros(s) if prefer_no_leading_zeros else norm_id_series(s)
+
+    return _one
+
+
+
+def backfill_df_from_baseline(sheet_name: str, built_df: pd.DataFrame, baseline_bytes: Optional[bytes]) -> Tuple[pd.DataFrame, dict]:
     if baseline_bytes is None or built_df is None or built_df.empty:
-        return built_df, 0
+        return built_df, {"sheet_name": sheet_name, "status": "skipped_empty", "keys": "", "fills": 0}
 
     try:
         baseline_df = read_tab_df_from_active_loans(baseline_bytes, sheet_name)
-    except Exception:
-        return built_df, 0
-
-    key_candidates = SHEET_BASELINE_KEY_CANDIDATES.get(sheet_name, [])
-    chosen_keys = None
-    for key_cols in key_candidates:
-        if all(col in built_df.columns for col in key_cols) and all(col in baseline_df.columns for col in key_cols):
-            chosen_keys = key_cols
-            break
-    if not chosen_keys:
-        return built_df, 0
+    except Exception as exc:
+        return built_df, {"sheet_name": sheet_name, "status": f"baseline_read_failed: {exc}", "keys": "", "fills": 0}
 
     out = built_df.copy()
-    out["_baseline_key"] = _compose_baseline_key(out, chosen_keys)
-    base = baseline_df.copy()
-    base["_baseline_key"] = _compose_baseline_key(base, chosen_keys)
-    base = base.dropna(subset=["_baseline_key"]).drop_duplicates("_baseline_key", keep="last").set_index("_baseline_key")
+    key_cols = _resolve_backfill_keys(sheet_name, out, baseline_df)
+    if not key_cols:
+        return out, {"sheet_name": sheet_name, "status": "skipped_no_keys", "keys": "", "fills": 0}
 
-    filled_cells = 0
+    normer = _choose_backfill_normalizer(sheet_name, key_cols)
+    helper_keys = [f"_baseline_k{i}" for i in range(len(key_cols))]
+
+    for i, col in enumerate(key_cols):
+        out[helper_keys[i]] = normer(out[col])
+
+    base = baseline_df.copy()
+    for i, col in enumerate(key_cols):
+        base[helper_keys[i]] = normer(base[col])
+
+    base = base.dropna(subset=helper_keys).copy()
+    if base.empty:
+        out = out.drop(columns=helper_keys, errors="ignore")
+        return out, {"sheet_name": sheet_name, "status": "skipped_no_baseline_keys", "keys": ", ".join(key_cols), "fills": 0}
+
     common_cols = [
-        c for c in out.columns
-        if c in base.columns
-        and c not in chosen_keys
-        and c != "_baseline_key"
+        c for c in base.columns
+        if c in out.columns
+        and c not in key_cols
+        and c not in helper_keys
         and not c.startswith("_")
         and not UPB_HEADER_RE.search(str(c))
     ]
 
-    for col in common_cols:
-        mapped = out["_baseline_key"].map(base[col])
-        current = pd.Series(out[col], index=out.index, dtype="object")
-        current_blank = blankish_mask(current)
-        mapped_nonblank = ~blankish_mask(pd.Series(mapped, index=out.index, dtype="object"))
-        mask = current_blank & mapped_nonblank
-        if mask.any():
-            filled_cells += int(mask.sum())
-            out[col] = current.where(~mask, mapped)
+    if not common_cols:
+        out = out.drop(columns=helper_keys, errors="ignore")
+        return out, {"sheet_name": sheet_name, "status": "skipped_no_common_cols", "keys": ", ".join(key_cols), "fills": 0}
 
-    out = out.drop(columns=["_baseline_key"], errors="ignore")
-    return downcast_numeric_frame(out), filled_cells
+    score = pd.Series([0] * len(base), index=base.index, dtype="int64")
+    for col in common_cols:
+        score = score + (~blankish_mask(base[col])).astype("int64")
+    base["_baseline_score"] = score
+    base = base.sort_values(helper_keys + ["_baseline_score"], ascending=[True] * len(helper_keys) + [True])
+    base = base.drop_duplicates(helper_keys, keep="last")
+
+    base_lookup = base.set_index(helper_keys, drop=False)
+    out = out.set_index(helper_keys, drop=False)
+
+    fills = 0
+    for col in common_cols:
+        base_vals = base_lookup[col].reindex(out.index)
+        mask = blankish_mask(out[col]) & (~blankish_mask(base_vals))
+        if mask.any():
+            fills += int(mask.sum())
+            out.loc[mask, col] = base_vals.loc[mask]
+
+    out = out.reset_index(drop=True)
+    out = out.drop(columns=helper_keys + ["_baseline_score"], errors="ignore")
+    return downcast_numeric_frame(out), {"sheet_name": sheet_name, "status": "backfilled", "keys": ", ".join(key_cols), "fills": fills}
 
 
 def _parse_npl_or_reo_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=4)
     df = df.dropna(how="all").copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -4757,6 +4785,120 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _trim_sheet_body_rows(ws, row_count=max(len(df), 1), start_row=5)
 
 
+def _normalize_sheet_key_value(header: str, value) -> str:
+    txt = clean_text(value)
+    if not txt:
+        return ""
+    txt = re.sub(r"\.0$", "", txt)
+    if header == "Servicer ID":
+        txt = re.sub(r"[^0-9A-Za-z]", "", txt).lstrip("0")
+    elif header in {"Deal Number", "Asset ID"}:
+        txt = re.sub(r"[^0-9A-Za-z]", "", txt)
+    return txt
+
+
+
+def _sheet_header_index(wb, ws, upb_header: str) -> Dict[str, int]:
+    return {header: col_idx for col_idx, header in header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)}
+
+
+
+def _build_sheet_row_lookup(wb, ws, key_headers: Sequence[str], upb_header: str) -> Tuple[Dict[Tuple[str, ...], int], Dict[str, int]]:
+    header_idx = _sheet_header_index(wb, ws, upb_header)
+    if not all(h in header_idx for h in key_headers):
+        return {}, header_idx
+
+    out: Dict[Tuple[str, ...], int] = {}
+    for r in range(5, ws.max_row + 1):
+        key = tuple(_normalize_sheet_key_value(h, ws.cell(r, header_idx[h]).value) for h in key_headers)
+        if any(not part for part in key):
+            continue
+        out[key] = r
+    return out, header_idx
+
+
+
+def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> List[dict]:
+    if not baseline_bytes:
+        return []
+
+    summary: List[dict] = []
+    base_wb = None
+    try:
+        base_wb = load_workbook(BytesIO(baseline_bytes), data_only=False, keep_links=True)
+        targets = list(sheet_names) if sheet_names else list(SHEET_BASELINE_KEY_CANDIDATES.keys())
+
+        for sheet_name in targets:
+            if sheet_name not in wb.sheetnames or sheet_name not in base_wb.sheetnames:
+                continue
+
+            out_ws = wb[sheet_name]
+            base_ws = base_wb[sheet_name]
+            chosen_keys: List[str] = []
+            out_rows: Dict[Tuple[str, ...], int] = {}
+            base_rows: Dict[Tuple[str, ...], int] = {}
+            out_header_idx: Dict[str, int] = {}
+            base_header_idx: Dict[str, int] = {}
+
+            for candidate in _backfill_rule_candidates(sheet_name):
+                out_rows_try, out_header_try = _build_sheet_row_lookup(wb, out_ws, candidate, upb_header)
+                base_rows_try, base_header_try = _build_sheet_row_lookup(base_wb, base_ws, candidate, upb_header)
+                if sheet_name == "Term Loan" and candidate == ["Servicer ID"] and (not out_rows_try or not base_rows_try):
+                    continue
+                if out_rows_try and base_rows_try:
+                    chosen_keys = candidate
+                    out_rows = out_rows_try
+                    base_rows = base_rows_try
+                    out_header_idx = out_header_try
+                    base_header_idx = base_header_try
+                    break
+
+            if not chosen_keys:
+                summary.append({"sheet_name": sheet_name, "status": "skipped_no_sheet_keys", "keys": "", "fills": 0, "matched_rows": 0})
+                continue
+
+            formula_cols = formula_col_indices(out_ws, start_row=5, header_row=4)
+            common_headers = [
+                h for h in out_header_idx
+                if h in base_header_idx
+                and h not in chosen_keys
+                and not UPB_HEADER_RE.search(str(h))
+            ]
+
+            fills = 0
+            matched_rows = 0
+            for key, out_row in out_rows.items():
+                base_row = base_rows.get(key)
+                if not base_row:
+                    continue
+                matched_rows += 1
+                for header in common_headers:
+                    out_col = out_header_idx[header]
+                    if out_col in formula_cols:
+                        continue
+                    out_cell = out_ws.cell(out_row, out_col)
+                    base_cell = base_ws.cell(base_row, base_header_idx[header])
+                    if clean_text(out_cell.value) == "" and clean_text(base_cell.value) != "":
+                        out_cell.value = base_cell.value
+                        fills += 1
+
+            summary.append({
+                "sheet_name": sheet_name,
+                "status": "repaired" if fills else "no_fills_needed",
+                "keys": ", ".join(chosen_keys),
+                "fills": fills,
+                "matched_rows": matched_rows,
+            })
+    finally:
+        try:
+            if base_wb is not None:
+                base_wb.close()
+        except Exception:
+            pass
+
+    return summary
+
+
 def mark_workbook_for_recalc(wb):
     try:
         wb.calculation.calcMode = "auto"
@@ -4826,7 +4968,8 @@ except Exception as e:
 st.caption(
     "This merged version uses your repo template by default, can use the uploaded completed report as the build base, "
     "adds NPL/REO flag integration, uses Midland / FCI / Berkadia as the term active-loan spine when available, "
-    "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, and keeps row-level Salesforce Servicer IDs intact."
+    "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, keeps row-level Salesforce Servicer IDs intact, "
+    "and runs both dataframe-level and workbook-level blank repair against the uploaded known-good report when you provide one."
 )
 
 sf_info = render_salesforce_login_gate()
@@ -4969,9 +5112,9 @@ if build_btn:
                     template_maps,
                     npl_maps=npl_maps,
                 )
-                bridge_asset_df, bridge_asset_filled = backfill_df_from_baseline("Bridge Asset", bridge_asset_df, prev_bytes)
-                if bridge_asset_filled:
-                    diagnostics.append(f"Bridge Asset baseline backfill cells: {bridge_asset_filled:,}")
+                bridge_asset_df, bridge_asset_backfill = backfill_df_from_baseline("Bridge Asset", bridge_asset_df, prev_bytes)
+                if bridge_asset_backfill and bridge_asset_backfill.get("fills"):
+                    diagnostics.append(f"Bridge Asset baseline backfill cells: {int(bridge_asset_backfill['fills']):,} using {bridge_asset_backfill.get('keys', 'n/a')}")
 
                 diagnostics.append(f"Bridge Asset rows: {len(bridge_asset_df):,}")
                 diagnostics.append(
@@ -4996,9 +5139,9 @@ if build_btn:
                         template_maps,
                         npl_maps=npl_maps,
                     )
-                    bridge_loan_df, bridge_loan_filled = backfill_df_from_baseline("Bridge Loan", bridge_loan_df, prev_bytes)
-                    if bridge_loan_filled:
-                        diagnostics.append(f"Bridge Loan baseline backfill cells: {bridge_loan_filled:,}")
+                    bridge_loan_df, bridge_loan_backfill = backfill_df_from_baseline("Bridge Loan", bridge_loan_df, prev_bytes)
+                    if bridge_loan_backfill and bridge_loan_backfill.get("fills"):
+                        diagnostics.append(f"Bridge Loan baseline backfill cells: {int(bridge_loan_backfill['fills']):,} using {bridge_loan_backfill.get('keys', 'n/a')}")
 
                     diagnostics.append(f"Bridge Loan rows: {len(bridge_loan_df):,}")
                     diagnostics.append(
@@ -5028,9 +5171,9 @@ if build_btn:
                     prev_maps,
                     template_maps,
                 )
-                term_loan_df, term_loan_filled = backfill_df_from_baseline("Term Loan", term_loan_df, prev_bytes)
-                if term_loan_filled:
-                    diagnostics.append(f"Term Loan baseline backfill cells: {term_loan_filled:,}")
+                term_loan_df, term_loan_backfill = backfill_df_from_baseline("Term Loan", term_loan_df, prev_bytes)
+                if term_loan_backfill and term_loan_backfill.get("fills"):
+                    diagnostics.append(f"Term Loan baseline backfill cells: {int(term_loan_backfill['fills']):,} using {term_loan_backfill.get('keys', 'n/a')}")
 
                 diagnostics.append(f"Term Loan rows: {len(term_loan_df):,}")
                 diagnostics.append(
@@ -5051,9 +5194,9 @@ if build_btn:
 
                     status.update(label="Building Term Asset...")
                     term_asset_df = build_term_asset(term_asset_source, term_loan_df, upb_col, prev_maps=prev_maps)
-                    term_asset_df, term_asset_filled = backfill_df_from_baseline("Term Asset", term_asset_df, prev_bytes)
-                    if term_asset_filled:
-                        diagnostics.append(f"Term Asset baseline backfill cells: {term_asset_filled:,}")
+                    term_asset_df, term_asset_backfill = backfill_df_from_baseline("Term Asset", term_asset_df, prev_bytes)
+                    if term_asset_backfill and term_asset_backfill.get("fills"):
+                        diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
 
                     status.update(label="Writing Term Asset sheet...")
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
@@ -5064,6 +5207,18 @@ if build_btn:
 
             del sf_am, sf_active_rm, serv_join, serv_preview
             gc.collect()
+
+            selected_sheet_names = [
+                sheet_name
+                for sheet_name in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
+                if build_target in (sheet_name, "All")
+            ]
+            repair_summary = repair_workbook_from_baseline(wb, prev_bytes, upb_col, sheet_names=selected_sheet_names)
+            for item in repair_summary:
+                if item.get("fills"):
+                    diagnostics.append(
+                        f"{item['sheet_name']} workbook repair cells: {int(item['fills']):,} using {item.get('keys', 'n/a')}"
+                    )
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
