@@ -45,7 +45,11 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-TEMPLATE_FILENAMES = ("Active Loan Template.xlsx", "Active Loan Report Template.xlsx")
+TEMPLATE_FILENAMES = (
+    "20260330 Active Loans vDRAFT.xlsx",
+    "Active Loan Template.xlsx",
+    "Active Loan Report Template.xlsx",
+)
 API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 600
@@ -55,11 +59,14 @@ ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
-VALID_STAGES = ["Closed Won", "Expired", "Matured", "Sold"]
+VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold"]
 BRIDGE_ACTIVE_STAGES = VALID_STAGES.copy()
 BRIDGE_LOAN_SOURCE_STAGES = VALID_STAGES.copy()
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
-BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan"]
+BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan", "Single Asset Bridge Loan"]
+BRIDGE_TYPE_CONTAINS = ["SAB", "Single Asset Bridge"]
+TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
+LOAN_ACTIVE_STATUS = "Active"
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
 
 DNL_STAGES = [
@@ -73,7 +80,6 @@ VALUATION_PROPERTY_STATUSES = ["Active", "REO", "REO-Sold"]
 EXPIRED_OR_MATURED_STAGES = ["Expired", "Matured"]
 REO_FAMILY_STAGES = ["REO", "REO-Sold"]
 TERM_ACTIVE_STAGES = VALID_STAGES.copy()
-TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
 TERM_RECORDTYPE_NAMES = {"term loan", "dscr"}
 BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single asset bridge loan"}
 BRIDGE_RT_CONTAINS = {"sab", "single asset bridge"}
@@ -295,6 +301,45 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "Property ALA": "ALA",
     "Value Date": "Value Date",
     "As-Is Value": "As-Is Value",
+}
+
+
+DRAFT_FORMULA_OVERRIDES = {
+    "Bridge Asset": {
+        "SF Funded Amount": "=+$BH5+$BJ5+$BM5",
+        "CV Maturity Date": '=IF(OR($BS5="Credit Line",$BT5="Line of Credit"),$AG5,$AE5)',
+        "Maturity Difference": '=IFERROR($CH5-$CG5,"N/A")',
+        "Maturity Date": '=IF($CG5<>"N/A",$CG5,$CH5)',
+        "Days to Maturity": '=+$CJ5-$CK$3',
+        "Days Past Due": '=+$CL$3-$AC5',
+        "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
+        "Most Recent Valuation Date": '=IF($BE5<>"N/A",$BE5,$BA5)',
+        "Most Recent As-Is Value": '=IF($BE5<>"N/A",$BF5,$BB5)',
+        "Most Recent ARV": '=IF($BE5<>"N/A",$BG5,$BC5)',
+        "Needs NPL Value": '=IF(AND($CZ5="Y",$CN5<$CQ$3),"Y","N")',
+        "Securitized (Y/N)": '=IF($BR5="Securitized Bridge","Y","N")',
+        "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
+        "CPP JV (Y/N)": '=IF($BR5="CPP JV","Y","N")',
+        "Oaktree JV (Y/N)": '=IF($BR5="Oaktree JV","Y","N")',
+        "Legacy (Y/N)": '=IF($BR5="Legacy","Y","N")',
+        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CK:$CK,$E:$E,$E5)<0,"Y","N")',
+        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CL:$CL,$E:$E,$E5)>=45,"Y","N")',
+        "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AK5,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
+        "3/31 NPL (Y/N)": '=IF(AND($D5<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E5)<$CZ$3),"Y","N")',
+        "Special Flag": '=IF(AND($D5<>"Sold",OR($CV5="Y",$CW5="Y",$CX5="Y",$CY5="Y")),"Y","N")',
+    },
+    "Bridge Loan": {
+        "Days Past Due": '=+$V$3-$U5',
+    },
+    "Term Loan": {
+        "Days Past Due": '=+$U$3-$S5',
+        "DQ Status": '=IF($T5<>"N/A","REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
+        "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
+    },
+    "Term Asset": {
+        "__UPB__": "=($K5/SUMIFS($K:$K,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
+        "Special (Y/N)": "=_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$AD:$AD)",
+    },
 }
 
 SHEET_BLUEPRINTS = {
@@ -645,6 +690,23 @@ def clean_text(val) -> str:
     if s.lower() in {"nan", "none", "<na>", "nat"}:
         return ""
     return s
+
+def strip_statebridge_display_id(servicer_id, servicer_name):
+    sid = clean_text(servicer_id)
+    if not sid:
+        return pd.NA
+    serv = clean_text(servicer_name).lower()
+    if "statebridge" in serv and sid.startswith("0000"):
+        sid = sid[4:]
+    return sid or pd.NA
+
+def normalize_servicer_id_for_report(servicer_ids: pd.Series, servicer_names: pd.Series) -> pd.Series:
+    sid = pd.Series(servicer_ids, copy=False)
+    serv = pd.Series(servicer_names, copy=False)
+    out = []
+    for i in sid.index:
+        out.append(strip_statebridge_display_id(sid.loc[i], serv.loc[i] if i in serv.index else pd.NA))
+    return pd.Series(out, index=sid.index, dtype="object")
 
 
 def blankish_mask(s: pd.Series) -> pd.Series:
@@ -1456,17 +1518,36 @@ def _soql_text(value: str) -> str:
 def _recordtype_name_expr(alias_prefix: str = "") -> str:
     return f"{alias_prefix}RecordType.Name" if alias_prefix else "RecordType.Name"
 
+def _lower_in_condition(field_expr: str, values: Sequence[str]) -> str:
+    vals = "(" + ", ".join(_soql_text(str(x).lower()) for x in values) + ")"
+    return f"({field_expr} != NULL AND LOWER({field_expr}) IN {vals})"
+
+def _lower_contains_condition(field_expr: str, values: Sequence[str]) -> str:
+    contains_parts = [f"LOWER({field_expr}) LIKE '%{str(x).lower().replace(chr(39), chr(92)+chr(39))}%'" for x in values]
+    return "(" + " OR ".join(contains_parts) + ")" if contains_parts else "FALSE"
+
+def _bridge_dealtype_condition(alias_prefix: str = "") -> str:
+    expr = f"{alias_prefix}Type" if alias_prefix else "Type"
+    exact_cond = _lower_in_condition(expr, BRIDGE_TYPES)
+    contains_cond = _lower_contains_condition(expr, BRIDGE_TYPE_CONTAINS)
+    return f"({exact_cond} OR {contains_cond})"
+
+def _term_dealtype_condition(alias_prefix: str = "") -> str:
+    expr = f"{alias_prefix}Type" if alias_prefix else "Type"
+    return _lower_in_condition(expr, TERM_TYPES)
+
+def _opportunity_status_active_condition(alias_prefix: str = "") -> str:
+    field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
+    if not field_api:
+        return "1 = 1"
+    field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
+    return f"{field_expr} = {_soql_text(LOAN_ACTIVE_STATUS)}"
+
 def _bridge_recordtype_condition(alias_prefix: str = "") -> str:
-    expr = _recordtype_name_expr(alias_prefix)
-    exact = "(" + ", ".join(_soql_text(x) for x in sorted(BRIDGE_RT_EXACT)) + ")"
-    contains_parts = [f"{expr} LIKE '%{str(x).replace(chr(39), chr(92)+chr(39))}%'" for x in sorted(BRIDGE_RT_CONTAINS)]
-    contains_sql = " OR ".join(contains_parts) if contains_parts else "FALSE"
-    return f"(({expr} != NULL AND LOWER({expr}) IN {exact}) OR ({contains_sql}))"
+    return _bridge_dealtype_condition(alias_prefix)
 
 def _term_recordtype_condition(alias_prefix: str = "") -> str:
-    expr = _recordtype_name_expr(alias_prefix)
-    vals = "(" + ", ".join(_soql_text(x) for x in sorted(TERM_RECORDTYPE_NAMES)) + ")"
-    return f"({expr} != NULL AND LOWER({expr}) IN {vals})"
+    return _term_dealtype_condition(alias_prefix)
 
 def _coalesce_numeric_columns(df: pd.DataFrame, columns: Sequence[str], default=np.nan) -> pd.Series:
     out = pd.Series([default] * len(df), index=df.index, dtype="float64")
@@ -1605,7 +1686,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     where_parts = [
         f"{opp_rel}.Deal_Loan_Number__c != NULL",
         _soql_in(f"{opp_rel}.StageName", BRIDGE_ACTIVE_STAGES),
-        _bridge_recordtype_condition(f"{opp_rel}."),
+        _opportunity_status_active_condition(f"{opp_rel}."),
+        _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
         "Asset_ID__c != NULL",
@@ -1732,7 +1814,8 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
     where_parts = [
         "Deal_Loan_Number__c != NULL",
         _soql_in("StageName", BRIDGE_LOAN_SOURCE_STAGES),
-        _bridge_recordtype_condition(),
+        _opportunity_status_active_condition(),
+        _bridge_dealtype_condition(),
         _soql_not_equal_or_null("LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
     ]
 
@@ -1777,7 +1860,8 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
     where_parts = [
         f"{opp_rel}.Deal_Loan_Number__c != NULL",
         _soql_in(f"{opp_rel}.StageName", BRIDGE_LOAN_SOURCE_STAGES),
-        _soql_in(f"{opp_rel}.Type", BRIDGE_TYPES),
+        _opportunity_status_active_condition(f"{opp_rel}."),
+        _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
     ]
 
@@ -1823,6 +1907,7 @@ def _build_do_not_lend_like() -> pd.DataFrame:
         "FROM Opportunity WHERE "
         "Account.Do_Not_Lend__c = TRUE "
         f"AND {_soql_in('StageName', DNL_STAGES)} "
+        f"AND {_opportunity_status_active_condition()} "
         "AND Deal_Loan_Number__c != NULL"
     )
     df = run_bulk_query(soql)
@@ -1833,6 +1918,65 @@ def _build_do_not_lend_like() -> pd.DataFrame:
     }
     return downcast_numeric_frame(_normalize_bulk_df(df.rename(columns=rename_map)))
 
+
+
+def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
+    asset_ids = _nonblank_unique(asset_ids or [])
+    property_rel = appraisal_property_relationship_name()
+    deal_rel = relationship_name_for("Appraisal__c", "Deal__c") if first_existing_field_name("Appraisal__c", ["Deal__c"]) else None
+
+    effective_field = first_existing_field_name("Appraisal__c", ["Appraisal_Effective_Date__c", "Appraisal_Report_Date__c"])
+    report_field = first_existing_field_name("Appraisal__c", ["Appraisal_Report_Date__c", "Appraisal_Effective_Date__c"])
+    order_field = first_existing_field_name("Appraisal__c", ["Order_Received_Date__c"])
+    as_is_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_As_Is_Value__c", "Appraised_Value_Amount__c"])
+    arv_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_After_Repair_Value__c", "Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c"])
+
+    select_pairs = [
+        ("Asset ID", f"{property_rel}.Asset_ID__c"),
+        ("Property Asset Id", "Property_Asset_Id__c"),
+        ("Property ID", f"{property_rel}.Id"),
+        ("Appraisal Name", "Name"),
+    ]
+    if deal_rel:
+        select_pairs.append(("Deal Loan Number", f"{deal_rel}.Deal_Loan_Number__c"))
+    if order_field:
+        select_pairs.append(("Most Recent Appraisal Order Date", order_field))
+    if effective_field:
+        select_pairs.append(("Appraisal Effective Date", effective_field))
+    if report_field and report_field != effective_field:
+        select_pairs.append(("Appraisal Report Date", report_field))
+    if as_is_field:
+        select_pairs.append(("Appraisal As-Is Value", as_is_field))
+    if arv_field:
+        select_pairs.append(("Appraisal ARV", arv_field))
+
+    rename_map = {expr: label for label, expr in select_pairs}
+    soqls = []
+    if asset_ids:
+        for chunk in _chunked(asset_ids, size=200):
+            soqls.append("SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Appraisal__c WHERE " + _soql_in(f"{property_rel}.Asset_ID__c", chunk))
+    else:
+        soqls.append("SELECT " + ", ".join(expr for _label, expr in select_pairs) + f" FROM Appraisal__c WHERE {property_rel}.Asset_ID__c != NULL")
+
+    df = _run_bulk_union(soqls, rename_map=rename_map)
+    if df.empty:
+        return df
+
+    if "Asset ID" not in df.columns and "Property Asset Id" in df.columns:
+        df["Asset ID"] = df["Property Asset Id"]
+    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+    df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Appraisal Effective Date", "Appraisal Report Date"])
+    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraisal As-Is Value"])
+    df["Current Appraised After Repair Value"] = _coalesce_numeric_columns(df, ["Appraisal ARV"])
+    df["_sort_dt"] = pd.to_datetime(df.get("Current Appraisal Date"), errors="coerce")
+    df["_nonnull_score"] = 0
+    for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value", "Most Recent Appraisal Order Date"]:
+        if c in df.columns:
+            df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
+    df = df[df["_asset_key"].notna()].copy()
+    df = df.sort_values(["_asset_key", "_sort_dt", "_nonnull_score"], ascending=[True, True, True])
+    df = df.drop_duplicates(["_asset_key"], keep="last")
+    return downcast_numeric_frame(df.drop(columns=["_sort_dt", "_nonnull_score"], errors="ignore"))
 
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     asset_ids = _nonblank_unique(asset_ids or [])
@@ -1872,12 +2016,28 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
         soqls.append("SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Property__c WHERE Asset_ID__c != NULL")
 
     df = _run_bulk_union(soqls, rename_map=rename_map)
-    if df.empty:
+    appraisal_df = _build_appraisal_like(asset_ids=asset_ids)
+    if df.empty and appraisal_df.empty:
         return df
 
-    df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "BPO Appraisal Date", "Backup Value Date Native"])
-    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
-    df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+    if df.empty:
+        df = appraisal_df.copy()
+    else:
+        df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "BPO Appraisal Date", "Backup Value Date Native"])
+        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
+        df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+        if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
+            app = appraisal_df.copy()
+            app["_asset_key"] = norm_id_series(app["Asset ID"])
+            keep = ["_asset_key"] + [c for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"] if c in app.columns]
+            app = app[keep].drop_duplicates("_asset_key")
+            df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+            df = df.merge(app, on="_asset_key", how="left", suffixes=("", "_app"))
+            for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
+                app_col = f"{c}_app"
+                if app_col in df.columns:
+                    df[c] = coalesce_keep_nonblank(df.get(c, pd.Series([pd.NA] * len(df), index=df.index)), df[app_col])
+                    df = df.drop(columns=[app_col], errors="ignore")
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
@@ -2071,7 +2231,9 @@ def _build_term_wide_like() -> pd.DataFrame:
         + ", ".join(expr for _label, expr in select_pairs)
         + " FROM Opportunity WHERE "
         "Deal_Loan_Number__c != NULL AND Probability > 0 AND "
-        + _soql_in("Type", TERM_TYPES)
+        + _term_dealtype_condition()
+        + " AND "
+        + _opportunity_status_active_condition()
         + " AND "
         + _soql_in("StageName", TERM_ACTIVE_STAGES)
     )
@@ -2141,7 +2303,7 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     base_where = [
         f"{opp_rel}.Deal_Loan_Number__c != NULL",
         f"{opp_rel}.Probability > 0",
-        _term_recordtype_condition(f"{opp_rel}."),
+        _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         "ALA__c > 0",
         "Asset_ID__c != NULL",
@@ -3621,6 +3783,7 @@ def build_bridge_asset(
     if "Is Special Asset (Y/N)" in out.columns:
         out["Is Special Asset (Y/N)"] = _yn_from_bool_series(out["Is Special Asset (Y/N)"])
 
+    out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Active RM"] = coalesce_keep_nonblank(out["Active RM"], pd.Series(["N"] * len(out), index=out.index))
     out["3/31 NPL (Y/N)"] = coalesce_keep_nonblank(out["3/31 NPL (Y/N)"], pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out["Needs NPL Value"], pd.Series(["N"] * len(out), index=out.index))
@@ -4043,6 +4206,7 @@ def build_term_loan(
         out["Next Payment Date"] = pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out.get("_serv_next_payment_date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce"))
         out["Maturity Date"] = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out.get("_serv_maturity_file", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce"))
 
+    out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out.get("Do Not Lend (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)))
     out["CPP JV"] = coalesce_keep_nonblank(out.get("CPP JV", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
@@ -4353,6 +4517,7 @@ def build_bridge_loan(
                 out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
+    out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out.get("Special Focus (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), pd.Series(["N"] * len(out), index=out.index))
@@ -4631,31 +4796,18 @@ def _apply_display_style(ws_formula, row_idx: int, col_idx: int, header: str, up
             cell.number_format = money_fmt
 
 
-def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, start_row: int = 5):
+def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, header_tuples: List[Tuple[int, str]], upb_header: str, start_row: int = 5):
     if row_count <= 0:
         return
 
-    header_map = {h: c for c, h in header_tuples_from_ws(ws_formula, header_row=4)}
-    dq_col = header_map.get("DQ Status")
-    reo_col = header_map.get("REO Date")
-    dpd_col = header_map.get("Days Past Due")
+    header_by_col = {c: h for c, h in header_tuples}
+    overrides = DRAFT_FORMULA_OVERRIDES.get(ws_formula.title, {})
 
-    for col_idx, seed in formula_seeds.items():
-        origin_row = seed["origin_row"]
-        origin_formula = seed["formula"]
-
-        if dq_col and reo_col and dpd_col and col_idx == dq_col and ws_formula.title in {"Bridge Asset", "Term Loan"}:
-            reo_letter = get_column_letter(reo_col)
-            dpd_letter = get_column_letter(dpd_col)
-            origin_row = start_row
-            origin_formula = (
-                f'=IF(AND(${reo_letter}{start_row}<>"",${reo_letter}{start_row}<>"N/A"),"REO",'
-                f'IF(AND(${dpd_letter}{start_row}>0,${dpd_letter}{start_row}<30),"DQ 1-29",'
-                f'IF(AND(${dpd_letter}{start_row}>=30,${dpd_letter}{start_row}<60),"DQ 30-59",'
-                f'IF(AND(${dpd_letter}{start_row}>=60,${dpd_letter}{start_row}<90),"DQ 60-89",'
-                f'IF(${dpd_letter}{start_row}>=90,"DQ 90+","Current")))))'
-            )
-
+    for col_idx in sorted(formula_seeds):
+        header = header_by_col.get(col_idx, "")
+        override_key = "__UPB__" if header == upb_header else header
+        origin_formula = overrides.get(override_key, formula_seeds[col_idx]["formula"])
+        origin_row = start_row
         origin_ref = f"{get_column_letter(col_idx)}{origin_row}"
 
         for r in range(start_row, start_row + row_count):
@@ -4721,7 +4873,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _clear_sheet_body(ws, used_cols, start_row=5)
 
     write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=5)
-    _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), start_row=5)
+    _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=5)
     _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
     _trim_sheet_body_rows(ws, row_count=max(len(df), 1), start_row=5)
 
