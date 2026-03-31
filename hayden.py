@@ -5023,6 +5023,577 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
     return summary
 
 
+
+EMBEDDED_AUDIT_NUMERIC_HEADERS = {
+    "Square Feet", "# of Units", "Year Built", "Property Count", "Loan Amount",
+    "Initial Disbursement Funded", "Renovation Holdback", "Renovation Holdback Funded",
+    "Renovation Holdback Remaining", "Renovation HB Funded", "Renovation HB Remaining",
+    "Interest Allocation", "Interest Allocation Funded", "Loan Commitment", "Active Funded Amount",
+    "Suspense Balance", "Remaining Commitment", "Origination As-Is Value", "Origination ARV",
+    "Updated As-Is Value", "Updated ARV", "Most Recent As-Is Value", "Most Recent ARV",
+    "Property ALA", "As-Is Value", "Needs NPL Value", "Days Past Due",
+}
+
+EMBEDDED_AUDIT_PROTECTED_HEADERS = {
+    "Bridge Asset": {
+        "Deal Number", "Servicer ID", "SF Yardi ID", "Asset ID", "Deal Name", "Address",
+        "City", "State", "Zip", "County", "CBSA", "APN", "# of Units", "Year Built",
+        "Square Feet", "Origination Date", "Origination Value Dt", "Origination As-Is Value",
+        "Origination ARV", "Most Recent Appraisal Order Date", "Updated Valuation Date",
+        "Updated As-Is Value", "Updated ARV", "Initial Disbursement Funded", "Renovation Holdback",
+        "Interest Allocation",
+    },
+    "Bridge Loan": {
+        "Deal Number", "Servicer ID", "SF Yardi ID", "Loan Commitment", "Active Funded Amount",
+        "Initial Disbursement Funded", "Renovation Holdback", "Interest Allocation",
+        "Most Recent As-Is Value", "Most Recent ARV",
+    },
+    "Term Loan": {
+        "Deal Number", "Servicer ID", "SF Yardi ID", "Loan Amount", "Origination Date", "Maturity Date",
+    },
+    "Term Asset": {
+        "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "Value Date",
+        "Property ALA", "As-Is Value",
+    },
+}
+
+EMBEDDED_AUDIT_HEADER_FONT = Font(name="Aptos Narrow", size=11, bold=True)
+EMBEDDED_AUDIT_BODY_FONT = Font(name="Aptos Narrow", size=11)
+EMBEDDED_AUDIT_WRAP_ALIGNMENT = Alignment(vertical="top", wrap_text=True)
+EMBEDDED_AUDIT_ALL_DATE_HEADERS = set().union(*SHEET_DATE_HEADERS.values())
+
+
+def _embedded_find_upb_header(wb, preferred_sheet: str = "Bridge Asset") -> str:
+    sheets = [preferred_sheet] + [name for name in wb.sheetnames if name != preferred_sheet]
+    for sheet_name in sheets:
+        ws = wb[sheet_name]
+        for cell in ws[4]:
+            value = cell.value
+            if isinstance(value, str) and UPB_HEADER_RE.search(value):
+                return value.strip()
+    return "UPB"
+
+
+
+def _embedded_row_has_any_value(ws, row_idx: int, col_indices: Sequence[int]) -> bool:
+    for col_idx in col_indices:
+        if clean_text(ws.cell(row_idx, col_idx).value) != "":
+            return True
+    return False
+
+
+
+def _embedded_normalize_compare_value(header: str, value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return ""
+        if header in EMBEDDED_AUDIT_ALL_DATE_HEADERS or "date" in header.lower():
+            return value.date().isoformat()
+        return value.isoformat(sep=" ")
+    if isinstance(value, datetime):
+        if header in EMBEDDED_AUDIT_ALL_DATE_HEADERS or "date" in header.lower():
+            return value.date().isoformat()
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            val = float(value)
+        except Exception:
+            return clean_text(value)
+        if np.isnan(val):
+            return ""
+        if header in EMBEDDED_AUDIT_ALL_DATE_HEADERS:
+            return str(value)
+        if float(val).is_integer():
+            return str(int(val))
+        return f"{val:.6f}".rstrip("0").rstrip(".")
+
+    text = clean_text(value)
+    if not text:
+        return ""
+
+    if header in EMBEDDED_AUDIT_ALL_DATE_HEADERS or "date" in header.lower():
+        parsed = pd.to_datetime(text, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.date().isoformat()
+
+    if header in EMBEDDED_AUDIT_NUMERIC_HEADERS:
+        numeric = text.replace(",", "").replace("$", "")
+        if numeric.startswith("(") and numeric.endswith(")"):
+            numeric = "-" + numeric[1:-1]
+        try:
+            val = float(numeric)
+            if float(val).is_integer():
+                return str(int(val))
+            return f"{val:.6f}".rstrip("0").rstrip(".")
+        except Exception:
+            pass
+
+    return re.sub(r"\s+", " ", text).strip().upper()
+
+
+
+def _embedded_build_row_lookup(
+    wb,
+    ws,
+    key_headers: Sequence[str],
+    upb_header: str,
+    include_key_variants: bool = False,
+) -> Tuple[Dict[Tuple[str, ...], int], Dict[str, int], int, int, List[dict]]:
+    header_idx = _sheet_header_index(wb, ws, upb_header)
+    if not all(h in header_idx for h in key_headers):
+        return {}, header_idx, 0, 0, []
+
+    rows: Dict[Tuple[str, ...], List[int]] = {}
+    blank_key_rows = 0
+    data_rows = 0
+    duplicates: List[dict] = []
+    scan_cols = list(header_idx.values())
+
+    for row_idx in range(5, ws.max_row + 1):
+        if not _embedded_row_has_any_value(ws, row_idx, scan_cols):
+            continue
+        data_rows += 1
+
+        key_parts: List[List[str]] = []
+        valid = True
+        for key_header in key_headers:
+            raw = ws.cell(row_idx, header_idx[key_header]).value
+            vals = _normalize_sheet_key_variants(key_header, raw) if include_key_variants else [_normalize_sheet_key_value(key_header, raw)]
+            vals = [v for v in vals if v]
+            if not vals:
+                blank_key_rows += 1
+                valid = False
+                break
+            key_parts.append(vals)
+        if not valid:
+            continue
+
+        if include_key_variants and len(key_parts) > 1:
+            import itertools
+            keys_to_add = list(itertools.product(*key_parts))
+        else:
+            keys_to_add = [tuple(part[0] for part in key_parts)]
+
+        for key in keys_to_add:
+            rows.setdefault(key, []).append(row_idx)
+            if len(rows[key]) > 1:
+                duplicates.append({
+                    "issue_type": "duplicate_key",
+                    "sheet_name": ws.title,
+                    "row": row_idx,
+                    "key": " | ".join(key),
+                    "header": ", ".join(key_headers),
+                    "built_value": "duplicate key row",
+                    "baseline_value": "",
+                    "detail": f"Duplicate key for {', '.join(key_headers)}",
+                    "suspected_source_header": "",
+                })
+
+    chosen = {key: row_list[-1] for key, row_list in rows.items()}
+    return chosen, header_idx, data_rows, blank_key_rows, duplicates
+
+
+
+def _embedded_choose_keys(sheet_name: str, out_wb, out_ws, base_wb, base_ws, upb_header: str):
+    for candidate in _backfill_rule_candidates(sheet_name):
+        out_rows, out_headers, out_data_rows, out_blank_keys, dupes = _embedded_build_row_lookup(
+            out_wb, out_ws, candidate, upb_header, include_key_variants=False
+        )
+        base_rows, base_headers, _base_data_rows, _base_blank_keys, _base_dupes = _embedded_build_row_lookup(
+            base_wb, base_ws, candidate, upb_header, include_key_variants=True
+        )
+        if sheet_name == "Term Loan" and candidate == ["Servicer ID"] and (not out_rows or not base_rows):
+            continue
+        if out_rows or base_rows:
+            return list(candidate), out_rows, base_rows, out_headers, base_headers, out_data_rows, out_blank_keys, dupes
+    return [], {}, {}, {}, {}, 0, 0, []
+
+
+
+def _embedded_choose_structural_keys(sheet_name: str, wb, ws, upb_header: str):
+    for candidate in _backfill_rule_candidates(sheet_name):
+        rows, headers, data_rows, blank_keys, dupes = _embedded_build_row_lookup(
+            wb, ws, candidate, upb_header, include_key_variants=False
+        )
+        if sheet_name == "Term Loan" and candidate == ["Servicer ID"] and not rows:
+            continue
+        if headers:
+            return list(candidate), rows, headers, data_rows, blank_keys, dupes
+    return [], {}, {}, 0, 0, []
+
+
+
+def _embedded_possible_shift_header(sheet_name: str, header: str, base_values: Dict[str, str], built_values: Dict[str, str]) -> str:
+    protected = EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set())
+    if header not in protected:
+        return ""
+    target = base_values.get(header, "")
+    if not target:
+        return ""
+    for other_header in protected:
+        if other_header == header:
+            continue
+        if built_values.get(other_header, "") == target:
+            return other_header
+    return ""
+
+
+
+def _embedded_audit_openpyxl_workbook(
+    wb,
+    baseline_bytes: Optional[bytes] = None,
+    upb_header: Optional[str] = None,
+    sheet_names: Optional[Sequence[str]] = None,
+    max_examples_per_sheet: int = 250,
+) -> Tuple[List[dict], List[dict]]:
+    if upb_header is None:
+        upb_header = _embedded_find_upb_header(wb)
+
+    targets = list(sheet_names) if sheet_names else list(SHEET_BASELINE_KEY_CANDIDATES.keys())
+    summaries: List[dict] = []
+    exceptions: List[dict] = []
+
+    base_wb = load_workbook(BytesIO(baseline_bytes), data_only=False, keep_links=True) if baseline_bytes else None
+    try:
+        for sheet_name in targets:
+            if sheet_name not in wb.sheetnames:
+                continue
+
+            out_ws = wb[sheet_name]
+            formula_cols = formula_col_indices(out_ws)
+
+            if base_wb is None or sheet_name not in getattr(base_wb, "sheetnames", []):
+                key_headers, out_rows, out_headers, out_data_rows, out_blank_keys, dupes = _embedded_choose_structural_keys(
+                    sheet_name, wb, out_ws, upb_header
+                )
+                formula_gaps = 0
+                sheet_example_count = 0
+                if out_headers:
+                    scan_cols = list(out_headers.values())
+                    header_by_col = {col_idx: header for header, col_idx in out_headers.items()}
+                    for row_idx in range(5, out_ws.max_row + 1):
+                        if not _embedded_row_has_any_value(out_ws, row_idx, scan_cols):
+                            continue
+                        for col_idx in formula_cols:
+                            value = out_ws.cell(row_idx, col_idx).value
+                            if not (isinstance(value, str) and value.startswith("=")):
+                                formula_gaps += 1
+                                if sheet_example_count < max_examples_per_sheet:
+                                    exceptions.append({
+                                        "issue_type": "formula_gap",
+                                        "sheet_name": sheet_name,
+                                        "row": row_idx,
+                                        "key": "",
+                                        "header": header_by_col.get(col_idx, ""),
+                                        "built_value": clean_text(value),
+                                        "baseline_value": "formula expected",
+                                        "detail": "Formula column is missing a formula on a populated data row.",
+                                        "suspected_source_header": "",
+                                    })
+                                    sheet_example_count += 1
+                for item in dupes[:max(0, max_examples_per_sheet - sheet_example_count)]:
+                    exceptions.append(item)
+                summaries.append({
+                    "sheet_name": sheet_name,
+                    "status": "structural_only",
+                    "keys": ", ".join(key_headers),
+                    "data_rows": out_data_rows,
+                    "matched_rows": 0,
+                    "built_only_rows": 0,
+                    "baseline_only_rows": 0,
+                    "duplicate_key_rows": len(dupes),
+                    "blank_key_rows": out_blank_keys,
+                    "formula_gap_cells": formula_gaps,
+                    "critical_fillable_blanks": 0,
+                    "review_fillable_blanks": 0,
+                    "possible_shift_cells": 0,
+                    "protected_headers_checked": len(EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set())),
+                    "top_fillable_blank_columns": [],
+                })
+                continue
+
+            base_ws = base_wb[sheet_name]
+            chosen_keys, out_rows, base_rows, out_headers, base_headers, out_data_rows, out_blank_keys, dupes = _embedded_choose_keys(
+                sheet_name, wb, out_ws, base_wb, base_ws, upb_header
+            )
+            if not chosen_keys:
+                summaries.append({
+                    "sheet_name": sheet_name,
+                    "status": "skipped_no_keys",
+                    "keys": "",
+                    "data_rows": 0,
+                    "matched_rows": 0,
+                    "built_only_rows": 0,
+                    "baseline_only_rows": 0,
+                    "duplicate_key_rows": 0,
+                    "blank_key_rows": 0,
+                    "formula_gap_cells": 0,
+                    "critical_fillable_blanks": 0,
+                    "review_fillable_blanks": 0,
+                    "possible_shift_cells": 0,
+                    "protected_headers_checked": 0,
+                    "top_fillable_blank_columns": [],
+                })
+                continue
+
+            built_only = set(out_rows) - set(base_rows)
+            baseline_only = set(base_rows) - set(out_rows)
+            common_headers = [
+                header for header in out_headers
+                if header in base_headers and header not in chosen_keys and not UPB_HEADER_RE.search(str(header))
+            ]
+            protected_headers = [header for header in common_headers if header in EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set())]
+            scan_cols = list(out_headers.values())
+            header_by_col = {col_idx: header for header, col_idx in out_headers.items()}
+
+            formula_gaps = 0
+            sheet_example_count = 0
+            for row_idx in range(5, out_ws.max_row + 1):
+                if not _embedded_row_has_any_value(out_ws, row_idx, scan_cols):
+                    continue
+                for col_idx in formula_cols:
+                    value = out_ws.cell(row_idx, col_idx).value
+                    if not (isinstance(value, str) and value.startswith("=")):
+                        formula_gaps += 1
+                        if sheet_example_count < max_examples_per_sheet:
+                            exceptions.append({
+                                "issue_type": "formula_gap",
+                                "sheet_name": sheet_name,
+                                "row": row_idx,
+                                "key": "",
+                                "header": header_by_col.get(col_idx, ""),
+                                "built_value": clean_text(value),
+                                "baseline_value": "formula expected",
+                                "detail": "Formula column is missing a formula on a populated data row.",
+                                "suspected_source_header": "",
+                            })
+                            sheet_example_count += 1
+
+            critical_fillable_blanks = 0
+            review_fillable_blanks = 0
+            possible_shifts = 0
+            top_blank_counts: Dict[str, int] = {}
+
+            for key, out_row in out_rows.items():
+                base_row = base_rows.get(key)
+                if not base_row:
+                    continue
+                key_text = " | ".join(key)
+
+                built_norm = {
+                    header: _embedded_normalize_compare_value(header, out_ws.cell(out_row, out_headers[header]).value)
+                    for header in protected_headers
+                    if out_headers[header] not in formula_cols
+                }
+                base_norm = {
+                    header: _embedded_normalize_compare_value(header, base_ws.cell(base_row, base_headers[header]).value)
+                    for header in protected_headers
+                    if out_headers[header] not in formula_cols
+                }
+
+                for header in common_headers:
+                    if out_headers[header] in formula_cols:
+                        continue
+                    built_raw = out_ws.cell(out_row, out_headers[header]).value
+                    base_raw = base_ws.cell(base_row, base_headers[header]).value
+                    built_value = _embedded_normalize_compare_value(header, built_raw)
+                    base_value = _embedded_normalize_compare_value(header, base_raw)
+
+                    if not built_value and base_value:
+                        top_blank_counts[header] = top_blank_counts.get(header, 0) + 1
+                        source_header = _embedded_possible_shift_header(sheet_name, header, base_norm, built_norm)
+                        if source_header:
+                            possible_shifts += 1
+                        if header in EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set()):
+                            critical_fillable_blanks += 1
+                            issue_type = "critical_blank"
+                        else:
+                            review_fillable_blanks += 1
+                            issue_type = "review_blank"
+                        if sheet_example_count < max_examples_per_sheet:
+                            exceptions.append({
+                                "issue_type": issue_type,
+                                "sheet_name": sheet_name,
+                                "row": out_row,
+                                "key": key_text,
+                                "header": header,
+                                "built_value": clean_text(built_raw),
+                                "baseline_value": clean_text(base_raw),
+                                "detail": "Built workbook is blank where baseline has a value.",
+                                "suspected_source_header": source_header,
+                            })
+                            sheet_example_count += 1
+                    elif header in EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set()) and base_value and built_value and base_value != built_value:
+                        source_header = _embedded_possible_shift_header(sheet_name, header, base_norm, built_norm)
+                        if source_header:
+                            possible_shifts += 1
+                            if sheet_example_count < max_examples_per_sheet:
+                                exceptions.append({
+                                    "issue_type": "possible_shift",
+                                    "sheet_name": sheet_name,
+                                    "row": out_row,
+                                    "key": key_text,
+                                    "header": header,
+                                    "built_value": clean_text(built_raw),
+                                    "baseline_value": clean_text(base_raw),
+                                    "detail": "Baseline value appears to be present in another protected column on the same row.",
+                                    "suspected_source_header": source_header,
+                                })
+                                sheet_example_count += 1
+
+            for item in dupes[:max(0, max_examples_per_sheet - sheet_example_count)]:
+                exceptions.append(item)
+
+            status = "pass"
+            if formula_gaps or critical_fillable_blanks or possible_shifts or dupes or out_blank_keys:
+                status = "fail"
+            elif review_fillable_blanks or built_only or baseline_only:
+                status = "review"
+
+            summaries.append({
+                "sheet_name": sheet_name,
+                "status": status,
+                "keys": ", ".join(chosen_keys),
+                "data_rows": out_data_rows,
+                "matched_rows": len(set(out_rows) & set(base_rows)),
+                "built_only_rows": len(built_only),
+                "baseline_only_rows": len(baseline_only),
+                "duplicate_key_rows": len(dupes),
+                "blank_key_rows": out_blank_keys,
+                "formula_gap_cells": formula_gaps,
+                "critical_fillable_blanks": critical_fillable_blanks,
+                "review_fillable_blanks": review_fillable_blanks,
+                "possible_shift_cells": possible_shifts,
+                "protected_headers_checked": len(protected_headers),
+                "top_fillable_blank_columns": [
+                    {"column": header, "count": count}
+                    for header, count in sorted(top_blank_counts.items(), key=lambda item: (-item[1], item[0]))[:15]
+                ],
+            })
+    finally:
+        if base_wb is not None:
+            try:
+                base_wb.close()
+            except Exception:
+                pass
+
+    return summaries, exceptions
+
+
+
+def _embedded_audit_col_letter(index: int) -> str:
+    out = ""
+    n = index
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
+
+def _embedded_auto_width(ws, widths: Dict[int, int], max_width: int = 50):
+    for col_idx, width in widths.items():
+        ws.column_dimensions[_embedded_audit_col_letter(col_idx)].width = min(max_width, max(10, width + 2))
+
+
+
+def _embedded_write_audit_sheets(wb, summary_rows: List[dict], exception_rows: List[dict]) -> None:
+    for name in ["QA Summary", "QA Exceptions"]:
+        if name in wb.sheetnames:
+            del wb[name]
+
+    ws = wb.create_sheet("QA Summary")
+    ws.freeze_panes = "A2"
+    summary_headers = [
+        "sheet_name", "status", "keys", "data_rows", "matched_rows", "built_only_rows",
+        "baseline_only_rows", "duplicate_key_rows", "blank_key_rows", "formula_gap_cells",
+        "critical_fillable_blanks", "review_fillable_blanks", "possible_shift_cells",
+        "protected_headers_checked", "top_fillable_blank_columns",
+    ]
+    widths = {i + 1: len(h) for i, h in enumerate(summary_headers)}
+    for col_idx, header in enumerate(summary_headers, start=1):
+        cell = ws.cell(1, col_idx, header)
+        cell.font = copy(EMBEDDED_AUDIT_HEADER_FONT)
+        cell.alignment = copy(EMBEDDED_AUDIT_WRAP_ALIGNMENT)
+    for row_idx, item in enumerate(summary_rows, start=2):
+        for col_idx, header in enumerate(summary_headers, start=1):
+            value = item.get(header, "")
+            if header == "top_fillable_blank_columns" and isinstance(value, list):
+                value = "; ".join(f"{x.get('column')}: {x.get('count')}" for x in value)
+            cell = ws.cell(row_idx, col_idx, value)
+            cell.font = copy(EMBEDDED_AUDIT_BODY_FONT)
+            cell.alignment = copy(EMBEDDED_AUDIT_WRAP_ALIGNMENT)
+            widths[col_idx] = max(widths[col_idx], len(str(value)) if value is not None else 0)
+    _embedded_auto_width(ws, widths)
+
+    ex = wb.create_sheet("QA Exceptions")
+    ex.freeze_panes = "A2"
+    exception_headers = [
+        "issue_type", "sheet_name", "row", "key", "header", "built_value",
+        "baseline_value", "detail", "suspected_source_header",
+    ]
+    widths = {i + 1: len(h) for i, h in enumerate(exception_headers)}
+    for col_idx, header in enumerate(exception_headers, start=1):
+        cell = ex.cell(1, col_idx, header)
+        cell.font = copy(EMBEDDED_AUDIT_HEADER_FONT)
+        cell.alignment = copy(EMBEDDED_AUDIT_WRAP_ALIGNMENT)
+    for row_idx, item in enumerate(exception_rows, start=2):
+        for col_idx, header in enumerate(exception_headers, start=1):
+            value = item.get(header, "")
+            cell = ex.cell(row_idx, col_idx, value)
+            cell.font = copy(EMBEDDED_AUDIT_BODY_FONT)
+            cell.alignment = copy(EMBEDDED_AUDIT_WRAP_ALIGNMENT)
+            widths[col_idx] = max(widths[col_idx], len(str(value)) if value is not None else 0)
+    _embedded_auto_width(ex, widths, max_width=60)
+
+
+
+def _embedded_audit_diagnostic_lines(summary_rows: List[dict]) -> List[str]:
+    lines: List[str] = []
+    for item in summary_rows:
+        status = str(item.get("status", "")).upper()
+        lines.append(
+            f"QA {item.get('sheet_name')}: {status} | "
+            f"critical blanks={int(item.get('critical_fillable_blanks', 0)):,}, "
+            f"review blanks={int(item.get('review_fillable_blanks', 0)):,}, "
+            f"possible shifts={int(item.get('possible_shift_cells', 0)):,}, "
+            f"formula gaps={int(item.get('formula_gap_cells', 0)):,}, "
+            f"duplicate keys={int(item.get('duplicate_key_rows', 0)):,}"
+        )
+    return lines
+
+
+
+def _embedded_workbook_needs_attention(summary_rows: List[dict]) -> bool:
+    for item in summary_rows:
+        if str(item.get("status", "")).lower() in {"fail", "review"}:
+            return True
+    return False
+
+
+if not POSTBUILD_AUDIT_AVAILABLE or audit_openpyxl_workbook is None or write_audit_sheets is None or audit_diagnostic_lines is None or workbook_needs_attention is None:
+    audit_openpyxl_workbook = _embedded_audit_openpyxl_workbook
+    write_audit_sheets = _embedded_write_audit_sheets
+    audit_diagnostic_lines = _embedded_audit_diagnostic_lines
+    workbook_needs_attention = _embedded_workbook_needs_attention
+    POSTBUILD_AUDIT_AVAILABLE = True
+    if POSTBUILD_AUDIT_IMPORT_ERROR:
+        POSTBUILD_AUDIT_IMPORT_ERROR = f"{POSTBUILD_AUDIT_IMPORT_ERROR}; embedded fallback activated"
+    else:
+        POSTBUILD_AUDIT_IMPORT_ERROR = "embedded fallback activated"
+
 def _audit_fillable_blank_totals(audit_summary: Sequence[dict]) -> Tuple[int, int, int]:
     critical = sum(int(item.get("critical_fillable_blanks", 0) or 0) for item in audit_summary)
     review = sum(int(item.get("review_fillable_blanks", 0) or 0) for item in audit_summary)
