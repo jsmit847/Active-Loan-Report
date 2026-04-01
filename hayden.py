@@ -2797,7 +2797,7 @@ def _best_header_read_excel(
     file_bytes: bytes,
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
-    max_header_scan: int = 8,
+    max_header_scan: int = 15,
 ):
     xls = pd.ExcelFile(BytesIO(file_bytes))
     sheet_names = list(xls.sheet_names)
@@ -2816,6 +2816,7 @@ def _best_header_read_excel(
 
     best = None
     best_score = -1
+    best_debug = None
 
     for sheet in ordered:
         for header_row in range(max_header_scan):
@@ -2825,20 +2826,29 @@ def _best_header_read_excel(
                 if df.empty:
                     continue
                 df.columns = [str(c).strip() for c in df.columns]
-                score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+                matched = [first_matching_col(df, aliases) for aliases in required_alias_groups]
+                score = sum(m is not None for m in matched)
                 if score > best_score:
                     best_score = score
                     best = (df, sheet, header_row, score)
+                    best_debug = {
+                        "sheet": sheet,
+                        "header_row": header_row,
+                        "columns": list(df.columns)[:20],
+                        "matched": matched,
+                    }
+                if score == len(required_alias_groups):
+                    return best
             except Exception:
                 continue
 
     if best is None or best_score <= 0:
-        raise ValueError("Could not find a matching header row.")
+        raise ValueError(f"Could not find a matching header row. Sheets scanned: {sheet_names}")
 
     return best
 
 
-def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 3):
+def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 6):
     best = None
     best_score = -1
 
@@ -2849,10 +2859,13 @@ def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[st
             if df.empty:
                 continue
             df.columns = [str(c).strip() for c in df.columns]
-            score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+            matched = [first_matching_col(df, aliases) for aliases in required_alias_groups]
+            score = sum(m is not None for m in matched)
             if score > best_score:
                 best_score = score
                 best = (df, header_row, score)
+            if score == len(required_alias_groups):
+                return best
         except Exception:
             continue
 
@@ -3008,8 +3021,9 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     if servicer_type == "FCI":
         df, _sheet, _hdr, _score = _best_header_read_excel(
             b,
-            [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
+            [["Account", "Loan Number", "Loan No", "Account Number", "Acct", "Acct #", "Servicer Loan ID", "Servicer Loan Number"], ["Current Balance", "Current UPB", "UPB", "Principal Balance", "Balance", "Principal", "Principal Bal", "Current Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
+            max_header_scan=15,
         )
         servicer = fci_servicer_label_from_filename(filename)
         out = pd.DataFrame(
@@ -3017,8 +3031,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "source_file": filename,
                 "servicer": servicer,
                 "servicer_family": "fci",
-                "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No"]),
-                "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance"]),
+                "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No", "Account Number", "Acct", "Acct #", "Servicer Loan ID", "Servicer Loan Number"]),
+                "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance", "Balance", "Principal", "Principal Bal", "Current Principal Balance"]),
                 "suspense": _series_to_num(df, ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"]),
                 "next_payment_date": _series_to_dt(df, ["Next Due Date", "Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Maturity Date", "Current Maturity Date"]),
@@ -3072,7 +3086,14 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
     file_dates: List[date] = []
 
     for blob in blobs:
-        parsed = parse_servicer_cached(blob)
+        try:
+            parsed = parse_servicer_cached(blob)
+        except Exception as exc:
+            try:
+                st.warning(f"Skipping servicer file {blob.filename}: {exc}")
+            except Exception:
+                pass
+            continue
         if parsed.empty:
             continue
         frames.append(parsed)
