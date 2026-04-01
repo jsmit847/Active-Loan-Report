@@ -728,9 +728,39 @@ def blankish_mask(s: pd.Series) -> pd.Series:
     return base.isna() | s_text.isin(["", "nan", "none", "<na>", "nat"])
 
 
+def _series_like(value, index: pd.Index) -> pd.Series:
+    if isinstance(value, pd.DataFrame):
+        if value.shape[1] == 0:
+            return pd.Series([pd.NA] * len(index), index=index, dtype="object")
+        value = value.iloc[:, 0]
+    if isinstance(value, pd.Series):
+        return value.reindex(index)
+    if np.isscalar(value) or value is None:
+        return pd.Series([value] * len(index), index=index, dtype="object")
+    try:
+        seq = list(value)
+    except Exception:
+        return pd.Series([value] * len(index), index=index, dtype="object")
+    if len(seq) == len(index):
+        return pd.Series(seq, index=index)
+    out = pd.Series([pd.NA] * len(index), index=index, dtype="object")
+    n = min(len(seq), len(index))
+    if n:
+        out.iloc[:n] = seq[:n]
+    return out
+
+
 def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series:
-    p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index)
-    f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index)
+    if isinstance(primary, pd.Series):
+        index = primary.index
+    elif isinstance(fallback, pd.Series):
+        index = fallback.index
+    else:
+        plen = len(primary) if hasattr(primary, "__len__") and not np.isscalar(primary) else 1
+        flen = len(fallback) if hasattr(fallback, "__len__") and not np.isscalar(fallback) else 1
+        index = pd.RangeIndex(max(plen, flen))
+    p = _series_like(primary, index)
+    f = _series_like(fallback, index)
     return p.where(~blankish_mask(p), f)
 
 
@@ -4426,6 +4456,7 @@ def build_bridge_loan(
         ba = bridge_asset.copy()
         active_bridge_deals = set(ba["_deal_key"].dropna().tolist())
         out = out[out["_deal_key"].isin(active_bridge_deals)].copy()
+        blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
         ba = ba[ba["_deal_key"].isin(active_bridge_deals)].copy()
         g = ba.groupby("_deal_key", dropna=True)
 
