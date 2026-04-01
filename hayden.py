@@ -4346,17 +4346,20 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
 
+    upb_num = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     meaningful_mask = (
         out["_deal_key"].notna()
         & out["_asset_key"].notna()
         & (
             (~blankish_mask(out.get("Address", pd.Series([pd.NA] * len(out), index=out.index))))
             | pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
-            | pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).ne(0)
+            | upb_num.fillna(0).gt(0)
             | pd.to_numeric(out.get("As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
         )
     )
     out = out.loc[meaningful_mask].copy()
+    if upb_col in out.columns:
+        out = out[pd.to_numeric(out[upb_col], errors="coerce").fillna(0).gt(0)].copy()
 
     return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
@@ -4421,6 +4424,9 @@ def build_bridge_loan(
 
     if bridge_asset is not None and not bridge_asset.empty:
         ba = bridge_asset.copy()
+        active_bridge_deals = set(ba["_deal_key"].dropna().tolist())
+        out = out[out["_deal_key"].isin(active_bridge_deals)].copy()
+        ba = ba[ba["_deal_key"].isin(active_bridge_deals)].copy()
         g = ba.groupby("_deal_key", dropna=True)
 
         def _first(series: pd.Series):
@@ -4802,6 +4808,15 @@ def _trim_sheet_body_rows(ws, row_count: int, start_row: int = 5):
         ws.delete_rows(keep_last + 1, ws.max_row - keep_last)
 
 
+def _reset_sheet_autofilter(ws, header_tuples: List[Tuple[int, str]], row_count: int, header_row: int = 4, start_row: int = 5):
+    if not header_tuples:
+        return
+    first_col = min(c for c, _h in header_tuples)
+    last_col = max(c for c, _h in header_tuples)
+    last_row = max(header_row, start_row + max(row_count, 1) - 1)
+    ws.auto_filter.ref = f"{get_column_letter(first_col)}{header_row}:{get_column_letter(last_col)}{last_row}"
+
+
 def _excel_safe_value(val):
     if val is None or val is pd.NA:
         return None
@@ -4967,6 +4982,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=5)
     _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
     _trim_sheet_body_rows(ws, row_count=max(len(df), 1), start_row=5)
+    _reset_sheet_autofilter(ws, hdr, row_count=max(len(df), 1), header_row=4, start_row=5)
 
 
 def _normalize_sheet_key_value(header: str, value) -> str:
@@ -6029,18 +6045,15 @@ if build_btn:
                 if term_loan_backfill and term_loan_backfill.get("fills"):
                     diagnostics.append(f"Term Loan baseline backfill cells: {int(term_loan_backfill['fills']):,} using {term_loan_backfill.get('keys', 'n/a')}")
 
-                diagnostics.append(f"Term Loan rows: {len(term_loan_df):,}")
+                diagnostics.append(f"Term Loan rows (pre-asset filter): {len(term_loan_df):,}")
                 diagnostics.append(
                     f"Term Loan nonblank {upb_col}: {term_loan_df[upb_col].notna().mean():.1%}"
                     if upb_col in term_loan_df.columns
                     else f"Term Loan nonblank {upb_col}: n/a"
                 )
 
-                if build_target in ("Term Loan", "All"):
-                    status.update(label="Writing Term Loan sheet...")
-                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
-
-                if need_term_asset:
+                term_asset_df = None
+                if need_term_asset or build_target in ("Term Loan", "All"):
                     term_deal_numbers = [d for d in _nonblank_unique(term_loan_df["Deal Number"].tolist()) if clean_text(d).upper() != "N/A"] if "Deal Number" in term_loan_df.columns else []
 
                     status.update(label="Pulling term asset data from Salesforce...")
@@ -6052,11 +6065,23 @@ if build_btn:
                     if term_asset_backfill and term_asset_backfill.get("fills"):
                         diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
 
-                    status.update(label="Writing Term Asset sheet...")
-                    write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
-                    del term_deal_numbers, term_asset_source, term_asset_df
+                    if term_asset_df is not None and not term_asset_df.empty:
+                        term_asset_df["_deal_key"] = norm_id_series(term_asset_df.get("Deal Number", pd.Series([None] * len(term_asset_df), index=term_asset_df.index)))
+                        valid_term_deals = set(term_asset_df["_deal_key"].dropna().tolist())
+                        term_loan_df["_deal_key"] = norm_id_series(term_loan_df.get("Deal Number", pd.Series([None] * len(term_loan_df), index=term_loan_df.index)))
+                        term_loan_df = term_loan_df[term_loan_df["_deal_key"].isin(valid_term_deals)].copy()
+                        diagnostics.append(f"Term Loan rows (post-asset UPB filter): {len(term_loan_df):,}")
 
-                del term_wide, term_loan_df
+                    if need_term_asset:
+                        status.update(label="Writing Term Asset sheet...")
+                        write_output_sheet(wb, "Term Asset", term_asset_df if term_asset_df is not None else pd.DataFrame(), upb_col)
+                    del term_deal_numbers, term_asset_source
+
+                if build_target in ("Term Loan", "All"):
+                    status.update(label="Writing Term Loan sheet...")
+                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
+
+                del term_wide, term_loan_df, term_asset_df
                 gc.collect()
 
             del sf_am, sf_active_rm, serv_join, serv_preview
