@@ -940,7 +940,7 @@ def _soql_quote(v: str) -> str:
 def _soql_in(field: str, values) -> str:
     vals = [v for v in values if v is not None and str(v).strip() != ""]
     if not vals:
-        return "1 = 1"
+        return "Id != NULL"
     return f"{field} IN ({', '.join(_soql_quote(v) for v in vals)})"
 
 
@@ -1519,12 +1519,15 @@ def _recordtype_name_expr(alias_prefix: str = "") -> str:
     return f"{alias_prefix}RecordType.Name" if alias_prefix else "RecordType.Name"
 
 def _lower_in_condition(field_expr: str, values: Sequence[str]) -> str:
-    vals = "(" + ", ".join(_soql_text(str(x).lower()) for x in values) + ")"
-    return f"({field_expr} != NULL AND LOWER({field_expr}) IN {vals})"
+    vals = [v for v in values if v is not None and str(v).strip() != ""]
+    if not vals:
+        return "Id != NULL"
+    return f"({field_expr} != NULL AND {field_expr} IN ({', '.join(_soql_text(str(x)) for x in vals)}))"
 
 def _lower_contains_condition(field_expr: str, values: Sequence[str]) -> str:
-    contains_parts = [f"LOWER({field_expr}) LIKE '%{str(x).lower().replace(chr(39), chr(92)+chr(39))}%'" for x in values]
-    return "(" + " OR ".join(contains_parts) + ")" if contains_parts else "FALSE"
+    vals = [v for v in values if v is not None and str(v).strip() != ""]
+    contains_parts = [f"{field_expr} LIKE '%{str(x).replace(chr(39), chr(92)+chr(39))}%'" for x in vals]
+    return "(" + " OR ".join(contains_parts) + ")" if contains_parts else "Id != NULL"
 
 def _bridge_dealtype_condition(alias_prefix: str = "") -> str:
     expr = f"{alias_prefix}Type" if alias_prefix else "Type"
@@ -1536,12 +1539,17 @@ def _term_dealtype_condition(alias_prefix: str = "") -> str:
     expr = f"{alias_prefix}Type" if alias_prefix else "Type"
     return _lower_in_condition(expr, TERM_TYPES)
 
-def _opportunity_status_active_condition(alias_prefix: str = "") -> str:
+def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str]:
     field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
     if not field_api:
-        return "1 = 1"
+        return None
     field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
     return f"{field_expr} = {_soql_text(LOAN_ACTIVE_STATUS)}"
+
+def _append_clause_if_present(parts: List[str], clause: Optional[str]) -> List[str]:
+    if clause and str(clause).strip():
+        parts.append(clause)
+    return parts
 
 def _bridge_recordtype_condition(alias_prefix: str = "") -> str:
     return _bridge_dealtype_condition(alias_prefix)
@@ -1686,12 +1694,12 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     where_parts = [
         f"{opp_rel}.Deal_Loan_Number__c != NULL",
         _soql_in(f"{opp_rel}.StageName", BRIDGE_ACTIVE_STAGES),
-        _opportunity_status_active_condition(f"{opp_rel}."),
         _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
         "Asset_ID__c != NULL",
     ]
+    _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
     soql = (
         "SELECT "
@@ -1814,10 +1822,10 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
     where_parts = [
         "Deal_Loan_Number__c != NULL",
         _soql_in("StageName", BRIDGE_LOAN_SOURCE_STAGES),
-        _opportunity_status_active_condition(),
         _bridge_dealtype_condition(),
         _soql_not_equal_or_null("LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
     ]
+    _append_clause_if_present(where_parts, _opportunity_status_active_condition())
 
     soql = "SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Opportunity WHERE " + " AND ".join(where_parts)
     df = run_bulk_query(soql, rename_map=rename_map)
@@ -1860,10 +1868,10 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
     where_parts = [
         f"{opp_rel}.Deal_Loan_Number__c != NULL",
         _soql_in(f"{opp_rel}.StageName", BRIDGE_LOAN_SOURCE_STAGES),
-        _opportunity_status_active_condition(f"{opp_rel}."),
         _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
     ]
+    _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
     soql = (
         "SELECT "
@@ -1902,13 +1910,16 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
 
 
 def _build_do_not_lend_like() -> pd.DataFrame:
+    where_parts = [
+        "Account.Do_Not_Lend__c = TRUE",
+        _soql_in("StageName", DNL_STAGES),
+        "Deal_Loan_Number__c != NULL",
+    ]
+    _append_clause_if_present(where_parts, _opportunity_status_active_condition())
     soql = (
         "SELECT Deal_Loan_Number__c, Account.Name, Account.Do_Not_Lend__c "
         "FROM Opportunity WHERE "
-        "Account.Do_Not_Lend__c = TRUE "
-        f"AND {_soql_in('StageName', DNL_STAGES)} "
-        f"AND {_opportunity_status_active_condition()} "
-        "AND Deal_Loan_Number__c != NULL"
+        + " AND ".join(where_parts)
     )
     df = run_bulk_query(soql)
     rename_map = {
@@ -2226,16 +2237,19 @@ def _build_term_wide_like() -> pd.DataFrame:
 
     rename_map = {expr: label for label, expr in select_pairs}
 
+    where_parts = [
+        "Deal_Loan_Number__c != NULL",
+        "Probability > 0",
+        _term_dealtype_condition(),
+        _soql_in("StageName", TERM_ACTIVE_STAGES),
+    ]
+    _append_clause_if_present(where_parts, _opportunity_status_active_condition())
+
     soql = (
         "SELECT "
         + ", ".join(expr for _label, expr in select_pairs)
         + " FROM Opportunity WHERE "
-        "Deal_Loan_Number__c != NULL AND Probability > 0 AND "
-        + _term_dealtype_condition()
-        + " AND "
-        + _opportunity_status_active_condition()
-        + " AND "
-        + _soql_in("StageName", TERM_ACTIVE_STAGES)
+        + " AND ".join(where_parts)
     )
 
     term_df = run_bulk_query(soql, rename_map=rename_map)
