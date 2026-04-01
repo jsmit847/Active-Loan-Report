@@ -66,8 +66,11 @@ BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan", "Single Asset Bridge Loan"]
 BRIDGE_TYPE_CONTAINS = ["SAB", "Single Asset Bridge"]
 TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
+TERM_TYPE_CONTAINS = ["DSCR", "Term"]
 LOAN_ACTIVE_STATUS = "Active"
+LOAN_PAID_OFF_STATUS = "Paid Off"
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
+TERM_ALWAYS_INCLUDE_DEALS = {"43422", "43462"}
 
 DNL_STAGES = [
     "Closed Won", "Purchased", "Brokered- Closed Won", "Expired", "Matured",
@@ -691,8 +694,18 @@ def clean_text(val) -> str:
         return ""
     return s
 
-def strip_statebridge_display_id(servicer_id, servicer_name):
+def _clean_servicer_id_display_text(servicer_id):
     sid = clean_text(servicer_id)
+    if not sid:
+        return pd.NA
+    sid = sid.replace(",", "").strip()
+    if re.fullmatch(r"[-+]?\d+\.0+", sid):
+        sid = sid.split(".", 1)[0]
+    return sid or pd.NA
+
+def strip_statebridge_display_id(servicer_id, servicer_name):
+    sid = _clean_servicer_id_display_text(servicer_id)
+    sid = clean_text(sid)
     if not sid:
         return pd.NA
     serv = clean_text(servicer_name).lower()
@@ -1537,7 +1550,9 @@ def _bridge_dealtype_condition(alias_prefix: str = "") -> str:
 
 def _term_dealtype_condition(alias_prefix: str = "") -> str:
     expr = f"{alias_prefix}Type" if alias_prefix else "Type"
-    return _lower_in_condition(expr, TERM_TYPES)
+    exact_cond = _lower_in_condition(expr, TERM_TYPES)
+    contains_cond = _lower_contains_condition(expr, TERM_TYPE_CONTAINS)
+    return f"({exact_cond} OR {contains_cond})"
 
 def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str]:
     field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
@@ -1545,6 +1560,15 @@ def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str
         return None
     field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
     return f"{field_expr} = {_soql_text(LOAN_ACTIVE_STATUS)}"
+
+def _opportunity_not_paid_off_condition(alias_prefix: str = "") -> str:
+    stage_expr = f"{alias_prefix}StageName" if alias_prefix else "StageName"
+    clauses = [f"({stage_expr} = NULL OR {stage_expr} != {_soql_text(LOAN_PAID_OFF_STATUS)})"]
+    field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
+    if field_api:
+        field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
+        clauses.append(f"({field_expr} = NULL OR {field_expr} != {_soql_text(LOAN_PAID_OFF_STATUS)})")
+    return " AND ".join(clauses)
 
 def _append_clause_if_present(parts: List[str], clause: Optional[str]) -> List[str]:
     if clause and str(clause).strip():
@@ -1698,6 +1722,7 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
         "Asset_ID__c != NULL",
+        _opportunity_not_paid_off_condition(f"{opp_rel}."),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
@@ -1824,6 +1849,7 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
         _soql_in("StageName", BRIDGE_LOAN_SOURCE_STAGES),
         _bridge_dealtype_condition(),
         _soql_not_equal_or_null("LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+        _opportunity_not_paid_off_condition(),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition())
 
@@ -1870,6 +1896,7 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
         _soql_in(f"{opp_rel}.StageName", BRIDGE_LOAN_SOURCE_STAGES),
         _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
+        _opportunity_not_paid_off_condition(f"{opp_rel}."),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
@@ -2242,6 +2269,7 @@ def _build_term_wide_like() -> pd.DataFrame:
         "Probability > 0",
         _term_dealtype_condition(),
         _soql_in("StageName", TERM_ACTIVE_STAGES),
+        _opportunity_not_paid_off_condition(),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition())
 
@@ -2776,20 +2804,34 @@ def _filter_term_population(
         return sf_term
 
     out = sf_term.copy()
+    prev_keys = prev_keys or set()
+    prev_positive_keys = prev_positive_keys or set()
     prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
-    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
     stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
+    stage_lower = stage.str.lower()
     current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
     sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
+    loan_type = out.get("Type", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip().str.lower()
 
     sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
-    is_closed_won = stage.eq("Closed Won")
-    is_sold = stage.eq("Sold")
-    is_expired_or_matured = stage.isin(EXPIRED_OR_MATURED_STAGES)
+    in_prev = out["_deal_key"].isin(prev_keys)
+    in_prev_positive = out["_deal_key"].isin(prev_positive_keys)
+    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
+    always_include = out["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)
 
-    keep_mask = is_closed_won | (is_expired_or_matured & current_upb.gt(0)) | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
+    valid_stage = stage.isin(TERM_ACTIVE_STAGES)
+    not_paid_off = ~stage_lower.eq("paid off")
+    is_dscr = loan_type.str.contains("dscr", na=False)
+
+    keep_core = valid_stage & not_paid_off & (
+        stage.eq("Active")
+        | stage.eq("Closed Won")
+        | (stage.isin(EXPIRED_OR_MATURED_STAGES) & (current_upb.gt(0) | in_prev_positive))
+        | (stage.eq("Sold") & (sold_servicing_retained | in_prev_sold_retained | current_upb.gt(0)))
+    )
+    keep_mask = keep_core | (valid_stage & not_paid_off & is_dscr) | in_prev | always_include
     return out.loc[keep_mask].copy()
 
 
@@ -4889,6 +4931,18 @@ def write_df_to_sheet_preserve_formulas(
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
 
+def _drop_effectively_blank_output_rows(df: pd.DataFrame, candidate_headers: Sequence[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    usable = [h for h in candidate_headers if h in df.columns]
+    if not usable:
+        return df.reset_index(drop=True)
+    keep_mask = pd.Series(False, index=df.index)
+    for col in usable:
+        keep_mask = keep_mask | (~blankish_mask(df[col]))
+    return df.loc[keep_mask].reset_index(drop=True).copy()
+
+
 def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     if sheet_name not in wb.sheetnames:
         return
@@ -4896,6 +4950,8 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    non_formula_headers = [header for col_idx, header in hdr if col_idx not in fcols]
+    df = _drop_effectively_blank_output_rows(df, non_formula_headers)
 
     if sheet_name == "Term Asset":
         force_write_headers = {upb_col, "Special (Y/N)"}
@@ -4917,6 +4973,7 @@ def _normalize_sheet_key_value(header: str, value) -> str:
     txt = clean_text(value)
     if not txt:
         return ""
+    txt = clean_text(_clean_servicer_id_display_text(txt) if header == "Servicer ID" else txt)
     txt = re.sub(r"\.0$", "", txt)
     if header == "Servicer ID":
         txt = re.sub(r"[^0-9A-Za-z]", "", txt).lstrip("0")
