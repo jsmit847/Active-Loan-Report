@@ -6139,9 +6139,13 @@ if build_btn:
                 if audit_diagnostic_lines is not None and audit_summary:
                     diagnostics.extend(audit_diagnostic_lines(audit_summary))
                 if not zero_blank_ok:
-                    raise ValueError(
+                    diagnostics.append(
                         "Zero-blank enforcement could not eliminate all fillable blanks. "
-                        "Use a completed workbook from the immediately prior run as the carry-forward baseline and rerun the build."
+                        "Workbook was still generated; review QA Summary / QA Exceptions and use the immediately prior completed workbook as the carry-forward baseline on the next run."
+                    )
+                    st.warning(
+                        "Zero-blank enforcement could not eliminate all fillable blanks. "
+                        "The workbook will still be saved, but you should review QA Summary / QA Exceptions and use the immediately prior completed workbook as the carry-forward baseline on the next run."
                     )
                 if any(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary):
                     diagnostics.append("Blank enforcement passed, but possible shifted values were still detected. Review the QA Exceptions tab before weekly use.")
