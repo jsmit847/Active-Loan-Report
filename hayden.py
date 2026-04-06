@@ -52,7 +52,7 @@ TEMPLATE_FILENAMES = (
 )
 API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
-BULK_WAIT_TIMEOUT_SECONDS = 600
+BULK_WAIT_TIMEOUT_SECONDS = 300
 OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
 ENFORCE_ZERO_FILLABLE_BLANKS = True
 ZERO_BLANK_MAX_ROUNDS = 4
@@ -3082,9 +3082,14 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
     blobs: List[UploadBlob] = [make_upload_blob(u) for u in servicer_uploads]
     frames: List[pd.DataFrame] = []
     file_dates: List[date] = []
+    skipped_files: List[str] = []
 
     for blob in blobs:
-        parsed = parse_servicer_cached(blob)
+        try:
+            parsed = parse_servicer_cached(blob)
+        except Exception as e:
+            skipped_files.append(f"{blob.filename}: {e}")
+            continue
         if parsed.empty:
             continue
         frames.append(parsed)
@@ -3096,6 +3101,12 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
         if d:
             file_dates.append(d)
+
+    if skipped_files:
+        try:
+            st.warning("Skipped servicer file(s): " + " | ".join(skipped_files))
+        except Exception:
+            pass
 
     full = (
         pd.concat(frames, ignore_index=True, copy=False)
@@ -5737,8 +5748,7 @@ Welcome! This tool builds the **Active Loans** workbook using **Salesforce Bulk 
 1) Log in to **Salesforce**
 2) Upload the **current servicer files** or skip them
 3) (Optional) Upload **last week’s / completed Active Loans report** for carry-forward
-4) (Optional) Upload **CV NPL / REO workbook**
-5) Choose **which sheet to build** or **All**
+4) Choose **which sheet to build** or **All**
 
 ### UPB header
 Always uses today's date (ET): **{run_dt.isoformat()}** → **{upb_col}**
@@ -5759,7 +5769,7 @@ except Exception as e:
 
 st.caption(
     "This merged version uses your repo template by default, can use the uploaded completed report as the build base, "
-    "adds NPL/REO flag integration, uses Midland / FCI / Berkadia as the term active-loan spine when available, "
+    "uses Midland / FCI / Berkadia as the term active-loan spine when available, "
     "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, keeps row-level Salesforce Servicer IDs intact, "
     "runs both dataframe-level and workbook-level blank repair against the uploaded known-good report when you provide one, "
     "and writes QA Summary / QA Exceptions tabs after the build when the post-build audit helper is available."
@@ -5787,11 +5797,6 @@ with col_b:
         type=["csv", "xlsx"],
         accept_multiple_files=True,
     )
-
-npl_reo_upload = st.file_uploader(
-    "Upload CV NPL / REO workbook (.xlsx) (optional)",
-    type=["xlsx"],
-)
 
 st.markdown("### Step 3: Build options")
 skip_servicer_files = st.checkbox(
@@ -5839,10 +5844,6 @@ if build_btn:
             if prev_upload:
                 status.update(label="Reading uploaded completed report for carry-forward...")
                 prev_maps = build_prev_maps(prev_bytes)
-
-            if npl_reo_upload is not None:
-                status.update(label="Reading CV NPL / REO workbook...")
-                npl_maps = parse_npl_reo_bytes(npl_reo_upload.getvalue())
 
             if skip_servicer_files:
                 serv_join = pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of", "_sid_key"])
