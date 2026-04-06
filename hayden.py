@@ -4267,7 +4267,36 @@ def build_term_loan(
     prev_sold_retained_keys = _prev_term_sold_retained_keys(prev_maps)
     sf_term_active = _filter_term_population(sf_term, prev_keys=prev_keys, prev_positive_keys=prev_positive_keys, prev_sold_retained_keys=prev_sold_retained_keys)
 
+    # Absolute protection for must-keep Term deals. These must survive every filter revision.
+    sf_term_force = sf_term.copy() if sf_term is not None else pd.DataFrame()
+    if not sf_term_force.empty:
+        sf_term_force["_deal_key"] = norm_id_series(
+            sf_term_force.get("Deal Loan Number", pd.Series([None] * len(sf_term_force), index=sf_term_force.index))
+        )
+        sf_term_force = sf_term_force[sf_term_force["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)].copy()
+        if not sf_term_force.empty:
+            sf_term_active = pd.concat([sf_term_active, sf_term_force], ignore_index=True)
+            if "Deal Loan Number" in sf_term_active.columns:
+                sf_term_active["_deal_key"] = norm_id_series(
+                    sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index))
+                )
+                sf_term_active = sf_term_active.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first").drop(columns=["_deal_key"], errors="ignore")
+
     out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
+
+    # If the normal path still fails to emit an always-include deal, build and append it explicitly.
+    if (out is None or out.empty) and not sf_term_force.empty:
+        out = _build_term_loan_salesforce_fallback(sf_term_force, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
+    elif not sf_term_force.empty:
+        out = out.copy()
+        out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
+        missing_force = set(TERM_ALWAYS_INCLUDE_DEALS) - set(out["_deal_key"].dropna().tolist())
+        if missing_force:
+            sf_term_force_missing = sf_term_force[sf_term_force["_deal_key"].isin(missing_force)].copy()
+            forced_rows = _build_term_loan_salesforce_fallback(sf_term_force_missing, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
+            if forced_rows is not None and not forced_rows.empty:
+                out = pd.concat([out.drop(columns=["_deal_key"], errors="ignore"), forced_rows], ignore_index=True)
+
     if out.empty:
         return out
 
@@ -4330,6 +4359,19 @@ def build_term_loan(
     stage_series = sf_term_active.set_index(norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([], dtype='object')))) if False else None
     # Final keep rule stays aligned to active stages and excludes Paid Off by construction.
     out = out[out["_deal_key"].notna()].copy()
+    if not out.empty:
+        out = out.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first")
+        missing_force = set(TERM_ALWAYS_INCLUDE_DEALS) - set(out["_deal_key"].dropna().tolist())
+        if missing_force and sf_term is not None and not sf_term.empty:
+            sf_force_final = sf_term.copy()
+            sf_force_final["_deal_key"] = norm_id_series(sf_force_final.get("Deal Loan Number", pd.Series([None] * len(sf_force_final), index=sf_force_final.index)))
+            sf_force_final = sf_force_final[sf_force_final["_deal_key"].isin(missing_force)].copy()
+            if not sf_force_final.empty:
+                forced_rows = _build_term_loan_salesforce_fallback(sf_force_final, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
+                if forced_rows is not None and not forced_rows.empty:
+                    forced_rows["_deal_key"] = norm_id_series(forced_rows.get("Deal Number", pd.Series([None] * len(forced_rows), index=forced_rows.index)))
+                    out = pd.concat([out, forced_rows], ignore_index=True)
+                    out = out.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first")
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
