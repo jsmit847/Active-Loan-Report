@@ -85,6 +85,7 @@ TERM_RECORDTYPE_NAMES = {"term loan", "dscr"}
 BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single asset bridge loan"}
 BRIDGE_RT_CONTAINS = {"sab", "single asset bridge"}
 TERM_DSCR_TYPES = {"DSCR", "Investor DSCR"}
+TERM_ALWAYS_INCLUDE_DEALS = {"43422", "43462"}
 TERM_SPINE_SERVICER_FAMILIES = {"midland", "fci", "berkadia"}
 TERM_SOLD_SERVICING_RETAINED_SEGMENT = "Sold Servicing Retained"
 TERM_SOLD_RETAINED_SEGMENT_VALUES = {
