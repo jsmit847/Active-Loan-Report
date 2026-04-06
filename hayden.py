@@ -3354,6 +3354,14 @@ SHEET_BASELINE_KEY_CANDIDATES = {
 }
 
 
+SHEET_REQUIRED_KEY_HEADERS = {
+    "Bridge Asset": ["Deal Number", "Asset ID"],
+    "Bridge Loan": ["Deal Number"],
+    "Term Loan": ["Deal Number"],
+    "Term Asset": ["Deal Number", "Asset ID"],
+}
+
+
 def _backfill_rule_candidates(sheet_name: str) -> List[List[str]]:
     return [list(x) for x in SHEET_BASELINE_KEY_CANDIDATES.get(sheet_name, [])]
 
@@ -4388,8 +4396,16 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         )
     )
     out = out.loc[meaningful_mask].copy()
+    retained_deals: Set[str] = set()
+    if "Segment" in tl.columns:
+        retained_mask = _term_segment_is_sold_servicing_retained(tl["Segment"])
+        retained_deals = set(tl.loc[retained_mask, "_deal_key"].dropna().tolist())
+
     if upb_col in out.columns:
-        out = out[pd.to_numeric(out[upb_col], errors="coerce").fillna(0).gt(0)].copy()
+        upb_mask = pd.to_numeric(out[upb_col], errors="coerce").fillna(0).gt(0)
+        retained_mask = out["_deal_key"].isin(retained_deals)
+        always_mask = out["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)
+        out = out[upb_mask | retained_mask | always_mask].copy()
 
     return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
@@ -4977,6 +4993,18 @@ def write_df_to_sheet_preserve_formulas(
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
 
+def _drop_rows_missing_required_keys(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    required = [h for h in SHEET_REQUIRED_KEY_HEADERS.get(sheet_name, []) if h in df.columns]
+    if not required:
+        return df.reset_index(drop=True).copy()
+    keep_mask = pd.Series(True, index=df.index)
+    for header in required:
+        keep_mask = keep_mask & (~blankish_mask(df[header]))
+    return df.loc[keep_mask].reset_index(drop=True).copy()
+
+
 def _drop_effectively_blank_output_rows(df: pd.DataFrame, candidate_headers: Sequence[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -4997,6 +5025,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
     non_formula_headers = [header for col_idx, header in hdr if col_idx not in fcols]
+    df = _drop_rows_missing_required_keys(sheet_name, df)
     df = _drop_effectively_blank_output_rows(df, non_formula_headers)
 
     if sheet_name == "Term Asset":
@@ -6100,6 +6129,13 @@ if build_btn:
                         term_asset_df["_deal_key"] = norm_id_series(term_asset_df.get("Deal Number", pd.Series([None] * len(term_asset_df), index=term_asset_df.index)))
                         valid_term_deals = set(term_asset_df["_deal_key"].dropna().tolist())
                         term_loan_df["_deal_key"] = norm_id_series(term_loan_df.get("Deal Number", pd.Series([None] * len(term_loan_df), index=term_loan_df.index)))
+                        retained_term_deals = set()
+                        if "Segment" in term_loan_df.columns:
+                            retained_term_deals = set(
+                                term_loan_df.loc[_term_segment_is_sold_servicing_retained(term_loan_df["Segment"]), "_deal_key"].dropna().tolist()
+                            )
+                        valid_term_deals |= retained_term_deals
+                        valid_term_deals |= set(TERM_ALWAYS_INCLUDE_DEALS)
                         term_loan_df = term_loan_df[term_loan_df["_deal_key"].isin(valid_term_deals)].copy()
                         diagnostics.append(f"Term Loan rows (post-asset UPB filter): {len(term_loan_df):,}")
 
