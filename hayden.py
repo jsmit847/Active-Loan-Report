@@ -59,7 +59,7 @@ ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
-VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO", "REO-Sold"]
+VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
 BRIDGE_ACTIVE_STAGES = VALID_STAGES.copy()
 BRIDGE_LOAN_SOURCE_STAGES = VALID_STAGES.copy()
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
@@ -75,11 +75,12 @@ DNL_STAGES = [
 ]
 
 VALUATION_STAGES = VALID_STAGES.copy()
-VALUATION_PROPERTY_STATUSES = ["Active", "REO", "REO-Sold"]
+VALUATION_PROPERTY_STATUSES = ["Active", "REO"]
 
 EXPIRED_OR_MATURED_STAGES = ["Expired", "Matured"]
-REO_FAMILY_STAGES = ["REO", "REO-Sold"]
+REO_FAMILY_STAGES = ["REO"]
 TERM_ACTIVE_STAGES = VALID_STAGES.copy()
+TERM_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 TERM_RECORDTYPE_NAMES = {"term loan", "dscr"}
 BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single asset bridge loan"}
 BRIDGE_RT_CONTAINS = {"sab", "single asset bridge"}
@@ -2319,6 +2320,7 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         f"{opp_rel}.Probability > 0",
         _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
+        _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
         "ALA__c > 0",
         "Asset_ID__c != NULL",
         _soql_false_or_null("Is_Sub_Unit__c"),
@@ -4169,6 +4171,7 @@ def build_term_loan(
     upb_col: str,
     prev_maps: dict,
     template_maps: dict,
+    asset_deal_numbers: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     prev_keys = _prev_term_keys(prev_maps)
     prev_positive_keys = _prev_term_positive_upb_keys(prev_maps)
@@ -4178,6 +4181,8 @@ def build_term_loan(
     out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
     if out.empty:
         return out
+
+    asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
@@ -4236,7 +4241,10 @@ def build_term_loan(
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(out.get("Special Loans List (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
     stage_series = sf_term_active.set_index(norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([], dtype='object')))) if False else None
-    # Final keep rule stays aligned to active stages and excludes Paid Off by construction.
+    if asset_deal_keys:
+        always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
+        out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
+
     out = out[out["_deal_key"].notna()].copy()
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
@@ -4548,6 +4556,12 @@ def build_bridge_loan(
 
     out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
+    bridge_asset_deal_keys = set()
+    if bridge_asset is not None and not bridge_asset.empty and "_deal_key" in bridge_asset.columns:
+        bridge_asset_deal_keys = set(pd.Series(bridge_asset["_deal_key"], copy=False).dropna().astype(str).tolist())
+        out = out[out["_deal_key"].isin(bridge_asset_deal_keys)].copy()
+        blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
 
     current_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
     active_asset_count = pd.to_numeric(out.get("Active Asset Count", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0)
@@ -5946,6 +5960,10 @@ if build_btn:
                 status.update(label="Pulling term data from Salesforce...")
                 term_wide = _build_term_wide_like()
 
+                status.update(label="Pulling term asset data from Salesforce...")
+                term_asset_source = _build_term_asset_like(deal_numbers=None)
+                term_asset_filter_deals = _nonblank_unique(term_asset_source["Deal Loan Number"].tolist()) if not term_asset_source.empty and "Deal Loan Number" in term_asset_source.columns else []
+
                 status.update(label="Building Term Loan...")
                 term_loan_df = build_term_loan(
                     term_wide,
@@ -5955,6 +5973,7 @@ if build_btn:
                     upb_col,
                     prev_maps,
                     template_maps,
+                    asset_deal_numbers=term_asset_filter_deals,
                 )
                 term_loan_df, term_loan_backfill = backfill_df_from_baseline("Term Loan", term_loan_df, prev_bytes)
                 if term_loan_backfill and term_loan_backfill.get("fills"):
@@ -5974,8 +5993,15 @@ if build_btn:
                 if need_term_asset:
                     term_deal_numbers = [d for d in _nonblank_unique(term_loan_df["Deal Number"].tolist()) if clean_text(d).upper() != "N/A"] if "Deal Number" in term_loan_df.columns else []
 
-                    status.update(label="Pulling term asset data from Salesforce...")
-                    term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
+                    if not term_asset_source.empty:
+                        term_asset_source = term_asset_source[
+                            norm_id_series(term_asset_source.get("Deal Loan Number", pd.Series([None] * len(term_asset_source), index=term_asset_source.index))).isin(
+                                set(norm_id_series(pd.Series(term_deal_numbers, dtype="object")).dropna().tolist())
+                            )
+                        ].copy()
+                    else:
+                        status.update(label="Pulling term asset data from Salesforce...")
+                        term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
 
                     status.update(label="Building Term Asset...")
                     term_asset_df = build_term_asset(term_asset_source, term_loan_df, upb_col, prev_maps=prev_maps)
@@ -5987,7 +6013,7 @@ if build_btn:
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
                     del term_deal_numbers, term_asset_source, term_asset_df
 
-                del term_wide, term_loan_df
+                del term_wide, term_loan_df, term_asset_filter_deals
                 gc.collect()
 
             del sf_am, sf_active_rm, serv_join, serv_preview
