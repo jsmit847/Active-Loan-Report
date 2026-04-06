@@ -59,18 +59,15 @@ ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
-VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold"]
+VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO", "REO-Sold"]
 BRIDGE_ACTIVE_STAGES = VALID_STAGES.copy()
 BRIDGE_LOAN_SOURCE_STAGES = VALID_STAGES.copy()
 BRIDGE_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 BRIDGE_TYPES = ["Bridge Loan", "SAB Loan", "Acquired Bridge Loan", "Single Asset Bridge Loan"]
 BRIDGE_TYPE_CONTAINS = ["SAB", "Single Asset Bridge"]
 TERM_TYPES = ["DSCR", "Investor DSCR", "Single Rental Loan", "Term Loan"]
-TERM_TYPE_CONTAINS = ["DSCR", "Term"]
 LOAN_ACTIVE_STATUS = "Active"
-LOAN_PAID_OFF_STATUS = "Paid Off"
 BRIDGE_EXCLUDED_PRODUCT_TYPE = "Model Home Lease"
-TERM_ALWAYS_INCLUDE_DEALS = {"43422", "43462"}
 
 DNL_STAGES = [
     "Closed Won", "Purchased", "Brokered- Closed Won", "Expired", "Matured",
@@ -694,18 +691,8 @@ def clean_text(val) -> str:
         return ""
     return s
 
-def _clean_servicer_id_display_text(servicer_id):
-    sid = clean_text(servicer_id)
-    if not sid:
-        return pd.NA
-    sid = sid.replace(",", "").strip()
-    if re.fullmatch(r"[-+]?\d+\.0+", sid):
-        sid = sid.split(".", 1)[0]
-    return sid or pd.NA
-
 def strip_statebridge_display_id(servicer_id, servicer_name):
-    sid = _clean_servicer_id_display_text(servicer_id)
-    sid = clean_text(sid)
+    sid = clean_text(servicer_id)
     if not sid:
         return pd.NA
     serv = clean_text(servicer_name).lower()
@@ -728,39 +715,9 @@ def blankish_mask(s: pd.Series) -> pd.Series:
     return base.isna() | s_text.isin(["", "nan", "none", "<na>", "nat"])
 
 
-def _series_like(value, index: pd.Index) -> pd.Series:
-    if isinstance(value, pd.DataFrame):
-        if value.shape[1] == 0:
-            return pd.Series([pd.NA] * len(index), index=index, dtype="object")
-        value = value.iloc[:, 0]
-    if isinstance(value, pd.Series):
-        return value.reindex(index)
-    if np.isscalar(value) or value is None:
-        return pd.Series([value] * len(index), index=index, dtype="object")
-    try:
-        seq = list(value)
-    except Exception:
-        return pd.Series([value] * len(index), index=index, dtype="object")
-    if len(seq) == len(index):
-        return pd.Series(seq, index=index)
-    out = pd.Series([pd.NA] * len(index), index=index, dtype="object")
-    n = min(len(seq), len(index))
-    if n:
-        out.iloc[:n] = seq[:n]
-    return out
-
-
 def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series:
-    if isinstance(primary, pd.Series):
-        index = primary.index
-    elif isinstance(fallback, pd.Series):
-        index = fallback.index
-    else:
-        plen = len(primary) if hasattr(primary, "__len__") and not np.isscalar(primary) else 1
-        flen = len(fallback) if hasattr(fallback, "__len__") and not np.isscalar(fallback) else 1
-        index = pd.RangeIndex(max(plen, flen))
-    p = _series_like(primary, index)
-    f = _series_like(fallback, index)
+    p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index)
+    f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index)
     return p.where(~blankish_mask(p), f)
 
 
@@ -1580,9 +1537,7 @@ def _bridge_dealtype_condition(alias_prefix: str = "") -> str:
 
 def _term_dealtype_condition(alias_prefix: str = "") -> str:
     expr = f"{alias_prefix}Type" if alias_prefix else "Type"
-    exact_cond = _lower_in_condition(expr, TERM_TYPES)
-    contains_cond = _lower_contains_condition(expr, TERM_TYPE_CONTAINS)
-    return f"({exact_cond} OR {contains_cond})"
+    return _lower_in_condition(expr, TERM_TYPES)
 
 def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str]:
     field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
@@ -1590,15 +1545,6 @@ def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str
         return None
     field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
     return f"{field_expr} = {_soql_text(LOAN_ACTIVE_STATUS)}"
-
-def _opportunity_not_paid_off_condition(alias_prefix: str = "") -> str:
-    stage_expr = f"{alias_prefix}StageName" if alias_prefix else "StageName"
-    clauses = [f"({stage_expr} = NULL OR {stage_expr} != {_soql_text(LOAN_PAID_OFF_STATUS)})"]
-    field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
-    if field_api:
-        field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
-        clauses.append(f"({field_expr} = NULL OR {field_expr} != {_soql_text(LOAN_PAID_OFF_STATUS)})")
-    return " AND ".join(clauses)
 
 def _append_clause_if_present(parts: List[str], clause: Optional[str]) -> List[str]:
     if clause and str(clause).strip():
@@ -1752,7 +1698,6 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         _soql_in("Status__c", BRIDGE_ACTIVE_PROPERTY_STATUSES),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
         "Asset_ID__c != NULL",
-        _opportunity_not_paid_off_condition(f"{opp_rel}."),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
@@ -1879,7 +1824,6 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
         _soql_in("StageName", BRIDGE_LOAN_SOURCE_STAGES),
         _bridge_dealtype_condition(),
         _soql_not_equal_or_null("LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
-        _opportunity_not_paid_off_condition(),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition())
 
@@ -1926,7 +1870,6 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
         _soql_in(f"{opp_rel}.StageName", BRIDGE_LOAN_SOURCE_STAGES),
         _bridge_dealtype_condition(f"{opp_rel}."),
         _soql_not_equal_or_null(f"{opp_rel}.LOC_Loan_Type__c", BRIDGE_EXCLUDED_PRODUCT_TYPE),
-        _opportunity_not_paid_off_condition(f"{opp_rel}."),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition(f"{opp_rel}."))
 
@@ -2299,7 +2242,6 @@ def _build_term_wide_like() -> pd.DataFrame:
         "Probability > 0",
         _term_dealtype_condition(),
         _soql_in("StageName", TERM_ACTIVE_STAGES),
-        _opportunity_not_paid_off_condition(),
     ]
     _append_clause_if_present(where_parts, _opportunity_status_active_condition())
 
@@ -2688,10 +2630,18 @@ def _recent_close_mask(close_series: pd.Series, run_date: date, days: int = 45) 
 
 
 def _sold_servicing_retained_mask(servicing_status: pd.Series) -> pd.Series:
-    txt = pd.Series(servicing_status, copy=False).astype("string").str.lower().str.strip()
-    retained = txt.str.contains(r"retain|retained|servic", regex=True, na=False)
-    bad = txt.str.contains(r"release|released|transfer|xfer|sold away|none|no servicing|unserviced", regex=True, na=False)
-    return retained & (~bad)
+    txt = pd.Series(servicing_status, copy=False).astype("string").str.lower().str.strip().fillna("")
+    exact = txt.isin({
+        "servicing retained",
+        "sold servicing retained",
+        "retain servicing",
+        "retained servicing",
+        "serv retained",
+        "retained",
+    })
+    retained = txt.str.contains(r"servicing retained|retain servicing|retained servicing|serv retained|\bretained\b|\bretain\w*\b", regex=True, na=False)
+    bad = txt.str.contains(r"release|released|transfer|transferred|xfer|sold away|none|no servicing|unserviced|servicing released|not retained", regex=True, na=False)
+    return (exact | retained) & (~bad)
 
 
 def _term_segment_is_sold_servicing_retained(segment_series: pd.Series) -> pd.Series:
@@ -2834,34 +2784,21 @@ def _filter_term_population(
         return sf_term
 
     out = sf_term.copy()
-    prev_keys = prev_keys or set()
-    prev_positive_keys = prev_positive_keys or set()
     prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
+    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
     stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
-    stage_lower = stage.str.lower()
     current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
     sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
-    loan_type = out.get("Type", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip().str.lower()
 
     sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
-    in_prev = out["_deal_key"].isin(prev_keys)
-    in_prev_positive = out["_deal_key"].isin(prev_positive_keys)
-    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
-    always_include = out["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)
+    is_closed_won = stage.eq("Closed Won")
+    is_sold = stage.eq("Sold")
+    is_expired_or_matured = stage.isin(EXPIRED_OR_MATURED_STAGES)
 
-    valid_stage = stage.isin(TERM_ACTIVE_STAGES)
-    not_paid_off = ~stage_lower.eq("paid off")
-    is_dscr = loan_type.str.contains("dscr", na=False)
-
-    keep_core = valid_stage & not_paid_off & (
-        stage.eq("Active")
-        | stage.eq("Closed Won")
-        | (stage.isin(EXPIRED_OR_MATURED_STAGES) & (current_upb.gt(0) | in_prev_positive))
-        | (stage.eq("Sold") & (sold_servicing_retained | in_prev_sold_retained | current_upb.gt(0)))
-    )
-    keep_mask = keep_core | (valid_stage & not_paid_off & is_dscr) | in_prev | always_include
+    is_reo = stage.isin(REO_FAMILY_STAGES)
+    keep_mask = is_closed_won | is_reo | (is_expired_or_matured & current_upb.gt(0)) | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
     return out.loc[keep_mask].copy()
 
 
@@ -2869,7 +2806,7 @@ def _best_header_read_excel(
     file_bytes: bytes,
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
-    max_header_scan: int = 15,
+    max_header_scan: int = 8,
 ):
     xls = pd.ExcelFile(BytesIO(file_bytes))
     sheet_names = list(xls.sheet_names)
@@ -2888,7 +2825,6 @@ def _best_header_read_excel(
 
     best = None
     best_score = -1
-    best_debug = None
 
     for sheet in ordered:
         for header_row in range(max_header_scan):
@@ -2898,29 +2834,20 @@ def _best_header_read_excel(
                 if df.empty:
                     continue
                 df.columns = [str(c).strip() for c in df.columns]
-                matched = [first_matching_col(df, aliases) for aliases in required_alias_groups]
-                score = sum(m is not None for m in matched)
+                score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
                 if score > best_score:
                     best_score = score
                     best = (df, sheet, header_row, score)
-                    best_debug = {
-                        "sheet": sheet,
-                        "header_row": header_row,
-                        "columns": list(df.columns)[:20],
-                        "matched": matched,
-                    }
-                if score == len(required_alias_groups):
-                    return best
             except Exception:
                 continue
 
     if best is None or best_score <= 0:
-        raise ValueError(f"Could not find a matching header row. Sheets scanned: {sheet_names}")
+        raise ValueError("Could not find a matching header row.")
 
     return best
 
 
-def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 6):
+def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 3):
     best = None
     best_score = -1
 
@@ -2931,13 +2858,10 @@ def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[st
             if df.empty:
                 continue
             df.columns = [str(c).strip() for c in df.columns]
-            matched = [first_matching_col(df, aliases) for aliases in required_alias_groups]
-            score = sum(m is not None for m in matched)
+            score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
             if score > best_score:
                 best_score = score
                 best = (df, header_row, score)
-            if score == len(required_alias_groups):
-                return best
         except Exception:
             continue
 
@@ -3093,9 +3017,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     if servicer_type == "FCI":
         df, _sheet, _hdr, _score = _best_header_read_excel(
             b,
-            [["Account", "Loan Number", "Loan No", "Account Number", "Acct", "Acct #", "Servicer Loan ID", "Servicer Loan Number"], ["Current Balance", "Current UPB", "UPB", "Principal Balance", "Balance", "Principal", "Principal Bal", "Current Principal Balance"]],
+            [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
-            max_header_scan=15,
         )
         servicer = fci_servicer_label_from_filename(filename)
         out = pd.DataFrame(
@@ -3103,8 +3026,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "source_file": filename,
                 "servicer": servicer,
                 "servicer_family": "fci",
-                "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No", "Account Number", "Acct", "Acct #", "Servicer Loan ID", "Servicer Loan Number"]),
-                "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance", "Balance", "Principal", "Principal Bal", "Current Principal Balance"]),
+                "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No"]),
+                "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance"]),
                 "suspense": _series_to_num(df, ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"]),
                 "next_payment_date": _series_to_dt(df, ["Next Due Date", "Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Maturity Date", "Current Maturity Date"]),
@@ -3158,14 +3081,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
     file_dates: List[date] = []
 
     for blob in blobs:
-        try:
-            parsed = parse_servicer_cached(blob)
-        except Exception as exc:
-            try:
-                st.warning(f"Skipping servicer file {blob.filename}: {exc}")
-            except Exception:
-                pass
-            continue
+        parsed = parse_servicer_cached(blob)
         if parsed.empty:
             continue
         frames.append(parsed)
@@ -3351,14 +3267,6 @@ SHEET_BASELINE_KEY_CANDIDATES = {
     "Bridge Loan": [["Deal Number"]],
     "Term Loan": [["Servicer ID"], ["Deal Number"]],
     "Term Asset": [["Deal Number", "Asset ID"]],
-}
-
-
-SHEET_REQUIRED_KEY_HEADERS = {
-    "Bridge Asset": ["Deal Number", "Asset ID"],
-    "Bridge Loan": ["Deal Number"],
-    "Term Loan": ["Deal Number"],
-    "Term Asset": ["Deal Number", "Asset ID"],
 }
 
 
@@ -4267,36 +4175,7 @@ def build_term_loan(
     prev_sold_retained_keys = _prev_term_sold_retained_keys(prev_maps)
     sf_term_active = _filter_term_population(sf_term, prev_keys=prev_keys, prev_positive_keys=prev_positive_keys, prev_sold_retained_keys=prev_sold_retained_keys)
 
-    # Absolute protection for must-keep Term deals. These must survive every filter revision.
-    sf_term_force = sf_term.copy() if sf_term is not None else pd.DataFrame()
-    if not sf_term_force.empty:
-        sf_term_force["_deal_key"] = norm_id_series(
-            sf_term_force.get("Deal Loan Number", pd.Series([None] * len(sf_term_force), index=sf_term_force.index))
-        )
-        sf_term_force = sf_term_force[sf_term_force["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)].copy()
-        if not sf_term_force.empty:
-            sf_term_active = pd.concat([sf_term_active, sf_term_force], ignore_index=True)
-            if "Deal Loan Number" in sf_term_active.columns:
-                sf_term_active["_deal_key"] = norm_id_series(
-                    sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index))
-                )
-                sf_term_active = sf_term_active.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first").drop(columns=["_deal_key"], errors="ignore")
-
     out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
-
-    # If the normal path still fails to emit an always-include deal, build and append it explicitly.
-    if (out is None or out.empty) and not sf_term_force.empty:
-        out = _build_term_loan_salesforce_fallback(sf_term_force, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
-    elif not sf_term_force.empty:
-        out = out.copy()
-        out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
-        missing_force = set(TERM_ALWAYS_INCLUDE_DEALS) - set(out["_deal_key"].dropna().tolist())
-        if missing_force:
-            sf_term_force_missing = sf_term_force[sf_term_force["_deal_key"].isin(missing_force)].copy()
-            forced_rows = _build_term_loan_salesforce_fallback(sf_term_force_missing, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
-            if forced_rows is not None and not forced_rows.empty:
-                out = pd.concat([out.drop(columns=["_deal_key"], errors="ignore"), forced_rows], ignore_index=True)
-
     if out.empty:
         return out
 
@@ -4359,19 +4238,6 @@ def build_term_loan(
     stage_series = sf_term_active.set_index(norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([], dtype='object')))) if False else None
     # Final keep rule stays aligned to active stages and excludes Paid Off by construction.
     out = out[out["_deal_key"].notna()].copy()
-    if not out.empty:
-        out = out.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first")
-        missing_force = set(TERM_ALWAYS_INCLUDE_DEALS) - set(out["_deal_key"].dropna().tolist())
-        if missing_force and sf_term is not None and not sf_term.empty:
-            sf_force_final = sf_term.copy()
-            sf_force_final["_deal_key"] = norm_id_series(sf_force_final.get("Deal Loan Number", pd.Series([None] * len(sf_force_final), index=sf_force_final.index)))
-            sf_force_final = sf_force_final[sf_force_final["_deal_key"].isin(missing_force)].copy()
-            if not sf_force_final.empty:
-                forced_rows = _build_term_loan_salesforce_fallback(sf_force_final, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
-                if forced_rows is not None and not forced_rows.empty:
-                    forced_rows["_deal_key"] = norm_id_series(forced_rows.get("Deal Number", pd.Series([None] * len(forced_rows), index=forced_rows.index)))
-                    out = pd.concat([out, forced_rows], ignore_index=True)
-                    out = out.sort_values("_deal_key", kind="stable").drop_duplicates("_deal_key", keep="first")
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
@@ -4426,28 +4292,17 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
 
-    upb_num = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     meaningful_mask = (
         out["_deal_key"].notna()
         & out["_asset_key"].notna()
         & (
             (~blankish_mask(out.get("Address", pd.Series([pd.NA] * len(out), index=out.index))))
             | pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
-            | upb_num.fillna(0).gt(0)
+            | pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).ne(0)
             | pd.to_numeric(out.get("As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
         )
     )
     out = out.loc[meaningful_mask].copy()
-    retained_deals: Set[str] = set()
-    if "Segment" in tl.columns:
-        retained_mask = _term_segment_is_sold_servicing_retained(tl["Segment"])
-        retained_deals = set(tl.loc[retained_mask, "_deal_key"].dropna().tolist())
-
-    if upb_col in out.columns:
-        upb_mask = pd.to_numeric(out[upb_col], errors="coerce").fillna(0).gt(0)
-        retained_mask = out["_deal_key"].isin(retained_deals)
-        always_mask = out["_deal_key"].isin(TERM_ALWAYS_INCLUDE_DEALS)
-        out = out[upb_mask | retained_mask | always_mask].copy()
 
     return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
@@ -4512,10 +4367,6 @@ def build_bridge_loan(
 
     if bridge_asset is not None and not bridge_asset.empty:
         ba = bridge_asset.copy()
-        active_bridge_deals = set(ba["_deal_key"].dropna().tolist())
-        out = out[out["_deal_key"].isin(active_bridge_deals)].copy()
-        blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
-        ba = ba[ba["_deal_key"].isin(active_bridge_deals)].copy()
         g = ba.groupby("_deal_key", dropna=True)
 
         def _first(series: pd.Series):
@@ -4897,15 +4748,6 @@ def _trim_sheet_body_rows(ws, row_count: int, start_row: int = 5):
         ws.delete_rows(keep_last + 1, ws.max_row - keep_last)
 
 
-def _reset_sheet_autofilter(ws, header_tuples: List[Tuple[int, str]], row_count: int, header_row: int = 4, start_row: int = 5):
-    if not header_tuples:
-        return
-    first_col = min(c for c, _h in header_tuples)
-    last_col = max(c for c, _h in header_tuples)
-    last_row = max(header_row, start_row + max(row_count, 1) - 1)
-    ws.auto_filter.ref = f"{get_column_letter(first_col)}{header_row}:{get_column_letter(last_col)}{last_row}"
-
-
 def _excel_safe_value(val):
     if val is None or val is pd.NA:
         return None
@@ -5035,30 +4877,6 @@ def write_df_to_sheet_preserve_formulas(
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
 
-def _drop_rows_missing_required_keys(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    required = [h for h in SHEET_REQUIRED_KEY_HEADERS.get(sheet_name, []) if h in df.columns]
-    if not required:
-        return df.reset_index(drop=True).copy()
-    keep_mask = pd.Series(True, index=df.index)
-    for header in required:
-        keep_mask = keep_mask & (~blankish_mask(df[header]))
-    return df.loc[keep_mask].reset_index(drop=True).copy()
-
-
-def _drop_effectively_blank_output_rows(df: pd.DataFrame, candidate_headers: Sequence[str]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    usable = [h for h in candidate_headers if h in df.columns]
-    if not usable:
-        return df.reset_index(drop=True)
-    keep_mask = pd.Series(False, index=df.index)
-    for col in usable:
-        keep_mask = keep_mask | (~blankish_mask(df[col]))
-    return df.loc[keep_mask].reset_index(drop=True).copy()
-
-
 def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     if sheet_name not in wb.sheetnames:
         return
@@ -5066,9 +4884,6 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
-    non_formula_headers = [header for col_idx, header in hdr if col_idx not in fcols]
-    df = _drop_rows_missing_required_keys(sheet_name, df)
-    df = _drop_effectively_blank_output_rows(df, non_formula_headers)
 
     if sheet_name == "Term Asset":
         force_write_headers = {upb_col, "Special (Y/N)"}
@@ -5084,14 +4899,12 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=5)
     _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
     _trim_sheet_body_rows(ws, row_count=max(len(df), 1), start_row=5)
-    _reset_sheet_autofilter(ws, hdr, row_count=max(len(df), 1), header_row=4, start_row=5)
 
 
 def _normalize_sheet_key_value(header: str, value) -> str:
     txt = clean_text(value)
     if not txt:
         return ""
-    txt = clean_text(_clean_servicer_id_display_text(txt) if header == "Servicer ID" else txt)
     txt = re.sub(r"\.0$", "", txt)
     if header == "Servicer ID":
         txt = re.sub(r"[^0-9A-Za-z]", "", txt).lstrip("0")
@@ -6147,15 +5960,18 @@ if build_btn:
                 if term_loan_backfill and term_loan_backfill.get("fills"):
                     diagnostics.append(f"Term Loan baseline backfill cells: {int(term_loan_backfill['fills']):,} using {term_loan_backfill.get('keys', 'n/a')}")
 
-                diagnostics.append(f"Term Loan rows (pre-asset filter): {len(term_loan_df):,}")
+                diagnostics.append(f"Term Loan rows: {len(term_loan_df):,}")
                 diagnostics.append(
                     f"Term Loan nonblank {upb_col}: {term_loan_df[upb_col].notna().mean():.1%}"
                     if upb_col in term_loan_df.columns
                     else f"Term Loan nonblank {upb_col}: n/a"
                 )
 
-                term_asset_df = None
-                if need_term_asset or build_target in ("Term Loan", "All"):
+                if build_target in ("Term Loan", "All"):
+                    status.update(label="Writing Term Loan sheet...")
+                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
+
+                if need_term_asset:
                     term_deal_numbers = [d for d in _nonblank_unique(term_loan_df["Deal Number"].tolist()) if clean_text(d).upper() != "N/A"] if "Deal Number" in term_loan_df.columns else []
 
                     status.update(label="Pulling term asset data from Salesforce...")
@@ -6167,30 +5983,11 @@ if build_btn:
                     if term_asset_backfill and term_asset_backfill.get("fills"):
                         diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
 
-                    if term_asset_df is not None and not term_asset_df.empty:
-                        term_asset_df["_deal_key"] = norm_id_series(term_asset_df.get("Deal Number", pd.Series([None] * len(term_asset_df), index=term_asset_df.index)))
-                        valid_term_deals = set(term_asset_df["_deal_key"].dropna().tolist())
-                        term_loan_df["_deal_key"] = norm_id_series(term_loan_df.get("Deal Number", pd.Series([None] * len(term_loan_df), index=term_loan_df.index)))
-                        retained_term_deals = set()
-                        if "Segment" in term_loan_df.columns:
-                            retained_term_deals = set(
-                                term_loan_df.loc[_term_segment_is_sold_servicing_retained(term_loan_df["Segment"]), "_deal_key"].dropna().tolist()
-                            )
-                        valid_term_deals |= retained_term_deals
-                        valid_term_deals |= set(TERM_ALWAYS_INCLUDE_DEALS)
-                        term_loan_df = term_loan_df[term_loan_df["_deal_key"].isin(valid_term_deals)].copy()
-                        diagnostics.append(f"Term Loan rows (post-asset UPB filter): {len(term_loan_df):,}")
+                    status.update(label="Writing Term Asset sheet...")
+                    write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
+                    del term_deal_numbers, term_asset_source, term_asset_df
 
-                    if need_term_asset:
-                        status.update(label="Writing Term Asset sheet...")
-                        write_output_sheet(wb, "Term Asset", term_asset_df if term_asset_df is not None else pd.DataFrame(), upb_col)
-                    del term_deal_numbers, term_asset_source
-
-                if build_target in ("Term Loan", "All"):
-                    status.update(label="Writing Term Loan sheet...")
-                    write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
-
-                del term_wide, term_loan_df, term_asset_df
+                del term_wide, term_loan_df
                 gc.collect()
 
             del sf_am, sf_active_rm, serv_join, serv_preview
@@ -6217,13 +6014,9 @@ if build_btn:
                 if audit_diagnostic_lines is not None and audit_summary:
                     diagnostics.extend(audit_diagnostic_lines(audit_summary))
                 if not zero_blank_ok:
-                    diagnostics.append(
+                    raise ValueError(
                         "Zero-blank enforcement could not eliminate all fillable blanks. "
-                        "Workbook was still generated; review QA Summary / QA Exceptions and use the immediately prior completed workbook as the carry-forward baseline on the next run."
-                    )
-                    st.warning(
-                        "Zero-blank enforcement could not eliminate all fillable blanks. "
-                        "The workbook will still be saved, but you should review QA Summary / QA Exceptions and use the immediately prior completed workbook as the carry-forward baseline on the next run."
+                        "Use a completed workbook from the immediately prior run as the carry-forward baseline and rerun the build."
                     )
                 if any(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary):
                     diagnostics.append("Blank enforcement passed, but possible shifted values were still detected. Review the QA Exceptions tab before weekly use.")
