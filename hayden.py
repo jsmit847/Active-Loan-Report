@@ -2812,6 +2812,48 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     result["matched_source"] = pd.Series(selected_source, index=sf_term.index, dtype="object")
     return result
 
+def _term_population_keep_mask(
+    stage_series: pd.Series,
+    current_upb_series: pd.Series,
+    sold_servicing_status_series: pd.Series,
+    deal_key_series: Optional[pd.Series] = None,
+    prev_sold_retained_keys: Optional[Set[str]] = None,
+    always_keep_keys: Optional[Set[str]] = None,
+    reo_date_series: Optional[pd.Series] = None,
+) -> pd.Series:
+    stage = pd.Series(stage_series, copy=False).astype("string").str.strip()
+    current_upb = pd.to_numeric(pd.Series(current_upb_series, copy=False), errors="coerce").fillna(0)
+    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status_series)
+
+    if deal_key_series is None:
+        deal_key = pd.Series([pd.NA] * len(stage), index=stage.index, dtype="object")
+    else:
+        deal_key = norm_id_series(pd.Series(deal_key_series, copy=False))
+        if not deal_key.index.equals(stage.index):
+            deal_key.index = stage.index
+
+    prev_sold_retained_keys = prev_sold_retained_keys or set()
+    always_keep_keys = always_keep_keys or set()
+
+    in_prev_sold_retained = deal_key.isin(prev_sold_retained_keys)
+    always_keep = deal_key.isin(always_keep_keys)
+
+    is_sold = stage.eq("Sold")
+    is_reo = stage.isin(REO_FAMILY_STAGES)
+    if reo_date_series is not None:
+        is_reo = is_reo | pd.to_datetime(pd.Series(reo_date_series, copy=False), errors="coerce").notna()
+
+    positive_upb = current_upb.gt(0)
+
+    keep_mask = (
+        always_keep
+        | is_reo
+        | ((~is_sold) & positive_upb)
+        | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
+    )
+    return keep_mask.fillna(False)
+
+
 def _filter_term_population(
     sf_term: pd.DataFrame,
     prev_keys: Optional[Set[str]] = None,
@@ -2822,37 +2864,16 @@ def _filter_term_population(
         return sf_term
 
     out = sf_term.copy()
-    prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
-    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
-    stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
-    current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
-    sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
-
-    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
-    is_closed_won = stage.eq("Closed Won")
-    is_sold = stage.eq("Sold")
-    is_expired_or_matured = stage.isin(EXPIRED_OR_MATURED_STAGES)
-
-    is_reo = stage.isin(REO_FAMILY_STAGES)
-    keep_mask = is_closed_won | is_reo | (is_expired_or_matured & current_upb.gt(0)) | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
+    keep_mask = _term_population_keep_mask(
+        stage_series=out.get("Stage", pd.Series([""] * len(out), index=out.index)),
+        current_upb_series=out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
+        sold_servicing_status_series=out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
+        deal_key_series=out["_deal_key"],
+        prev_sold_retained_keys=prev_sold_retained_keys,
+    )
     return out.loc[keep_mask].copy()
-
-
-def _term_positive_current_upb_deal_keys(sf_term: pd.DataFrame) -> Set[str]:
-    if sf_term is None or sf_term.empty:
-        return set()
-
-    deal_keys = norm_id_series(sf_term.get("Deal Loan Number", pd.Series([None] * len(sf_term), index=sf_term.index)))
-    if "Current Servicer UPB" not in sf_term.columns:
-        return set(deal_keys.dropna().tolist())
-
-    current_upb = pd.to_numeric(
-        sf_term.get("Current Servicer UPB", pd.Series([np.nan] * len(sf_term), index=sf_term.index)),
-        errors="coerce",
-    ).fillna(0)
-    return set(deal_keys[current_upb.gt(0)].dropna().tolist())
 
 
 def _best_header_read_excel(
@@ -3911,6 +3932,8 @@ def _build_term_loan_salesforce_fallback(
     upb_col: str,
     prev_maps: dict,
     template_maps: dict,
+    prev_sold_retained_keys: Optional[Set[str]] = None,
+    always_keep_keys: Optional[Set[str]] = None,
 ) -> pd.DataFrame:
     if sf_term is None or sf_term.empty:
         return pd.DataFrame()
@@ -3921,6 +3944,12 @@ def _build_term_loan_salesforce_fallback(
         out[col] = sf_term[label] if label in sf_term.columns else pd.NA
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
+    out["_stage_raw"] = sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index))
+    out["_sold_servicing_status_raw"] = sf_term.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
+    out["_sf_current_servicer_upb_raw"] = pd.to_numeric(
+        sf_term.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
+        errors="coerce",
+    )
 
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
@@ -4042,19 +4071,14 @@ def _build_term_loan_salesforce_fallback(
         out[upb_col] = np.where(reo_mask & ((cur_upb.isna()) | (cur_upb <= 0)), fill_val, cur_upb)
         out = out.drop(columns=["_prev_upb"], errors="ignore")
 
-    stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string").str.strip()
-    final_upb = pd.to_numeric(out[upb_col], errors="coerce").fillna(0)
-    sold_segment_retained = _term_segment_is_sold_servicing_retained(out.get("Segment", blank_obj))
-    is_closed_won = stage_series.eq("Closed Won")
-    is_sold = stage_series.eq("Sold")
-    is_reo = pd.to_datetime(out["REO Date"], errors="coerce").notna() | stage_series.isin(REO_FAMILY_STAGES)
-    is_expired_or_matured = stage_series.isin(EXPIRED_OR_MATURED_STAGES)
-
-    keep_mask = (
-        is_closed_won
-        | is_reo
-        | (is_expired_or_matured & final_upb.gt(0))
-        | (is_sold & sold_segment_retained)
+    keep_mask = _term_population_keep_mask(
+        stage_series=out.get("_stage_raw", pd.Series([pd.NA] * len(out), index=out.index)),
+        current_upb_series=out.get("_sf_current_servicer_upb_raw", pd.Series([np.nan] * len(out), index=out.index)),
+        sold_servicing_status_series=out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)),
+        deal_key_series=out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)),
+        prev_sold_retained_keys=prev_sold_retained_keys,
+        always_keep_keys=always_keep_keys,
+        reo_date_series=out.get("REO Date", pd.Series([pd.NaT] * len(out), index=out.index)),
     )
     out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
@@ -4241,21 +4265,23 @@ def build_term_loan(
     asset_filter_provided = asset_deal_numbers is not None
     asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
     always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    positive_current_upb_keys: Set[str] = set()
-    if sf_term_active is not None and not sf_term_active.empty:
+    if asset_filter_provided and sf_term_active is not None and not sf_term_active.empty:
         sf_term_active = sf_term_active.copy()
         sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
-        if asset_filter_provided:
-            sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
-        positive_current_upb_keys = _term_positive_current_upb_deal_keys(sf_term_active)
-        keep_term_deal_keys = positive_current_upb_keys | always_keep_keys
-        if keep_term_deal_keys:
-            sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(keep_term_deal_keys)].copy()
-        else:
-            sf_term_active = sf_term_active.iloc[0:0].copy()
+        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
         sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
 
-    out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
+    out = _build_term_loan_salesforce_fallback(
+        sf_term_active,
+        sf_am,
+        sf_active_rm,
+        serv_lookup,
+        upb_col,
+        prev_maps,
+        template_maps,
+        prev_sold_retained_keys=prev_sold_retained_keys,
+        always_keep_keys=always_keep_keys,
+    )
     if out.empty:
         return out
 
@@ -4315,14 +4341,19 @@ def build_term_loan(
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(out.get("Special Loans List (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
-    if positive_current_upb_keys:
-        out = out[out["_deal_key"].isin(positive_current_upb_keys | always_keep_keys)].copy()
-    elif sf_term_active is not None and sf_term_active.empty:
-        out = out.iloc[0:0].copy()
-
     if asset_filter_provided:
         out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
 
+    term_keep_mask = _term_population_keep_mask(
+        stage_series=out.get("_stage_raw", pd.Series([pd.NA] * len(out), index=out.index)),
+        current_upb_series=out.get("_sf_current_servicer_upb_raw", pd.Series([np.nan] * len(out), index=out.index)),
+        sold_servicing_status_series=out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)),
+        deal_key_series=out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)),
+        prev_sold_retained_keys=prev_sold_retained_keys,
+        always_keep_keys=always_keep_keys,
+        reo_date_series=out.get("REO Date", pd.Series([pd.NaT] * len(out), index=out.index)),
+    )
+    out = out.loc[term_keep_mask].copy()
     out = out[out["_deal_key"].notna()].copy()
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
