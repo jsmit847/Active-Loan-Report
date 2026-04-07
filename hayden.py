@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -54,6 +54,9 @@ API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 300
 OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
+SERVICER_PARSE_CACHE_ENABLED = False
+SERVICER_HEADER_SCAN_ROWS = 60
+SERVICER_PREVIEW_ROWS = 50
 ENFORCE_ZERO_FILLABLE_BLANKS = True
 ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
@@ -2876,13 +2879,23 @@ def _filter_term_population(
     return out.loc[keep_mask].copy()
 
 
+def _score_header_row_values(row_values: Sequence[object], required_alias_groups: List[List[str]]) -> int:
+    normalized = {normalize_header_name(v) for v in row_values if has_any_value(v)}
+    normalized.discard("")
+    if not normalized:
+        return 0
+    return sum(any(normalize_header_name(alias) in normalized for alias in aliases) for aliases in required_alias_groups)
+
+
 def _best_header_read_excel(
     file_bytes: bytes,
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
     max_header_scan: int = 8,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ):
-    xls = pd.ExcelFile(BytesIO(file_bytes))
+    bio = BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
     sheet_names = list(xls.sheet_names)
 
     if preferred_sheets:
@@ -2897,52 +2910,83 @@ def _best_header_read_excel(
     else:
         ordered = sheet_names
 
-    best = None
+    best_sheet = None
+    best_header_row = None
     best_score = -1
+    probe_rows = max(SERVICER_HEADER_SCAN_ROWS, max_header_scan + 2)
 
     for sheet in ordered:
-        for header_row in range(max_header_scan):
-            try:
-                df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=header_row)
-                df = df.dropna(how="all")
-                if df.empty:
-                    continue
-                df.columns = [str(c).strip() for c in df.columns]
-                score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
-                if score > best_score:
-                    best_score = score
-                    best = (df, sheet, header_row, score)
-            except Exception:
-                continue
-
-    if best is None or best_score <= 0:
-        raise ValueError("Could not find a matching header row.")
-
-    return best
-
-
-def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 3):
-    best = None
-    best_score = -1
-
-    for header_row in range(max_header_scan):
+        if progress_callback:
+            progress_callback(f"scanning header rows on sheet '{sheet}'")
         try:
-            df = pd.read_csv(BytesIO(file_bytes), header=header_row)
-            df = df.dropna(how="all")
-            if df.empty:
-                continue
-            df.columns = [str(c).strip() for c in df.columns]
-            score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
-            if score > best_score:
-                best_score = score
-                best = (df, header_row, score)
+            sample = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=probe_rows, dtype=object)
         except Exception:
             continue
+        if sample is None or sample.empty:
+            continue
 
-    if best is None or best_score <= 0:
+        limit = min(max_header_scan, len(sample.index))
+        for header_row in range(limit):
+            score = _score_header_row_values(sample.iloc[header_row].tolist(), required_alias_groups)
+            if score > best_score:
+                best_score = score
+                best_sheet = sheet
+                best_header_row = header_row
+
+        del sample
+        gc.collect()
+
+    if best_sheet is None or best_header_row is None or best_score <= 0:
+        raise ValueError("Could not find a matching header row.")
+
+    if progress_callback:
+        progress_callback(f"reading matched sheet '{best_sheet}' using header row {best_header_row + 1}")
+
+    df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row)
+    df = df.dropna(how="all")
+    if not df.empty:
+        df.columns = [str(c).strip() for c in df.columns]
+    return df, best_sheet, best_header_row, best_score
+
+
+def _best_header_read_csv(
+    file_bytes: bytes,
+    required_alias_groups: List[List[str]],
+    max_header_scan: int = 3,
+    progress_callback: Optional[Callable[[str], None]] = None,
+):
+    probe_rows = max(SERVICER_HEADER_SCAN_ROWS, max_header_scan + 2)
+    if progress_callback:
+        progress_callback(f"sampling first {probe_rows} CSV rows to find headers")
+
+    sample = pd.read_csv(BytesIO(file_bytes), header=None, nrows=probe_rows, dtype=object)
+    if sample is None or sample.empty:
         raise ValueError("Could not find a matching CSV header row.")
 
-    return best
+    best_header_row = None
+    best_score = -1
+    limit = min(max_header_scan, len(sample.index))
+    for header_row in range(limit):
+        score = _score_header_row_values(sample.iloc[header_row].tolist(), required_alias_groups)
+        if score > best_score:
+            best_score = score
+            best_header_row = header_row
+
+    del sample
+    gc.collect()
+
+    if best_header_row is None or best_score <= 0:
+        raise ValueError("Could not find a matching CSV header row.")
+
+    if progress_callback:
+        progress_callback(f"reading CSV using header row {best_header_row + 1}")
+
+    df = pd.read_csv(BytesIO(file_bytes), header=best_header_row)
+    df = df.dropna(how="all")
+    if not df.empty:
+        df.columns = [str(c).strip() for c in df.columns]
+    return df, best_header_row, best_score
+
 
 
 def _series_to_num(df: pd.DataFrame, aliases: Sequence[str]) -> pd.Series:
@@ -2983,14 +3027,17 @@ def _as_of_for_df(df: pd.DataFrame, filename: str, aliases: Sequence[str]) -> da
     return date_from_filename(filename) or today_et()
 
 
-def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
+def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     servicer_type = detect_servicer_type(filename)
+    if progress_callback:
+        progress_callback(f"detected {servicer_type}; matching layout")
 
     if servicer_type == "Shellpoint":
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["LoanID", "Servicer Loan ID", "Loan Number"], ["PrincipalBalance", "UPB", "Current UPB"]],
             max_header_scan=2,
+            progress_callback=progress_callback,
         )
         sid_col = first_matching_col(df, ["LoanID", "Servicer Loan ID", "Loan Number"])
         if not sid_col:
@@ -3018,6 +3065,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["Servicer Loan ID", "Loan ID", "Loan Number"], ["UPB", "Principal Balance", "Current UPB"]],
+            progress_callback=progress_callback,
         )
         servicer_col = first_matching_col(df, ["Servicing Company", "Servicer", "Servicer Name"])
         servicer = df[servicer_col].astype("string") if servicer_col else pd.Series(["CHL Streamline"] * len(df))
@@ -3044,6 +3092,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"], ["Current UPB", "Principal Balance", "UPB"]],
             preferred_sheets=["loan"],
+            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
@@ -3071,6 +3120,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["BCM Loan#", "Loan Number", "Loan No"], ["Principal Balance", "Current UPB", "UPB"]],
             preferred_sheets=["loan"],
+            progress_callback=progress_callback,
         )
         out = pd.DataFrame(
             {
@@ -3093,6 +3143,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
+            progress_callback=progress_callback,
         )
         servicer = fci_servicer_label_from_filename(filename)
         out = pd.DataFrame(
@@ -3116,6 +3167,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"], ["UPB$", "UPB", "Current UPB", "Principal Balance"]],
             preferred_sheets=["export", "midland", "loan"],
+            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
@@ -3149,21 +3201,52 @@ def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
 
 
-def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
-    blobs: List[UploadBlob] = [make_upload_blob(u) for u in servicer_uploads]
+def build_servicer_lookup(
+    servicer_uploads: List,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    use_cache: bool = SERVICER_PARSE_CACHE_ENABLED,
+) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
     frames: List[pd.DataFrame] = []
     file_dates: List[date] = []
     skipped_files: List[str] = []
+    total_uploads = len(servicer_uploads or [])
+    parse_started = time.perf_counter()
 
-    for blob in blobs:
+    for idx, upload in enumerate(servicer_uploads or [], start=1):
+        blob = make_upload_blob(upload)
+
+        def _emit(step: str) -> None:
+            if progress_callback:
+                elapsed = time.perf_counter() - parse_started
+                progress_callback(f"servicer {idx}/{total_uploads} | {blob.filename} | {step} | elapsed {elapsed:0.1f}s")
+
         try:
-            parsed = parse_servicer_cached(blob)
+            servicer_type = detect_servicer_type(blob.filename)
+            _emit(f"detected {servicer_type}; starting parse")
+        except Exception:
+            servicer_type = None
+            _emit("starting parse")
+
+        try:
+            if use_cache:
+                parsed = parse_servicer_cached(blob)
+            else:
+                parsed = parse_servicer_bytes(blob.filename, blob.data, progress_callback=_emit)
         except Exception as e:
             skipped_files.append(f"{blob.filename}: {e}")
+            del blob
+            gc.collect()
             continue
+
         if parsed.empty:
+            _emit("parsed 0 rows after cleanup")
+            del parsed
+            del blob
+            gc.collect()
             continue
+
         frames.append(parsed)
+        _emit(f"parsed {len(parsed):,} normalized rows")
 
         if "as_of" in parsed.columns and parsed["as_of"].notna().any():
             d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
@@ -3173,17 +3256,23 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         if d:
             file_dates.append(d)
 
+        del blob
+        gc.collect()
+
     if skipped_files:
         try:
             st.warning("Skipped servicer file(s): " + " | ".join(skipped_files))
         except Exception:
             pass
 
-    full = (
-        pd.concat(frames, ignore_index=True, copy=False)
-        if frames
-        else pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
-    )
+    if frames:
+        if progress_callback:
+            progress_callback("combining normalized servicer rows")
+        full = pd.concat(frames, ignore_index=True, copy=False)
+    else:
+        full = pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
+    frames.clear()
+    gc.collect()
 
     if not full.empty:
         full = full.dropna(subset=["servicer_id"]).copy()
@@ -3197,6 +3286,9 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         full["_has_mat"] = full["maturity_date"].notna().astype("int8")
         full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
 
+        if progress_callback:
+            progress_callback("ranking and deduplicating servicer rows")
+
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
             ascending=[True, True, True, True, True, True, True, True, True],
@@ -3205,8 +3297,9 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
         join = full.drop_duplicates(["_sid_key"], keep="last").drop(
             columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore"
         )
-        preview = full.head(200).copy()
-        full = full.drop(columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
+        preview = join.head(SERVICER_PREVIEW_ROWS).copy()
+        del full
+        gc.collect()
     else:
         full["_sid_key"] = pd.Series(dtype="string")
         join = full.copy()
@@ -3214,6 +3307,7 @@ def build_servicer_lookup(servicer_uploads: List) -> Tuple[pd.DataFrame, date, p
 
     run_date = max(file_dates) if file_dates else today_et()
     return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
+
 
 
 
@@ -5999,8 +6093,14 @@ if build_btn:
                 st.caption("Servicer files were skipped. Servicer-driven columns will use Salesforce fallback where available.")
                 st.caption(f"UPB header (always today): **{upb_col}**")
             else:
-                status.update(label="Parsing servicer files...")
-                serv_join, detected_run_date, serv_preview = build_servicer_lookup(servicer_uploads)
+                servicer_phase_started = time.perf_counter()
+
+                def _servicer_progress(message: str) -> None:
+                    elapsed = time.perf_counter() - servicer_phase_started
+                    status.update(label=f"Servicer processing | {message} | total {elapsed:0.1f}s")
+
+                _servicer_progress(f"starting {len(servicer_uploads)} uploaded file(s)")
+                serv_join, detected_run_date, serv_preview = build_servicer_lookup(servicer_uploads, progress_callback=_servicer_progress, use_cache=False)
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest servicer report date from file contents / report tabs: **{detected_run_date.isoformat()}**")
