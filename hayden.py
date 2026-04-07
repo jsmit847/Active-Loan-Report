@@ -2418,9 +2418,10 @@ def _md5_hex(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-def make_upload_blob(upload) -> UploadBlob:
+def make_upload_blob(upload, include_hash: bool = True) -> UploadBlob:
     b = upload.getvalue()
-    return UploadBlob(filename=upload.name, file_hash=_md5_hex(b), data=b)
+    file_hash = _md5_hex(b) if include_hash else ""
+    return UploadBlob(filename=upload.name, file_hash=file_hash, data=b)
 
 
 def date_from_filename(name: str) -> Optional[date]:
@@ -2858,73 +2859,153 @@ def _filter_term_population(
     return out
 
 
+def _ordered_sheet_names(sheet_names: Sequence[str], preferred_sheets: Optional[List[str]] = None) -> List[str]:
+    names = list(sheet_names or [])
+    if not preferred_sheets:
+        return names
+    preferred = []
+    others = []
+    for sheet_name in names:
+        sheet_lc = sheet_name.lower()
+        if any(pref.lower() in sheet_lc for pref in preferred_sheets):
+            preferred.append(sheet_name)
+        else:
+            others.append(sheet_name)
+    return preferred + others
+
+
+def _header_match_score(header_values: Sequence[object], required_alias_groups: List[List[str]]) -> int:
+    header_tokens = {normalize_header_name(v) for v in header_values if clean_text(v)}
+    if not header_tokens:
+        return 0
+    return sum(any(normalize_header_name(alias) in header_tokens for alias in aliases) for aliases in required_alias_groups)
+
+
+def _header_usecols_from_alias_groups(header_values: Sequence[object], alias_groups: Optional[List[List[str]]]) -> Optional[List[int]]:
+    if not alias_groups:
+        return None
+    alias_tokens = {normalize_header_name(alias) for group in alias_groups for alias in group}
+    usecols = [idx for idx, value in enumerate(header_values) if normalize_header_name(value) in alias_tokens]
+    return sorted(set(usecols)) if usecols else None
+
+
 def _best_header_read_excel(
     file_bytes: bytes,
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
     max_header_scan: int = 8,
+    selected_alias_groups: Optional[List[List[str]]] = None,
+    progress_callback=None,
 ):
-    xls = pd.ExcelFile(BytesIO(file_bytes))
-    sheet_names = list(xls.sheet_names)
-
-    if preferred_sheets:
-        preferred = []
-        others = []
-        for s in sheet_names:
-            if any(p.lower() in s.lower() for p in preferred_sheets):
-                preferred.append(s)
-            else:
-                others.append(s)
-        ordered = preferred + others
-    else:
-        ordered = sheet_names
-
-    best = None
+    workbook = None
+    best_sheet = None
+    best_header_row = None
+    best_header_values = []
     best_score = -1
+    target_score = len(required_alias_groups)
 
-    for sheet in ordered:
-        for header_row in range(max_header_scan):
+    try:
+        workbook = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
+        ordered = _ordered_sheet_names(list(workbook.sheetnames), preferred_sheets)
+
+        for sheet_idx, sheet_name in enumerate(ordered, start=1):
+            if progress_callback:
+                progress_callback(f"scanning header rows on sheet '{sheet_name}' ({sheet_idx}/{len(ordered)})")
             try:
-                df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=header_row)
-                df = df.dropna(how="all")
-                if df.empty:
-                    continue
-                df.columns = [str(c).strip() for c in df.columns]
-                score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
-                if score > best_score:
-                    best_score = score
-                    best = (df, sheet, header_row, score)
+                ws = workbook[sheet_name]
+                for header_row in range(1, max_header_scan + 1):
+                    row_iter = ws.iter_rows(min_row=header_row, max_row=header_row, max_col=256, values_only=True)
+                    row_values = list(next(row_iter, ()))
+                    score = _header_match_score(row_values, required_alias_groups)
+                    if score > best_score:
+                        best_score = score
+                        best_sheet = sheet_name
+                        best_header_row = header_row - 1
+                        best_header_values = row_values
+                    if score >= target_score:
+                        break
+                if best_score >= target_score and best_sheet == sheet_name:
+                    break
             except Exception:
                 continue
+    finally:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
 
-    if best is None or best_score <= 0:
+    if best_sheet is None or best_score <= 0 or best_header_row is None:
         raise ValueError("Could not find a matching header row.")
 
-    return best
+    usecols = _header_usecols_from_alias_groups(best_header_values, selected_alias_groups)
+    if progress_callback:
+        if usecols is None:
+            progress_callback(f"reading sheet '{best_sheet}'")
+        else:
+            progress_callback(f"reading sheet '{best_sheet}' ({len(usecols)} column(s))")
+
+    xls = pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl")
+    try:
+        df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row, usecols=usecols)
+    except Exception:
+        if usecols is None:
+            raise
+        if progress_callback:
+            progress_callback(f"retrying sheet '{best_sheet}' without column pruning")
+        df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row)
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError("Could not find a matching header row.")
+    df.columns = [str(c).strip() for c in df.columns]
+    score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+    if score <= 0:
+        raise ValueError("Could not find a matching header row.")
+    return df, best_sheet, best_header_row, score
 
 
-def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 3):
-    best = None
+def _best_header_read_csv(
+    file_bytes: bytes,
+    required_alias_groups: List[List[str]],
+    max_header_scan: int = 3,
+    selected_alias_groups: Optional[List[List[str]]] = None,
+    progress_callback=None,
+):
+    best_header_row = None
     best_score = -1
+    target_score = len(required_alias_groups)
 
     for header_row in range(max_header_scan):
+        if progress_callback:
+            progress_callback(f"scanning csv header row {header_row + 1}/{max_header_scan}")
         try:
-            df = pd.read_csv(BytesIO(file_bytes), header=header_row)
-            df = df.dropna(how="all")
-            if df.empty:
+            sample = pd.read_csv(BytesIO(file_bytes), header=header_row, nrows=60)
+            sample = sample.dropna(how="all")
+            if sample.empty:
                 continue
-            df.columns = [str(c).strip() for c in df.columns]
-            score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+            sample.columns = [str(c).strip() for c in sample.columns]
+            score = sum(first_matching_col(sample, aliases) is not None for aliases in required_alias_groups)
             if score > best_score:
                 best_score = score
-                best = (df, header_row, score)
+                best_header_row = header_row
+            if score >= target_score:
+                break
         except Exception:
             continue
 
-    if best is None or best_score <= 0:
+    if best_header_row is None or best_score <= 0:
         raise ValueError("Could not find a matching CSV header row.")
 
-    return best
+    alias_tokens = {normalize_header_name(alias) for group in (selected_alias_groups or []) for alias in group}
+    usecols = (lambda c: normalize_header_name(c) in alias_tokens) if alias_tokens else None
+    if progress_callback:
+        progress_callback("reading csv rows")
+    df = pd.read_csv(BytesIO(file_bytes), header=best_header_row, usecols=usecols)
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError("Could not find a matching CSV header row.")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df, best_header_row, best_score
 
 
 def _series_to_num(df: pd.DataFrame, aliases: Sequence[str]) -> pd.Series:
@@ -2965,14 +3046,25 @@ def _as_of_for_df(df: pd.DataFrame, filename: str, aliases: Sequence[str]) -> da
     return date_from_filename(filename) or today_et()
 
 
-def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
+def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.DataFrame:
     servicer_type = detect_servicer_type(filename)
+    if progress_callback:
+        progress_callback(f"detected {servicer_type}; locating headers")
 
     if servicer_type == "Shellpoint":
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["LoanID", "Servicer Loan ID", "Loan Number"], ["PrincipalBalance", "UPB", "Current UPB"]],
             max_header_scan=2,
+            selected_alias_groups=[
+                ["LoanID", "Servicer Loan ID", "Loan Number", "InvestorLoanID", "Investor Loan ID"],
+                ["PrincipalBalance", "UPB", "Current UPB"],
+                ["SuspenseBalance", "Suspense Balance"],
+                ["NextDueDate", "Next Due Date", "Next Payment Date"],
+                ["LoanStatus", "Status", "PayString"],
+                ["DataAsOf", "Report Date", "As Of Date", "Run Date"],
+            ],
+            progress_callback=progress_callback,
         )
         sid_col = first_matching_col(df, ["LoanID", "Servicer Loan ID", "Loan Number"])
         if not sid_col:
@@ -2980,6 +3072,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         if not sid_col:
             raise ValueError("Shellpoint file is missing a loan identifier column.")
 
+        if progress_callback:
+            progress_callback("normalizing Shellpoint rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3000,11 +3094,23 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["Servicer Loan ID", "Loan ID", "Loan Number"], ["UPB", "Principal Balance", "Current UPB"]],
+            selected_alias_groups=[
+                ["Servicer Loan ID", "Loan ID", "Loan Number"],
+                ["UPB", "Principal Balance", "Current UPB"],
+                ["Servicing Company", "Servicer", "Servicer Name"],
+                ["Next Due Date", "Due Date", "Next Payment Date"],
+                ["Current Maturity Date", "Maturity Date"],
+                ["Performing Status", "Status", "Loan Status"],
+                ["Report Date", "As Of Date", "Run Date"],
+            ],
+            progress_callback=progress_callback,
         )
         servicer_col = first_matching_col(df, ["Servicing Company", "Servicer", "Servicer Name"])
         servicer = df[servicer_col].astype("string") if servicer_col else pd.Series(["CHL Streamline"] * len(df))
         servicer = servicer.fillna("CHL Streamline")
         servicer = servicer.where(~servicer.astype("string").str.upper().eq("FCI"), "FCI CHL Streamline")
+        if progress_callback:
+            progress_callback("normalizing CHL rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3026,12 +3132,24 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"], ["Current UPB", "Principal Balance", "UPB"]],
             preferred_sheets=["loan"],
+            selected_alias_groups=[
+                ["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"],
+                ["Current UPB", "Principal Balance", "UPB"],
+                ["Unapplied Balance", "Suspense Balance", "Suspense"],
+                ["Due Date", "Next Due Date", "Next Payment Date"],
+                ["Maturity Date", "Current Maturity Date"],
+                ["Loan Status", "Status"],
+                ["Date", "Run Date", "Report Date", "As Of Date"],
+            ],
+            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
             sid = norm_id_series(s).astype("string")
             return sid.apply(lambda x: x if pd.isna(x) else (x if x.startswith("0000") else f"0000{x}"))
 
+        if progress_callback:
+            progress_callback("normalizing Statebridge rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3053,7 +3171,19 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["BCM Loan#", "Loan Number", "Loan No"], ["Principal Balance", "Current UPB", "UPB"]],
             preferred_sheets=["loan"],
+            selected_alias_groups=[
+                ["BCM Loan#", "Loan Number", "Loan No"],
+                ["Principal Balance", "Current UPB", "UPB"],
+                ["Suspense Balance", "Unapplied Balance", "Suspense"],
+                ["Next Payment Due Date", "Next Due Date", "Due Date"],
+                ["Maturity Date", "Current Maturity Date"],
+                ["Loan Status", "Status"],
+                ["Run Date", "Date", "Report Date", "As Of Date"],
+            ],
+            progress_callback=progress_callback,
         )
+        if progress_callback:
+            progress_callback("normalizing Berkadia rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3075,8 +3205,20 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
+            selected_alias_groups=[
+                ["Account", "Loan Number", "Loan No"],
+                ["Current Balance", "Current UPB", "UPB", "Principal Balance"],
+                ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"],
+                ["Next Due Date", "Due Date", "Next Payment Date"],
+                ["Maturity Date", "Current Maturity Date"],
+                ["Status", "Loan Status"],
+                ["Report Date", "As Of Date", "Date", "Run Date"],
+            ],
+            progress_callback=progress_callback,
         )
         servicer = fci_servicer_label_from_filename(filename)
+        if progress_callback:
+            progress_callback(f"normalizing {servicer} rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3098,6 +3240,15 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             b,
             [["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"], ["UPB$", "UPB", "Current UPB", "Principal Balance"]],
             preferred_sheets=["export", "midland", "loan"],
+            selected_alias_groups=[
+                ["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"],
+                ["UPB$", "UPB", "Current UPB", "Principal Balance"],
+                ["NextPaymentDate", "Next Payment Date", "Next Due Date"],
+                ["MaturityDate", "Maturity Date"],
+                ["ServicerLoanStatus", "Loan Status", "Status"],
+                ["ReportDate", "Report Date", "As Of Date", "Run Date"],
+            ],
+            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
@@ -3106,6 +3257,8 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
             raw = raw.str.replace(r"[^0-9A-Za-z]", "", regex=True).str.lstrip("0")
             return raw.replace({"": pd.NA})
 
+        if progress_callback:
+            progress_callback("normalizing Midland rows")
         out = pd.DataFrame(
             {
                 "source_file": filename,
@@ -3125,10 +3278,63 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     raise ValueError("Unhandled servicer type.")
 
 
-
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60, max_entries=128, hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"})
 def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
+
+
+SERVICER_LOOKUP_COLUMNS = [
+    "source_file",
+    "servicer",
+    "servicer_family",
+    "servicer_id",
+    "upb",
+    "suspense",
+    "next_payment_date",
+    "maturity_date",
+    "status",
+    "as_of",
+]
+
+
+def _empty_servicer_lookup_frame(include_key: bool = True) -> pd.DataFrame:
+    cols = SERVICER_LOOKUP_COLUMNS + (["_sid_key"] if include_key else [])
+    return pd.DataFrame(columns=cols)
+
+
+def _collapse_servicer_lookup_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_servicer_lookup_frame(include_key=True)
+
+    full = df.copy()
+    for col in SERVICER_LOOKUP_COLUMNS:
+        if col not in full.columns:
+            full[col] = pd.NA
+    full = full[SERVICER_LOOKUP_COLUMNS].copy()
+    full["as_of"] = pd.to_datetime(full.get("as_of"), errors="coerce")
+    full = full.dropna(subset=["servicer_id"]).copy()
+    full["_sid_key"] = id_key_no_leading_zeros(full["servicer_id"])
+    full = full.dropna(subset=["_sid_key"]).copy()
+    if full.empty:
+        return _empty_servicer_lookup_frame(include_key=True)
+
+    full["_as_of_sort"] = pd.to_datetime(full["as_of"], errors="coerce")
+    full["_as_of_sort"] = full["_as_of_sort"].where(full["_as_of_sort"].notna(), pd.Timestamp("1900-01-01"))
+    full["_has_upb"] = full["upb"].notna().astype("int8")
+    full["_has_nonzero_upb"] = (pd.to_numeric(full["upb"], errors="coerce").fillna(0) > 0).astype("int8")
+    full["_has_suspense"] = full["suspense"].notna().astype("int8")
+    full["_has_npd"] = pd.to_datetime(full["next_payment_date"], errors="coerce").notna().astype("int8")
+    full["_has_mat"] = pd.to_datetime(full["maturity_date"], errors="coerce").notna().astype("int8")
+    full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
+
+    full = full.sort_values(
+        ["_sid_key", "_as_of_sort", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
+        ascending=[True, True, True, True, True, True, True, True, True],
+        kind="stable",
+    )
+    full = full.drop_duplicates(["_sid_key"], keep="last")
+    full = full.drop(columns=["_as_of_sort", "_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
+    return downcast_numeric_frame(full)
 
 
 def build_servicer_lookup(
@@ -3136,36 +3342,67 @@ def build_servicer_lookup(
     progress_callback=None,
     use_cache: bool = False,
 ) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
-    frames: List[pd.DataFrame] = []
+    join = _empty_servicer_lookup_frame(include_key=True)
+    preview_samples: List[pd.DataFrame] = []
+    preview_rows_remaining = 30
     file_dates: List[date] = []
     skipped_files: List[str] = []
     total_files = len(servicer_uploads or [])
 
     for idx, upload in enumerate(servicer_uploads or [], start=1):
         blob = None
-        try:
-            blob = make_upload_blob(upload)
+        parsed = None
+        name = getattr(upload, "name", f"file {idx}")
+
+        def _file_progress(detail: str) -> None:
             if progress_callback:
-                progress_callback(f"servicer {idx}/{total_files} | {blob.filename} | parsing")
-            parsed = parse_servicer_cached(blob) if use_cache else parse_servicer_bytes(blob.filename, blob.data)
+                progress_callback(f"servicer {idx}/{total_files} | {name} | {detail}")
+
+        try:
+            _file_progress("reading upload bytes")
+            blob = make_upload_blob(upload, include_hash=use_cache)
+            name = blob.filename
+            if use_cache:
+                _file_progress("loading cached parse")
+                parsed = parse_servicer_cached(blob)
+            else:
+                parsed = parse_servicer_bytes(blob.filename, blob.data, progress_callback=_file_progress)
         except Exception as e:
-            name = getattr(blob, "filename", None) or getattr(upload, "name", f"file {idx}")
             skipped_files.append(f"{name}: {e}")
+            del parsed
+            del blob
             gc.collect()
             continue
 
         if parsed is not None and not parsed.empty:
-            frames.append(parsed)
+            parsed = parsed[[c for c in SERVICER_LOOKUP_COLUMNS if c in parsed.columns]].copy()
+            for col in SERVICER_LOOKUP_COLUMNS:
+                if col not in parsed.columns:
+                    parsed[col] = pd.NA
+            parsed = parsed[SERVICER_LOOKUP_COLUMNS]
+
+            if preview_rows_remaining > 0:
+                sample = parsed.head(min(10, preview_rows_remaining)).copy()
+                if not sample.empty:
+                    preview_samples.append(sample)
+                    preview_rows_remaining -= len(sample)
+
             if "as_of" in parsed.columns and parsed["as_of"].notna().any():
-                d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
+                try:
+                    d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
+                except Exception:
+                    d = date_from_filename(name)
             else:
-                d = date_from_filename(blob.filename)
+                d = date_from_filename(name)
             if d:
                 file_dates.append(d)
 
-        if progress_callback:
-            rows = 0 if parsed is None else len(parsed)
-            progress_callback(f"servicer {idx}/{total_files} | {blob.filename} | parsed {rows:,} rows")
+            _file_progress(f"collapsing {len(parsed):,} parsed row(s)")
+            join = pd.concat([join[SERVICER_LOOKUP_COLUMNS], parsed], ignore_index=True, copy=False)
+            join = _collapse_servicer_lookup_rows(join)
+            _file_progress(f"parsed {len(parsed):,} row(s); unique servicer ids {len(join):,}")
+        else:
+            _file_progress("parsed 0 row(s)")
 
         del parsed
         del blob
@@ -3177,43 +3414,15 @@ def build_servicer_lookup(
         except Exception:
             pass
 
-    full = (
-        pd.concat(frames, ignore_index=True, copy=False)
-        if frames
-        else pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
-    )
-    frames.clear()
+    if preview_samples:
+        preview = pd.concat(preview_samples, ignore_index=True, copy=False)
+    else:
+        preview = _empty_servicer_lookup_frame(include_key=False)
+    preview = preview.head(30).copy()
     gc.collect()
 
-    if not full.empty:
-        full = full.dropna(subset=["servicer_id"]).copy()
-        full["_sid_key"] = id_key_no_leading_zeros(full["servicer_id"])
-        full = full.dropna(subset=["_sid_key"]).copy()
-
-        full["_has_upb"] = full["upb"].notna().astype("int8")
-        full["_has_nonzero_upb"] = (pd.to_numeric(full["upb"], errors="coerce").fillna(0) > 0).astype("int8")
-        full["_has_suspense"] = full["suspense"].notna().astype("int8")
-        full["_has_npd"] = full["next_payment_date"].notna().astype("int8")
-        full["_has_mat"] = full["maturity_date"].notna().astype("int8")
-        full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
-
-        full = full.sort_values(
-            ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
-            ascending=[True, True, True, True, True, True, True, True, True],
-        )
-
-        join = full.drop_duplicates(["_sid_key"], keep="last").drop(
-            columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore"
-        )
-        preview = full.head(50).copy()
-        full = full.drop(columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
-    else:
-        full["_sid_key"] = pd.Series(dtype="string")
-        join = full.copy()
-        preview = full.copy()
-
     run_date = max(file_dates) if file_dates else today_et()
-    return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
+    return join, run_date, downcast_numeric_frame(preview)
 
 
 
