@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -54,9 +54,6 @@ API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
 BULK_WAIT_TIMEOUT_SECONDS = 300
 OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
-SERVICER_PARSE_CACHE_ENABLED = False
-SERVICER_HEADER_SCAN_ROWS = 60
-SERVICER_PREVIEW_ROWS = 50
 ENFORCE_ZERO_FILLABLE_BLANKS = True
 ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
@@ -2815,48 +2812,6 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     result["matched_source"] = pd.Series(selected_source, index=sf_term.index, dtype="object")
     return result
 
-def _term_population_keep_mask(
-    stage_series: pd.Series,
-    current_upb_series: pd.Series,
-    sold_servicing_status_series: pd.Series,
-    deal_key_series: Optional[pd.Series] = None,
-    prev_sold_retained_keys: Optional[Set[str]] = None,
-    always_keep_keys: Optional[Set[str]] = None,
-    reo_date_series: Optional[pd.Series] = None,
-) -> pd.Series:
-    stage = pd.Series(stage_series, copy=False).astype("string").str.strip()
-    current_upb = pd.to_numeric(pd.Series(current_upb_series, copy=False), errors="coerce").fillna(0)
-    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status_series)
-
-    if deal_key_series is None:
-        deal_key = pd.Series([pd.NA] * len(stage), index=stage.index, dtype="object")
-    else:
-        deal_key = norm_id_series(pd.Series(deal_key_series, copy=False))
-        if not deal_key.index.equals(stage.index):
-            deal_key.index = stage.index
-
-    prev_sold_retained_keys = prev_sold_retained_keys or set()
-    always_keep_keys = always_keep_keys or set()
-
-    in_prev_sold_retained = deal_key.isin(prev_sold_retained_keys)
-    always_keep = deal_key.isin(always_keep_keys)
-
-    is_sold = stage.eq("Sold")
-    is_reo = stage.isin(REO_FAMILY_STAGES)
-    if reo_date_series is not None:
-        is_reo = is_reo | pd.to_datetime(pd.Series(reo_date_series, copy=False), errors="coerce").notna()
-
-    positive_upb = current_upb.gt(0)
-
-    keep_mask = (
-        always_keep
-        | is_reo
-        | ((~is_sold) & positive_upb)
-        | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
-    )
-    return keep_mask.fillna(False)
-
-
 def _filter_term_population(
     sf_term: pd.DataFrame,
     prev_keys: Optional[Set[str]] = None,
@@ -2867,24 +2822,40 @@ def _filter_term_population(
         return sf_term
 
     out = sf_term.copy()
+    prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
+    in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
-    keep_mask = _term_population_keep_mask(
-        stage_series=out.get("Stage", pd.Series([""] * len(out), index=out.index)),
-        current_upb_series=out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
-        sold_servicing_status_series=out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
-        deal_key_series=out["_deal_key"],
-        prev_sold_retained_keys=prev_sold_retained_keys,
+    stage = out.get("Stage", pd.Series([""] * len(out), index=out.index)).astype("string").str.strip()
+    current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
+    sold_servicing_status = out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
+
+    sold_servicing_retained = _sold_servicing_retained_mask(sold_servicing_status)
+    is_closed_won = stage.eq("Closed Won")
+    is_sold = stage.eq("Sold")
+    is_expired_or_matured = stage.isin(EXPIRED_OR_MATURED_STAGES)
+    is_reo = stage.isin(REO_FAMILY_STAGES)
+
+    # Keep sold-servicing-retained loans even when Salesforce stage/financing fields are
+    # inconsistent. Some valid retained-servicing deals are not reliably labeled as Stage=Sold
+    # in the wide pull, so key off the raw servicing status directly.
+    keep_mask = (
+        is_closed_won
+        | is_reo
+        | ((~sold_servicing_retained) & (~in_prev_sold_retained) & current_upb.gt(0))
+        | sold_servicing_retained
+        | in_prev_sold_retained
     )
-    return out.loc[keep_mask].copy()
+    out = out.loc[keep_mask].copy()
 
+    # Hard exclusions still win unless the user explicitly force-kept the deal.
+    excluded_stage = stage.isin(["Paid Off", "REO-Sold"])
+    if excluded_stage.any():
+        always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
+        keep_excluded = out["_deal_key"].isin(always_keep_keys)
+        out = out.loc[(~excluded_stage.loc[out.index]) | keep_excluded].copy()
 
-def _score_header_row_values(row_values: Sequence[object], required_alias_groups: List[List[str]]) -> int:
-    normalized = {normalize_header_name(v) for v in row_values if has_any_value(v)}
-    normalized.discard("")
-    if not normalized:
-        return 0
-    return sum(any(normalize_header_name(alias) in normalized for alias in aliases) for aliases in required_alias_groups)
+    return out
 
 
 def _best_header_read_excel(
@@ -2892,10 +2863,8 @@ def _best_header_read_excel(
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
     max_header_scan: int = 8,
-    progress_callback: Optional[Callable[[str], None]] = None,
 ):
-    bio = BytesIO(file_bytes)
-    xls = pd.ExcelFile(bio)
+    xls = pd.ExcelFile(BytesIO(file_bytes))
     sheet_names = list(xls.sheet_names)
 
     if preferred_sheets:
@@ -2910,83 +2879,52 @@ def _best_header_read_excel(
     else:
         ordered = sheet_names
 
-    best_sheet = None
-    best_header_row = None
+    best = None
     best_score = -1
-    probe_rows = max(SERVICER_HEADER_SCAN_ROWS, max_header_scan + 2)
 
     for sheet in ordered:
-        if progress_callback:
-            progress_callback(f"scanning header rows on sheet '{sheet}'")
-        try:
-            sample = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=probe_rows, dtype=object)
-        except Exception:
-            continue
-        if sample is None or sample.empty:
-            continue
+        for header_row in range(max_header_scan):
+            try:
+                df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=header_row)
+                df = df.dropna(how="all")
+                if df.empty:
+                    continue
+                df.columns = [str(c).strip() for c in df.columns]
+                score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+                if score > best_score:
+                    best_score = score
+                    best = (df, sheet, header_row, score)
+            except Exception:
+                continue
 
-        limit = min(max_header_scan, len(sample.index))
-        for header_row in range(limit):
-            score = _score_header_row_values(sample.iloc[header_row].tolist(), required_alias_groups)
-            if score > best_score:
-                best_score = score
-                best_sheet = sheet
-                best_header_row = header_row
-
-        del sample
-        gc.collect()
-
-    if best_sheet is None or best_header_row is None or best_score <= 0:
+    if best is None or best_score <= 0:
         raise ValueError("Could not find a matching header row.")
 
-    if progress_callback:
-        progress_callback(f"reading matched sheet '{best_sheet}' using header row {best_header_row + 1}")
-
-    df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row)
-    df = df.dropna(how="all")
-    if not df.empty:
-        df.columns = [str(c).strip() for c in df.columns]
-    return df, best_sheet, best_header_row, best_score
+    return best
 
 
-def _best_header_read_csv(
-    file_bytes: bytes,
-    required_alias_groups: List[List[str]],
-    max_header_scan: int = 3,
-    progress_callback: Optional[Callable[[str], None]] = None,
-):
-    probe_rows = max(SERVICER_HEADER_SCAN_ROWS, max_header_scan + 2)
-    if progress_callback:
-        progress_callback(f"sampling first {probe_rows} CSV rows to find headers")
-
-    sample = pd.read_csv(BytesIO(file_bytes), header=None, nrows=probe_rows, dtype=object)
-    if sample is None or sample.empty:
-        raise ValueError("Could not find a matching CSV header row.")
-
-    best_header_row = None
+def _best_header_read_csv(file_bytes: bytes, required_alias_groups: List[List[str]], max_header_scan: int = 3):
+    best = None
     best_score = -1
-    limit = min(max_header_scan, len(sample.index))
-    for header_row in range(limit):
-        score = _score_header_row_values(sample.iloc[header_row].tolist(), required_alias_groups)
-        if score > best_score:
-            best_score = score
-            best_header_row = header_row
 
-    del sample
-    gc.collect()
+    for header_row in range(max_header_scan):
+        try:
+            df = pd.read_csv(BytesIO(file_bytes), header=header_row)
+            df = df.dropna(how="all")
+            if df.empty:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
+            if score > best_score:
+                best_score = score
+                best = (df, header_row, score)
+        except Exception:
+            continue
 
-    if best_header_row is None or best_score <= 0:
+    if best is None or best_score <= 0:
         raise ValueError("Could not find a matching CSV header row.")
 
-    if progress_callback:
-        progress_callback(f"reading CSV using header row {best_header_row + 1}")
-
-    df = pd.read_csv(BytesIO(file_bytes), header=best_header_row)
-    df = df.dropna(how="all")
-    if not df.empty:
-        df.columns = [str(c).strip() for c in df.columns]
-    return df, best_header_row, best_score
-
+    return best
 
 
 def _series_to_num(df: pd.DataFrame, aliases: Sequence[str]) -> pd.Series:
@@ -3027,17 +2965,14 @@ def _as_of_for_df(df: pd.DataFrame, filename: str, aliases: Sequence[str]) -> da
     return date_from_filename(filename) or today_et()
 
 
-def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
+def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     servicer_type = detect_servicer_type(filename)
-    if progress_callback:
-        progress_callback(f"detected {servicer_type}; matching layout")
 
     if servicer_type == "Shellpoint":
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["LoanID", "Servicer Loan ID", "Loan Number"], ["PrincipalBalance", "UPB", "Current UPB"]],
             max_header_scan=2,
-            progress_callback=progress_callback,
         )
         sid_col = first_matching_col(df, ["LoanID", "Servicer Loan ID", "Loan Number"])
         if not sid_col:
@@ -3065,7 +3000,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Ca
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["Servicer Loan ID", "Loan ID", "Loan Number"], ["UPB", "Principal Balance", "Current UPB"]],
-            progress_callback=progress_callback,
         )
         servicer_col = first_matching_col(df, ["Servicing Company", "Servicer", "Servicer Name"])
         servicer = df[servicer_col].astype("string") if servicer_col else pd.Series(["CHL Streamline"] * len(df))
@@ -3092,7 +3026,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Ca
             b,
             [["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"], ["Current UPB", "Principal Balance", "UPB"]],
             preferred_sheets=["loan"],
-            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
@@ -3120,7 +3053,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Ca
             b,
             [["BCM Loan#", "Loan Number", "Loan No"], ["Principal Balance", "Current UPB", "UPB"]],
             preferred_sheets=["loan"],
-            progress_callback=progress_callback,
         )
         out = pd.DataFrame(
             {
@@ -3143,7 +3075,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Ca
             b,
             [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
-            progress_callback=progress_callback,
         )
         servicer = fci_servicer_label_from_filename(filename)
         out = pd.DataFrame(
@@ -3167,7 +3098,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback: Optional[Ca
             b,
             [["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"], ["UPB$", "UPB", "Current UPB", "Principal Balance"]],
             preferred_sheets=["export", "midland", "loan"],
-            progress_callback=progress_callback,
         )
 
         def _idfix(s: pd.Series) -> pd.Series:
@@ -3203,59 +3133,41 @@ def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
 
 def build_servicer_lookup(
     servicer_uploads: List,
-    progress_callback: Optional[Callable[[str], None]] = None,
-    use_cache: bool = SERVICER_PARSE_CACHE_ENABLED,
+    progress_callback=None,
+    use_cache: bool = False,
 ) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
     frames: List[pd.DataFrame] = []
     file_dates: List[date] = []
     skipped_files: List[str] = []
-    total_uploads = len(servicer_uploads or [])
-    parse_started = time.perf_counter()
+    total_files = len(servicer_uploads or [])
 
     for idx, upload in enumerate(servicer_uploads or [], start=1):
-        blob = make_upload_blob(upload)
-
-        def _emit(step: str) -> None:
+        blob = None
+        try:
+            blob = make_upload_blob(upload)
             if progress_callback:
-                elapsed = time.perf_counter() - parse_started
-                progress_callback(f"servicer {idx}/{total_uploads} | {blob.filename} | {step} | elapsed {elapsed:0.1f}s")
-
-        try:
-            servicer_type = detect_servicer_type(blob.filename)
-            _emit(f"detected {servicer_type}; starting parse")
-        except Exception:
-            servicer_type = None
-            _emit("starting parse")
-
-        try:
-            if use_cache:
-                parsed = parse_servicer_cached(blob)
-            else:
-                parsed = parse_servicer_bytes(blob.filename, blob.data, progress_callback=_emit)
+                progress_callback(f"servicer {idx}/{total_files} | {blob.filename} | parsing")
+            parsed = parse_servicer_cached(blob) if use_cache else parse_servicer_bytes(blob.filename, blob.data)
         except Exception as e:
-            skipped_files.append(f"{blob.filename}: {e}")
-            del blob
+            name = getattr(blob, "filename", None) or getattr(upload, "name", f"file {idx}")
+            skipped_files.append(f"{name}: {e}")
             gc.collect()
             continue
 
-        if parsed.empty:
-            _emit("parsed 0 rows after cleanup")
-            del parsed
-            del blob
-            gc.collect()
-            continue
+        if parsed is not None and not parsed.empty:
+            frames.append(parsed)
+            if "as_of" in parsed.columns and parsed["as_of"].notna().any():
+                d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
+            else:
+                d = date_from_filename(blob.filename)
+            if d:
+                file_dates.append(d)
 
-        frames.append(parsed)
-        _emit(f"parsed {len(parsed):,} normalized rows")
+        if progress_callback:
+            rows = 0 if parsed is None else len(parsed)
+            progress_callback(f"servicer {idx}/{total_files} | {blob.filename} | parsed {rows:,} rows")
 
-        if "as_of" in parsed.columns and parsed["as_of"].notna().any():
-            d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
-        else:
-            d = date_from_filename(blob.filename)
-
-        if d:
-            file_dates.append(d)
-
+        del parsed
         del blob
         gc.collect()
 
@@ -3265,12 +3177,11 @@ def build_servicer_lookup(
         except Exception:
             pass
 
-    if frames:
-        if progress_callback:
-            progress_callback("combining normalized servicer rows")
-        full = pd.concat(frames, ignore_index=True, copy=False)
-    else:
-        full = pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
+    full = (
+        pd.concat(frames, ignore_index=True, copy=False)
+        if frames
+        else pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of"])
+    )
     frames.clear()
     gc.collect()
 
@@ -3286,9 +3197,6 @@ def build_servicer_lookup(
         full["_has_mat"] = full["maturity_date"].notna().astype("int8")
         full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
 
-        if progress_callback:
-            progress_callback("ranking and deduplicating servicer rows")
-
         full = full.sort_values(
             ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
             ascending=[True, True, True, True, True, True, True, True, True],
@@ -3297,9 +3205,8 @@ def build_servicer_lookup(
         join = full.drop_duplicates(["_sid_key"], keep="last").drop(
             columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore"
         )
-        preview = join.head(SERVICER_PREVIEW_ROWS).copy()
-        del full
-        gc.collect()
+        preview = full.head(50).copy()
+        full = full.drop(columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
     else:
         full["_sid_key"] = pd.Series(dtype="string")
         join = full.copy()
@@ -3307,7 +3214,6 @@ def build_servicer_lookup(
 
     run_date = max(file_dates) if file_dates else today_et()
     return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
-
 
 
 
@@ -4026,8 +3932,6 @@ def _build_term_loan_salesforce_fallback(
     upb_col: str,
     prev_maps: dict,
     template_maps: dict,
-    prev_sold_retained_keys: Optional[Set[str]] = None,
-    always_keep_keys: Optional[Set[str]] = None,
 ) -> pd.DataFrame:
     if sf_term is None or sf_term.empty:
         return pd.DataFrame()
@@ -4038,12 +3942,6 @@ def _build_term_loan_salesforce_fallback(
         out[col] = sf_term[label] if label in sf_term.columns else pd.NA
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
-    out["_stage_raw"] = sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index))
-    out["_sold_servicing_status_raw"] = sf_term.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index))
-    out["_sf_current_servicer_upb_raw"] = pd.to_numeric(
-        sf_term.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
-        errors="coerce",
-    )
 
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
@@ -4165,15 +4063,29 @@ def _build_term_loan_salesforce_fallback(
         out[upb_col] = np.where(reo_mask & ((cur_upb.isna()) | (cur_upb <= 0)), fill_val, cur_upb)
         out = out.drop(columns=["_prev_upb"], errors="ignore")
 
-    keep_mask = _term_population_keep_mask(
-        stage_series=out.get("_stage_raw", pd.Series([pd.NA] * len(out), index=out.index)),
-        current_upb_series=out.get("_sf_current_servicer_upb_raw", pd.Series([np.nan] * len(out), index=out.index)),
-        sold_servicing_status_series=out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)),
-        deal_key_series=out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)),
-        prev_sold_retained_keys=prev_sold_retained_keys,
-        always_keep_keys=always_keep_keys,
-        reo_date_series=out.get("REO Date", pd.Series([pd.NaT] * len(out), index=out.index)),
+    stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string").str.strip()
+    final_upb = pd.to_numeric(out[upb_col], errors="coerce").fillna(0)
+    sold_segment_retained = _term_segment_is_sold_servicing_retained(out.get("Segment", blank_obj))
+    raw_sold_retained = _sold_servicing_retained_mask(out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)))
+    prev_sold_retained = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(prev_sold_retained_keys or set())
+    is_closed_won = stage_series.eq("Closed Won")
+    is_sold = stage_series.eq("Sold")
+    is_reo = pd.to_datetime(out["REO Date"], errors="coerce").notna() | stage_series.isin(REO_FAMILY_STAGES)
+    is_expired_or_matured = stage_series.isin(EXPIRED_OR_MATURED_STAGES)
+
+    keep_mask = (
+        is_closed_won
+        | is_reo
+        | ((~raw_sold_retained) & (~prev_sold_retained) & final_upb.gt(0))
+        | raw_sold_retained
+        | prev_sold_retained
+        | (is_sold & sold_segment_retained)
     )
+    excluded_stage = stage_series.isin(["Paid Off", "REO-Sold"])
+    if always_keep_keys:
+        keep_mask = keep_mask & (~excluded_stage | out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(always_keep_keys))
+    else:
+        keep_mask = keep_mask & (~excluded_stage)
     out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
@@ -4359,23 +4271,21 @@ def build_term_loan(
     asset_filter_provided = asset_deal_numbers is not None
     asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
     always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
+    retained_deal_keys = set()
+    if sf_term_active is not None and not sf_term_active.empty:
+        retained_mask = _sold_servicing_retained_mask(
+            sf_term_active.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index))
+        )
+        retained_deal_keys = set(
+            norm_id_series(sf_term_active.loc[retained_mask, "Deal Loan Number"]).dropna().tolist()
+        )
     if asset_filter_provided and sf_term_active is not None and not sf_term_active.empty:
         sf_term_active = sf_term_active.copy()
         sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
-        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
+        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | retained_deal_keys | always_keep_keys)].copy()
         sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
 
-    out = _build_term_loan_salesforce_fallback(
-        sf_term_active,
-        sf_am,
-        sf_active_rm,
-        serv_lookup,
-        upb_col,
-        prev_maps,
-        template_maps,
-        prev_sold_retained_keys=prev_sold_retained_keys,
-        always_keep_keys=always_keep_keys,
-    )
+    out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
     if out.empty:
         return out
 
@@ -4438,16 +4348,6 @@ def build_term_loan(
     if asset_filter_provided:
         out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
 
-    term_keep_mask = _term_population_keep_mask(
-        stage_series=out.get("_stage_raw", pd.Series([pd.NA] * len(out), index=out.index)),
-        current_upb_series=out.get("_sf_current_servicer_upb_raw", pd.Series([np.nan] * len(out), index=out.index)),
-        sold_servicing_status_series=out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)),
-        deal_key_series=out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)),
-        prev_sold_retained_keys=prev_sold_retained_keys,
-        always_keep_keys=always_keep_keys,
-        reo_date_series=out.get("REO Date", pd.Series([pd.NaT] * len(out), index=out.index)),
-    )
-    out = out.loc[term_keep_mask].copy()
     out = out[out["_deal_key"].notna()].copy()
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
@@ -6100,7 +6000,11 @@ if build_btn:
                     status.update(label=f"Servicer processing | {message} | total {elapsed:0.1f}s")
 
                 _servicer_progress(f"starting {len(servicer_uploads)} uploaded file(s)")
-                serv_join, detected_run_date, serv_preview = build_servicer_lookup(servicer_uploads, progress_callback=_servicer_progress, use_cache=False)
+                serv_join, detected_run_date, serv_preview = build_servicer_lookup(
+                    servicer_uploads,
+                    progress_callback=_servicer_progress,
+                    use_cache=False,
+                )
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest servicer report date from file contents / report tabs: **{detected_run_date.isoformat()}**")
