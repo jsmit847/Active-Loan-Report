@@ -1542,11 +1542,10 @@ def _term_dealtype_condition(alias_prefix: str = "") -> str:
     return _lower_in_condition(expr, TERM_TYPES)
 
 def _opportunity_status_active_condition(alias_prefix: str = "") -> Optional[str]:
-    field_api = first_existing_field_name("Opportunity", ["Status__c", "Loan_Status__c"])
-    if not field_api:
-        return None
-    field_expr = f"{alias_prefix}{field_api}" if alias_prefix else field_api
-    return f"{field_expr} = {_soql_text(LOAN_ACTIVE_STATUS)}"
+    # Business logic now keys inclusion off StageName and property Status instead of the
+    # custom Opportunity status fields. Leaving this filter enabled was dropping Sold /
+    # REO rows upstream before the explicit retained-servicing and REO rules could run.
+    return None
 
 def _append_clause_if_present(parts: List[str], clause: Optional[str]) -> List[str]:
     if clause and str(clause).strip():
@@ -1893,7 +1892,7 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     status = df.get("Property Status", pd.Series([pd.NA] * len(df), index=df.index)).astype("string").str.strip()
     asset_upb = pd.to_numeric(df.get("Property Current UPB", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce").fillna(0)
-    is_active_asset = status.isin(BRIDGE_ACTIVE_PROPERTY_STATUSES) | asset_upb.gt(0)
+    is_active_asset = status.isin(BRIDGE_ACTIVE_PROPERTY_STATUSES)
     df["_active_asset_upb"] = asset_upb.where(is_active_asset, 0.0)
     df["_is_active_asset"] = is_active_asset.astype("int8")
 
@@ -2192,6 +2191,42 @@ def _build_sold_term_like() -> pd.DataFrame:
     return run_bulk_query(soql, rename_map=rename_map)
 
 
+
+
+def _build_term_asset_deal_universe(deal_numbers: Optional[Sequence[str]] = None) -> List[str]:
+    opp_rel = property_opportunity_relationship_name()
+    deal_numbers = _nonblank_unique(deal_numbers or [])
+
+    select_pairs = [("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c")]
+    rename_map = {expr: label for label, expr in select_pairs}
+
+    base_where = [
+        f"{opp_rel}.Deal_Loan_Number__c != NULL",
+        f"{opp_rel}.Probability > 0",
+        _term_dealtype_condition(f"{opp_rel}."),
+        _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
+        _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
+        "ALA__c > 0",
+        "Asset_ID__c != NULL",
+        _soql_false_or_null("Is_Sub_Unit__c"),
+    ]
+
+    soqls = []
+    if deal_numbers:
+        for chunk in _chunked(deal_numbers, size=200):
+            where_parts = base_where + [_soql_in(f"{opp_rel}.Deal_Loan_Number__c", chunk)]
+            soqls.append(
+                "SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Property__c WHERE " + " AND ".join(where_parts)
+            )
+    else:
+        soqls.append(
+            "SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Property__c WHERE " + " AND ".join(base_where)
+        )
+
+    df = _run_bulk_union(soqls, rename_map=rename_map)
+    if df.empty or "Deal Loan Number" not in df.columns:
+        return []
+    return _nonblank_unique(df["Deal Loan Number"].tolist())
 
 
 def _build_term_wide_like() -> pd.DataFrame:
@@ -3862,15 +3897,9 @@ def _build_term_loan_salesforce_fallback(
     prev_maps: dict,
     template_maps: dict,
 ) -> pd.DataFrame:
-    prev_keys = _prev_term_keys(prev_maps)
-    prev_positive_keys = _prev_term_positive_upb_keys(prev_maps)
-    prev_sold_retained_keys = _prev_term_sold_retained_keys(prev_maps)
-    sf_term = _filter_term_population(
-        sf_term,
-        prev_keys=prev_keys,
-        prev_positive_keys=prev_positive_keys,
-        prev_sold_retained_keys=prev_sold_retained_keys,
-    )
+    if sf_term is None or sf_term.empty:
+        return pd.DataFrame()
+
     out = pd.DataFrame(index=sf_term.index)
 
     for col, label in TERM_LOAN_FROM_TERM_WIDE.items():
@@ -4103,13 +4132,23 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
     if not candidate_cols:
         return pd.DataFrame()
 
+    detail_fields = [
+        "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name",
+        "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator",
+        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        "Comments AM", "Sold Loan: Sold To", "Servicer Name", "Current Servicer UPB",
+        "Sold Loan: Servicing Status", "Stage",
+    ]
+    keep_cols = [c for c in dict.fromkeys(detail_fields) if c in sf_term.columns]
+
     frames = []
     for pos, col in enumerate(candidate_cols):
-        tmp = sf_term.copy()
-        tmp["_sid_key"] = id_key_no_leading_zeros(tmp[col])
-        tmp = tmp[tmp["_sid_key"].notna()].copy()
-        if tmp.empty:
+        sid_key = id_key_no_leading_zeros(sf_term.get(col, pd.Series([None] * len(sf_term), index=sf_term.index)))
+        mask = sid_key.notna()
+        if not mask.any():
             continue
+        tmp = sf_term.loc[mask, keep_cols].copy()
+        tmp["_sid_key"] = pd.Series(sid_key.loc[mask], index=tmp.index, dtype="object")
         tmp["_sid_source_col"] = col
         tmp["_sid_priority"] = 1 if col == "Servicer Commitment Id" else max(0, 50 - pos)
         frames.append(tmp)
@@ -4133,12 +4172,6 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
         )
     ]
 
-    detail_fields = [
-        "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name",
-        "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator",
-        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
-        "Comments AM", "Sold Loan: Sold To", "Servicer Name",
-    ]
     detail_count = pd.Series([0] * len(key_df), index=key_df.index, dtype="int64")
     for col in [c for c in detail_fields if c in key_df.columns]:
         detail_count = detail_count + (~blankish_mask(key_df[col])).astype("int64")
@@ -4190,11 +4223,18 @@ def build_term_loan(
     prev_sold_retained_keys = _prev_term_sold_retained_keys(prev_maps)
     sf_term_active = _filter_term_population(sf_term, prev_keys=prev_keys, prev_positive_keys=prev_positive_keys, prev_sold_retained_keys=prev_sold_retained_keys)
 
+    asset_filter_provided = asset_deal_numbers is not None
+    asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
+    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
+    if asset_filter_provided and sf_term_active is not None and not sf_term_active.empty:
+        sf_term_active = sf_term_active.copy()
+        sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
+        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
+        sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
+
     out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
     if out.empty:
         return out
-
-    asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
@@ -4252,9 +4292,7 @@ def build_term_loan(
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(out.get("Special Loans List (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
-    stage_series = sf_term_active.set_index(norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([], dtype='object')))) if False else None
-    if asset_deal_keys:
-        always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
+    if asset_filter_provided:
         out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
 
     out = out[out["_deal_key"].notna()].copy()
@@ -4769,9 +4807,53 @@ def _clear_sheet_body(ws, used_cols: Set[int], start_row: int = 5):
 
 
 def _trim_sheet_body_rows(ws, row_count: int, start_row: int = 5):
-    keep_last = max(start_row, start_row + row_count - 1)
+    keep_last = (start_row - 1) if row_count <= 0 else (start_row + row_count - 1)
     if ws.max_row > keep_last:
         ws.delete_rows(keep_last + 1, ws.max_row - keep_last)
+
+
+def _drop_fully_blank_dataframe_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    mask = pd.Series(False, index=df.index)
+    for col in df.columns:
+        series = df[col]
+        if pd.api.types.is_numeric_dtype(series):
+            mask = mask | pd.to_numeric(series, errors="coerce").notna()
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            mask = mask | pd.to_datetime(series, errors="coerce").notna()
+        else:
+            mask = mask | (~blankish_mask(series))
+    return df.loc[mask].copy()
+
+
+def _drop_rows_missing_required_keys(sheet_name: str, df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+
+    key_map = {
+        "Bridge Asset": ["Deal Number", "Asset ID"],
+        "Bridge Loan": ["Deal Number"],
+        "Term Loan": ["Deal Number"],
+        "Term Asset": ["Deal Number", "Asset ID"],
+    }
+    required = [c for c in key_map.get(sheet_name, []) if c in df.columns]
+    if not required:
+        return df.copy()
+
+    mask = pd.Series(True, index=df.index)
+    for col in required:
+        mask = mask & (~blankish_mask(df[col]))
+    return df.loc[mask].copy()
+
+
+def _reset_sheet_autofilter(ws, header_tuples: List[Tuple[int, str]], row_count: int, header_row: int = 4, start_row: int = 5):
+    if not header_tuples:
+        return
+    first_col = min(col_idx for col_idx, _header in header_tuples)
+    last_col = max(col_idx for col_idx, _header in header_tuples)
+    end_row = header_row if row_count <= 0 else (start_row + row_count - 1)
+    ws.auto_filter.ref = f"{get_column_letter(first_col)}{header_row}:{get_column_letter(last_col)}{end_row}"
 
 
 def _excel_safe_value(val):
@@ -4907,6 +4989,9 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     if sheet_name not in wb.sheetnames:
         return
 
+    df = _drop_fully_blank_dataframe_rows(df)
+    df = _drop_rows_missing_required_keys(sheet_name, df)
+
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
@@ -4924,7 +5009,8 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=5)
     _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=5)
     _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
-    _trim_sheet_body_rows(ws, row_count=max(len(df), 1), start_row=5)
+    _trim_sheet_body_rows(ws, row_count=len(df), start_row=5)
+    _reset_sheet_autofilter(ws, hdr, row_count=len(df), header_row=4, start_row=5)
 
 
 def _normalize_sheet_key_value(header: str, value) -> str:
@@ -5962,9 +6048,11 @@ if build_btn:
                 status.update(label="Pulling term data from Salesforce...")
                 term_wide = _build_term_wide_like()
 
-                status.update(label="Pulling term asset data from Salesforce...")
-                term_asset_source = _build_term_asset_like(deal_numbers=None)
-                term_asset_filter_deals = _nonblank_unique(term_asset_source["Deal Loan Number"].tolist()) if not term_asset_source.empty and "Deal Loan Number" in term_asset_source.columns else []
+                candidate_term_deals = _nonblank_unique(term_wide["Deal Loan Number"].tolist()) if not term_wide.empty and "Deal Loan Number" in term_wide.columns else []
+
+                status.update(label="Pulling term asset deal universe from Salesforce...")
+                term_asset_filter_deals = _build_term_asset_deal_universe(candidate_term_deals)
+                diagnostics.append(f"Term asset deal universe: {len(term_asset_filter_deals):,} deals")
 
                 status.update(label="Building Term Loan...")
                 term_loan_df = build_term_loan(
@@ -5995,15 +6083,8 @@ if build_btn:
                 if need_term_asset:
                     term_deal_numbers = [d for d in _nonblank_unique(term_loan_df["Deal Number"].tolist()) if clean_text(d).upper() != "N/A"] if "Deal Number" in term_loan_df.columns else []
 
-                    if not term_asset_source.empty:
-                        term_asset_source = term_asset_source[
-                            norm_id_series(term_asset_source.get("Deal Loan Number", pd.Series([None] * len(term_asset_source), index=term_asset_source.index))).isin(
-                                set(norm_id_series(pd.Series(term_deal_numbers, dtype="object")).dropna().tolist())
-                            )
-                        ].copy()
-                    else:
-                        status.update(label="Pulling term asset data from Salesforce...")
-                        term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
+                    status.update(label="Pulling term asset rows from Salesforce...")
+                    term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
 
                     status.update(label="Building Term Asset...")
                     term_asset_df = build_term_asset(term_asset_source, term_loan_df, upb_col, prev_maps=prev_maps)
@@ -6015,7 +6096,7 @@ if build_btn:
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
                     del term_deal_numbers, term_asset_source, term_asset_df
 
-                del term_wide, term_loan_df, term_asset_filter_deals
+                del term_wide, term_loan_df, term_asset_filter_deals, candidate_term_deals
                 gc.collect()
 
             del sf_am, sf_active_rm, serv_join, serv_preview
@@ -6042,9 +6123,11 @@ if build_btn:
                 if audit_diagnostic_lines is not None and audit_summary:
                     diagnostics.extend(audit_diagnostic_lines(audit_summary))
                 if not zero_blank_ok:
-                    raise ValueError(
-                        "Zero-blank enforcement could not eliminate all fillable blanks. "
-                        "Use a completed workbook from the immediately prior run as the carry-forward baseline and rerun the build."
+                    diagnostics.append(
+                        "Zero-blank enforcement could not eliminate all fillable blanks. Review the QA Summary / QA Exceptions tabs and use the immediately prior completed workbook as baseline on the next run."
+                    )
+                    st.warning(
+                        "Zero-blank enforcement did not clear every fillable blank. The workbook was still built; review QA Summary / QA Exceptions before use."
                     )
                 if any(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary):
                     diagnostics.append("Blank enforcement passed, but possible shifted values were still detected. Review the QA Exceptions tab before weekly use.")
