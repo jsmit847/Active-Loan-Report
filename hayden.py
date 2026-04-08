@@ -314,7 +314,7 @@ DRAFT_FORMULA_OVERRIDES = {
         "Maturity Date": '=IF($CG5<>"N/A",$CG5,$CH5)',
         "Days to Maturity": '=+$CJ5-$CK$3',
         "Days Past Due": '=+$CL$3-$AC5',
-        "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
+        "DQ Status": '=IF(AND($AZ5<>"",$AZ5<>"N/A"),"REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
         "Most Recent Valuation Date": '=IF($BE5<>"N/A",$BE5,$BA5)',
         "Most Recent As-Is Value": '=IF($BE5<>"N/A",$BF5,$BB5)',
         "Most Recent ARV": '=IF($BE5<>"N/A",$BG5,$BC5)',
@@ -335,7 +335,7 @@ DRAFT_FORMULA_OVERRIDES = {
     },
     "Term Loan": {
         "Days Past Due": '=+$U$3-$S5',
-        "DQ Status": '=IF($T5<>"N/A","REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
+        "DQ Status": '=IF(AND($T5<>"",$T5<>"N/A"),"REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
         "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
     },
     "Term Asset": {
@@ -4778,6 +4778,22 @@ def refresh_summary_labels(wb, run_dt: date, upb_header: str):
                 cell.value = new_txt
 
 
+def set_summary_active_sheet(wb):
+    if "Summary" not in wb.sheetnames:
+        return
+    summary_idx = wb.sheetnames.index("Summary")
+    wb.active = summary_idx
+    for idx, ws in enumerate(wb.worksheets):
+        ws.sheet_view.tabSelected = (idx == summary_idx)
+    summary_ws = wb["Summary"]
+    summary_ws.sheet_view.topLeftCell = "A1"
+    try:
+        summary_ws.sheet_view.selection[0].activeCell = "A1"
+        summary_ws.sheet_view.selection[0].sqref = "A1"
+    except Exception:
+        pass
+
+
 def restore_template_scaffold(wb, run_dt: date, upb_header: str):
     q_end = quarter_end_for_run(run_dt)
 
@@ -6293,6 +6309,7 @@ if build_btn:
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
             mark_workbook_for_recalc(wb)
+            set_summary_active_sheet(wb)
             wb.save(out_bytes)
             out_bytes.seek(0)
             wb.close()
