@@ -1,5 +1,6 @@
 import base64
 import calendar
+import csv
 import gc
 import hashlib
 import io
@@ -57,6 +58,9 @@ OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
 ENFORCE_ZERO_FILLABLE_BLANKS = True
 ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
+SERVICER_PREVIEW_ROWS = 20
+RUN_POSTBUILD_QA_DEFAULT = False
+SHOW_SERVICER_PREVIEW_DEFAULT = False
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
 VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
@@ -1404,8 +1408,10 @@ def load_repo_template_bytes() -> Tuple[bytes, str]:
     )
 
 
-def resolve_template_bytes(prev_upload) -> Tuple[bytes, str]:
+def resolve_template_bytes(prev_upload=None, prev_bytes: Optional[bytes] = None) -> Tuple[bytes, str]:
     if prev_upload is not None:
+        if prev_bytes is not None:
+            return prev_bytes, f"uploaded workbook template: {prev_upload.name}"
         return prev_upload.getvalue(), f"uploaded workbook template: {prev_upload.name}"
     return load_repo_template_bytes()
 
@@ -2418,10 +2424,9 @@ def _md5_hex(b: bytes) -> str:
     return hashlib.md5(b).hexdigest()
 
 
-def make_upload_blob(upload, include_hash: bool = True) -> UploadBlob:
+def make_upload_blob(upload) -> UploadBlob:
     b = upload.getvalue()
-    file_hash = _md5_hex(b) if include_hash else ""
-    return UploadBlob(filename=upload.name, file_hash=file_hash, data=b)
+    return UploadBlob(filename=upload.name, file_hash=_md5_hex(b), data=b)
 
 
 def date_from_filename(name: str) -> Optional[date]:
@@ -2835,58 +2840,51 @@ def _filter_term_population(
     is_closed_won = stage.eq("Closed Won")
     is_sold = stage.eq("Sold")
     is_expired_or_matured = stage.isin(EXPIRED_OR_MATURED_STAGES)
+
     is_reo = stage.isin(REO_FAMILY_STAGES)
-
-    # Keep sold-servicing-retained loans even when Salesforce stage/financing fields are
-    # inconsistent. Some valid retained-servicing deals are not reliably labeled as Stage=Sold
-    # in the wide pull, so key off the raw servicing status directly.
-    keep_mask = (
-        is_closed_won
-        | is_reo
-        | ((~sold_servicing_retained) & (~in_prev_sold_retained) & current_upb.gt(0))
-        | sold_servicing_retained
-        | in_prev_sold_retained
-    )
-    out = out.loc[keep_mask].copy()
-
-    # Hard exclusions still win unless the user explicitly force-kept the deal.
-    excluded_stage = stage.isin(["Paid Off", "REO-Sold"])
-    if excluded_stage.any():
-        always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-        keep_excluded = out["_deal_key"].isin(always_keep_keys)
-        out = out.loc[(~excluded_stage.loc[out.index]) | keep_excluded].copy()
-
-    return out
+    keep_mask = is_closed_won | is_reo | (is_expired_or_matured & current_upb.gt(0)) | (is_sold & (sold_servicing_retained | in_prev_sold_retained))
+    return out.loc[keep_mask].copy()
 
 
-def _ordered_sheet_names(sheet_names: Sequence[str], preferred_sheets: Optional[List[str]] = None) -> List[str]:
-    names = list(sheet_names or [])
+def _ordered_sheet_names(sheet_names: Sequence[str], preferred_sheets: Optional[Sequence[str]] = None) -> List[str]:
+    ordered = list(sheet_names or [])
     if not preferred_sheets:
-        return names
+        return ordered
     preferred = []
-    others = []
-    for sheet_name in names:
-        sheet_lc = sheet_name.lower()
-        if any(pref.lower() in sheet_lc for pref in preferred_sheets):
+    other = []
+    preferred_tokens = [str(x).lower() for x in preferred_sheets if clean_text(x)]
+    for sheet_name in ordered:
+        lower_name = str(sheet_name).lower()
+        if any(token in lower_name for token in preferred_tokens):
             preferred.append(sheet_name)
         else:
-            others.append(sheet_name)
-    return preferred + others
+            other.append(sheet_name)
+    return preferred + other
 
 
-def _header_match_score(header_values: Sequence[object], required_alias_groups: List[List[str]]) -> int:
-    header_tokens = {normalize_header_name(v) for v in header_values if clean_text(v)}
-    if not header_tokens:
-        return 0
-    return sum(any(normalize_header_name(alias) in header_tokens for alias in aliases) for aliases in required_alias_groups)
+def _header_alias_score(values: Sequence, required_alias_groups: Sequence[Sequence[str]]) -> int:
+    normalized = {normalize_header_name(v) for v in values if clean_text(v)}
+    return sum(1 for aliases in required_alias_groups if any(normalize_header_name(alias) in normalized for alias in aliases))
 
 
-def _header_usecols_from_alias_groups(header_values: Sequence[object], alias_groups: Optional[List[List[str]]]) -> Optional[List[int]]:
-    if not alias_groups:
-        return None
-    alias_tokens = {normalize_header_name(alias) for group in alias_groups for alias in group}
-    usecols = [idx for idx, value in enumerate(header_values) if normalize_header_name(value) in alias_tokens]
-    return sorted(set(usecols)) if usecols else None
+def _pick_usecols_from_header_values(values: Sequence, alias_groups: Sequence[Sequence[str]]) -> List[str]:
+    lookup = {}
+    for value in values:
+        txt = str(value).strip() if value is not None else ""
+        if txt:
+            lookup.setdefault(normalize_header_name(txt), txt)
+    selected: List[str] = []
+    seen: Set[str] = set()
+    for aliases in alias_groups or []:
+        chosen = None
+        for alias in aliases:
+            chosen = lookup.get(normalize_header_name(alias))
+            if chosen:
+                break
+        if chosen and chosen not in seen:
+            selected.append(chosen)
+            seen.add(chosen)
+    return selected
 
 
 def _best_header_read_excel(
@@ -2894,116 +2892,128 @@ def _best_header_read_excel(
     required_alias_groups: List[List[str]],
     preferred_sheets: Optional[List[str]] = None,
     max_header_scan: int = 8,
-    selected_alias_groups: Optional[List[List[str]]] = None,
+    read_alias_groups: Optional[List[List[str]]] = None,
     progress_callback=None,
 ):
-    workbook = None
-    best_sheet = None
-    best_header_row = None
-    best_header_values = []
-    best_score = -1
-    target_score = len(required_alias_groups)
-
+    wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False)
     try:
-        workbook = load_workbook(filename=BytesIO(file_bytes), read_only=True, data_only=True)
-        ordered = _ordered_sheet_names(list(workbook.sheetnames), preferred_sheets)
+        ordered = _ordered_sheet_names(wb.sheetnames, preferred_sheets)
+        best_sheet = None
+        best_header_row = None
+        best_score = -1
+        best_values: List[str] = []
 
         for sheet_idx, sheet_name in enumerate(ordered, start=1):
+            ws = wb[sheet_name]
             if progress_callback:
                 progress_callback(f"scanning header rows on sheet '{sheet_name}' ({sheet_idx}/{len(ordered)})")
-            try:
-                ws = workbook[sheet_name]
-                for header_row in range(1, max_header_scan + 1):
-                    row_iter = ws.iter_rows(min_row=header_row, max_row=header_row, max_col=256, values_only=True)
-                    row_values = list(next(row_iter, ()))
-                    score = _header_match_score(row_values, required_alias_groups)
-                    if score > best_score:
-                        best_score = score
-                        best_sheet = sheet_name
-                        best_header_row = header_row - 1
-                        best_header_values = row_values
-                    if score >= target_score:
+            for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=max_header_scan, values_only=True), start=1):
+                values = [str(v).strip() if v is not None else "" for v in row]
+                score = _header_alias_score(values, required_alias_groups)
+                if score > best_score:
+                    best_sheet = sheet_name
+                    best_header_row = row_idx - 1
+                    best_score = score
+                    best_values = values
+                    if best_score >= len(required_alias_groups):
                         break
-                if best_score >= target_score and best_sheet == sheet_name:
-                    break
-            except Exception:
-                continue
+            if best_score >= len(required_alias_groups):
+                break
     finally:
-        if workbook is not None:
-            try:
-                workbook.close()
-            except Exception:
-                pass
+        try:
+            wb.close()
+        except Exception:
+            pass
 
-    if best_sheet is None or best_score <= 0 or best_header_row is None:
+    if best_sheet is None or best_header_row is None or best_score <= 0:
         raise ValueError("Could not find a matching header row.")
 
-    usecols = _header_usecols_from_alias_groups(best_header_values, selected_alias_groups)
+    usecols = _pick_usecols_from_header_values(best_values, read_alias_groups or required_alias_groups)
+    read_kwargs = {
+        "sheet_name": best_sheet,
+        "header": best_header_row,
+        "engine": "openpyxl",
+    }
+    if usecols:
+        read_kwargs["usecols"] = usecols
     if progress_callback:
-        if usecols is None:
-            progress_callback(f"reading sheet '{best_sheet}'")
-        else:
-            progress_callback(f"reading sheet '{best_sheet}' ({len(usecols)} column(s))")
-
-    xls = pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl")
+        detail = f"reading sheet '{best_sheet}'"
+        if usecols:
+            detail += f" ({len(usecols)} column(s))"
+        progress_callback(detail)
     try:
-        df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row, usecols=usecols)
+        df = pd.read_excel(BytesIO(file_bytes), **read_kwargs)
     except Exception:
-        if usecols is None:
+        if "usecols" in read_kwargs:
+            if progress_callback:
+                progress_callback(f"retrying sheet '{best_sheet}' without column pruning")
+            read_kwargs.pop("usecols", None)
+            df = pd.read_excel(BytesIO(file_bytes), **read_kwargs)
+        else:
             raise
-        if progress_callback:
-            progress_callback(f"retrying sheet '{best_sheet}' without column pruning")
-        df = pd.read_excel(xls, sheet_name=best_sheet, header=best_header_row)
     df = df.dropna(how="all")
-    if df.empty:
-        raise ValueError("Could not find a matching header row.")
     df.columns = [str(c).strip() for c in df.columns]
-    score = sum(first_matching_col(df, aliases) is not None for aliases in required_alias_groups)
-    if score <= 0:
-        raise ValueError("Could not find a matching header row.")
-    return df, best_sheet, best_header_row, score
+    return df, best_sheet, best_header_row, best_score
 
 
 def _best_header_read_csv(
     file_bytes: bytes,
     required_alias_groups: List[List[str]],
     max_header_scan: int = 3,
-    selected_alias_groups: Optional[List[List[str]]] = None,
+    read_alias_groups: Optional[List[List[str]]] = None,
     progress_callback=None,
 ):
-    best_header_row = None
-    best_score = -1
-    target_score = len(required_alias_groups)
-
-    for header_row in range(max_header_scan):
-        if progress_callback:
-            progress_callback(f"scanning csv header row {header_row + 1}/{max_header_scan}")
+    sample_bytes = file_bytes[:1024 * 1024]
+    sample_text = None
+    sample_encoding = None
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            sample = pd.read_csv(BytesIO(file_bytes), header=header_row, nrows=60)
-            sample = sample.dropna(how="all")
-            if sample.empty:
-                continue
-            sample.columns = [str(c).strip() for c in sample.columns]
-            score = sum(first_matching_col(sample, aliases) is not None for aliases in required_alias_groups)
-            if score > best_score:
-                best_score = score
-                best_header_row = header_row
-            if score >= target_score:
-                break
+            sample_text = sample_bytes.decode(enc)
+            sample_encoding = enc
+            break
         except Exception:
             continue
+    if sample_text is None:
+        raise ValueError("Could not decode CSV header sample.")
 
+    rows = list(csv.reader(io.StringIO(sample_text)))
+    best_header_row = None
+    best_score = -1
+    best_values: List[str] = []
+    for header_row in range(min(max_header_scan, len(rows))):
+        if progress_callback:
+            progress_callback(f"scanning csv header row {header_row + 1}/{max_header_scan}")
+        values = [str(v).strip() for v in rows[header_row]]
+        score = _header_alias_score(values, required_alias_groups)
+        if score > best_score:
+            best_header_row = header_row
+            best_score = score
+            best_values = values
     if best_header_row is None or best_score <= 0:
         raise ValueError("Could not find a matching CSV header row.")
 
-    alias_tokens = {normalize_header_name(alias) for group in (selected_alias_groups or []) for alias in group}
-    usecols = (lambda c: normalize_header_name(c) in alias_tokens) if alias_tokens else None
+    usecols = _pick_usecols_from_header_values(best_values, read_alias_groups or required_alias_groups)
+    read_kwargs = {"header": best_header_row, "low_memory": True}
+    if usecols:
+        read_kwargs["usecols"] = usecols
     if progress_callback:
         progress_callback("reading csv rows")
-    df = pd.read_csv(BytesIO(file_bytes), header=best_header_row, usecols=usecols)
+    for enc in (sample_encoding, "utf-8-sig", "utf-8", "latin-1"):
+        if not enc:
+            continue
+        try:
+            df = pd.read_csv(BytesIO(file_bytes), encoding=enc, **read_kwargs)
+            break
+        except Exception:
+            if enc == "latin-1" and "usecols" in read_kwargs:
+                read_kwargs.pop("usecols", None)
+                df = pd.read_csv(BytesIO(file_bytes), encoding=enc, **read_kwargs)
+                break
+            continue
+    else:
+        raise ValueError("Could not read CSV after locating header row.")
+
     df = df.dropna(how="all")
-    if df.empty:
-        raise ValueError("Could not find a matching CSV header row.")
     df.columns = [str(c).strip() for c in df.columns]
     return df, best_header_row, best_score
 
@@ -3054,9 +3064,9 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
     if servicer_type == "Shellpoint":
         df, _hdr, _score = _best_header_read_csv(
             b,
-            [["LoanID", "Servicer Loan ID", "Loan Number"], ["PrincipalBalance", "UPB", "Current UPB"]],
+            [["LoanID", "Servicer Loan ID", "Loan Number", "InvestorLoanID", "Investor Loan ID"], ["PrincipalBalance", "UPB", "Current UPB"]],
             max_header_scan=2,
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["LoanID", "Servicer Loan ID", "Loan Number", "InvestorLoanID", "Investor Loan ID"],
                 ["PrincipalBalance", "UPB", "Current UPB"],
                 ["SuspenseBalance", "Suspense Balance"],
@@ -3071,7 +3081,6 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
             sid_col = first_matching_col(df, ["InvestorLoanID", "Investor Loan ID"])
         if not sid_col:
             raise ValueError("Shellpoint file is missing a loan identifier column.")
-
         if progress_callback:
             progress_callback("normalizing Shellpoint rows")
         out = pd.DataFrame(
@@ -3094,7 +3103,7 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
         df, _hdr, _score = _best_header_read_csv(
             b,
             [["Servicer Loan ID", "Loan ID", "Loan Number"], ["UPB", "Principal Balance", "Current UPB"]],
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["Servicer Loan ID", "Loan ID", "Loan Number"],
                 ["UPB", "Principal Balance", "Current UPB"],
                 ["Servicing Company", "Servicer", "Servicer Name"],
@@ -3132,7 +3141,7 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
             b,
             [["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"], ["Current UPB", "Principal Balance", "UPB"]],
             preferred_sheets=["loan"],
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["Loan Number", "Loan No", "BCM Loan#", "Servicer Loan Number"],
                 ["Current UPB", "Principal Balance", "UPB"],
                 ["Unapplied Balance", "Suspense Balance", "Suspense"],
@@ -3171,7 +3180,7 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
             b,
             [["BCM Loan#", "Loan Number", "Loan No"], ["Principal Balance", "Current UPB", "UPB"]],
             preferred_sheets=["loan"],
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["BCM Loan#", "Loan Number", "Loan No"],
                 ["Principal Balance", "Current UPB", "UPB"],
                 ["Suspense Balance", "Unapplied Balance", "Suspense"],
@@ -3205,7 +3214,7 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
             b,
             [["Account", "Loan Number", "Loan No"], ["Current Balance", "Current UPB", "UPB", "Principal Balance"]],
             preferred_sheets=["fci", "cvmaster", "v1805510", "report"],
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["Account", "Loan Number", "Loan No"],
                 ["Current Balance", "Current UPB", "UPB", "Principal Balance"],
                 ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"],
@@ -3240,23 +3249,17 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
             b,
             [["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"], ["UPB$", "UPB", "Current UPB", "Principal Balance"]],
             preferred_sheets=["export", "midland", "loan"],
-            selected_alias_groups=[
+            read_alias_groups=[
                 ["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"],
                 ["UPB$", "UPB", "Current UPB", "Principal Balance"],
-                ["NextPaymentDate", "Next Payment Date", "Next Due Date"],
-                ["MaturityDate", "Maturity Date"],
+                ["Suspense", "Suspense Balance", "Unapplied Balance"],
+                ["NextPaymentDate", "Next Payment Date", "Due Date", "Next Due Date"],
+                ["MaturityDate", "Maturity Date", "Current Maturity Date"],
                 ["ServicerLoanStatus", "Loan Status", "Status"],
-                ["ReportDate", "Report Date", "As Of Date", "Run Date"],
+                ["ReportDate", "Report Date", "As Of Date", "Date", "Run Date"],
             ],
             progress_callback=progress_callback,
         )
-
-        def _idfix(s: pd.Series) -> pd.Series:
-            raw = s.astype("string").str.strip()
-            raw = raw.str.replace(r"COM$", "", regex=True)
-            raw = raw.str.replace(r"[^0-9A-Za-z]", "", regex=True).str.lstrip("0")
-            return raw.replace({"": pd.NA})
-
         if progress_callback:
             progress_callback("normalizing Midland rows")
         out = pd.DataFrame(
@@ -3264,13 +3267,13 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
                 "source_file": filename,
                 "servicer": "Midland",
                 "servicer_family": "midland",
-                "servicer_id": _idfix(df[first_matching_col(df, ["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"])]),
+                "servicer_id": _series_to_id(df, ["ServicerLoanNumber", "Servicer Loan Number", "Loan Number"]),
                 "upb": _series_to_num(df, ["UPB$", "UPB", "Current UPB", "Principal Balance"]),
-                "suspense": np.nan,
-                "next_payment_date": _series_to_dt(df, ["NextPaymentDate", "Next Payment Date", "Next Due Date"]),
-                "maturity_date": _series_to_dt(df, ["MaturityDate", "Maturity Date"]),
+                "suspense": _series_to_num(df, ["Suspense", "Suspense Balance", "Unapplied Balance"]),
+                "next_payment_date": _series_to_dt(df, ["NextPaymentDate", "Next Payment Date", "Due Date", "Next Due Date"]),
+                "maturity_date": _series_to_dt(df, ["MaturityDate", "Maturity Date", "Current Maturity Date"]),
                 "status": _series_to_text(df, ["ServicerLoanStatus", "Loan Status", "Status"]),
-                "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["ReportDate", "Report Date", "As Of Date", "Run Date"])),
+                "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["ReportDate", "Report Date", "As Of Date", "Date", "Run Date"])),
             }
         )
         return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
@@ -3278,7 +3281,8 @@ def parse_servicer_bytes(filename: str, b: bytes, progress_callback=None) -> pd.
     raise ValueError("Unhandled servicer type.")
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 60 * 60, max_entries=128, hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"})
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60, max_entries=32, hash_funcs={UploadBlob: lambda b: f"{b.filename}:{b.file_hash}"})
 def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
 
@@ -3298,114 +3302,118 @@ SERVICER_LOOKUP_COLUMNS = [
 
 
 def _empty_servicer_lookup_frame(include_key: bool = True) -> pd.DataFrame:
-    cols = SERVICER_LOOKUP_COLUMNS + (["_sid_key"] if include_key else [])
+    cols = list(SERVICER_LOOKUP_COLUMNS)
+    if include_key:
+        cols.append("_sid_key")
     return pd.DataFrame(columns=cols)
 
 
 def _collapse_servicer_lookup_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return _empty_servicer_lookup_frame(include_key=True)
-
     full = df.copy()
-    for col in SERVICER_LOOKUP_COLUMNS:
-        if col not in full.columns:
-            full[col] = pd.NA
-    full = full[SERVICER_LOOKUP_COLUMNS].copy()
-    full["as_of"] = pd.to_datetime(full.get("as_of"), errors="coerce")
+    if "servicer_id" not in full.columns:
+        return _empty_servicer_lookup_frame(include_key=True)
     full = full.dropna(subset=["servicer_id"]).copy()
+    if full.empty:
+        return _empty_servicer_lookup_frame(include_key=True)
     full["_sid_key"] = id_key_no_leading_zeros(full["servicer_id"])
     full = full.dropna(subset=["_sid_key"]).copy()
     if full.empty:
         return _empty_servicer_lookup_frame(include_key=True)
-
-    full["_as_of_sort"] = pd.to_datetime(full["as_of"], errors="coerce")
-    full["_as_of_sort"] = full["_as_of_sort"].where(full["_as_of_sort"].notna(), pd.Timestamp("1900-01-01"))
+    full["as_of"] = pd.to_datetime(full.get("as_of"), errors="coerce")
+    full["upb"] = pd.to_numeric(full.get("upb"), errors="coerce")
+    full["suspense"] = pd.to_numeric(full.get("suspense"), errors="coerce")
     full["_has_upb"] = full["upb"].notna().astype("int8")
-    full["_has_nonzero_upb"] = (pd.to_numeric(full["upb"], errors="coerce").fillna(0) > 0).astype("int8")
+    full["_has_nonzero_upb"] = full["upb"].fillna(0).gt(0).astype("int8")
     full["_has_suspense"] = full["suspense"].notna().astype("int8")
-    full["_has_npd"] = pd.to_datetime(full["next_payment_date"], errors="coerce").notna().astype("int8")
-    full["_has_mat"] = pd.to_datetime(full["maturity_date"], errors="coerce").notna().astype("int8")
-    full["_label_rank"] = full["servicer"].map(_servicer_specificity_rank).fillna(0).astype("int16")
-
+    full["_has_npd"] = pd.to_datetime(full.get("next_payment_date"), errors="coerce").notna().astype("int8")
+    full["_has_mat"] = pd.to_datetime(full.get("maturity_date"), errors="coerce").notna().astype("int8")
+    full["_label_rank"] = full.get("servicer", pd.Series([pd.NA] * len(full), index=full.index)).map(_servicer_specificity_rank).fillna(0).astype("int16")
     full = full.sort_values(
-        ["_sid_key", "_as_of_sort", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
+        ["_sid_key", "as_of", "_has_nonzero_upb", "_has_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank", "upb"],
         ascending=[True, True, True, True, True, True, True, True, True],
-        kind="stable",
+        kind="mergesort",
     )
-    full = full.drop_duplicates(["_sid_key"], keep="last")
-    full = full.drop(columns=["_as_of_sort", "_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"], errors="ignore")
-    return downcast_numeric_frame(full)
+    keep = full.drop_duplicates(["_sid_key"], keep="last").drop(
+        columns=["_has_upb", "_has_nonzero_upb", "_has_suspense", "_has_npd", "_has_mat", "_label_rank"],
+        errors="ignore",
+    )
+    return downcast_numeric_frame(keep)
 
 
 def build_servicer_lookup(
     servicer_uploads: List,
     progress_callback=None,
     use_cache: bool = False,
+    preview_rows_limit: int = SERVICER_PREVIEW_ROWS,
 ) -> Tuple[pd.DataFrame, date, pd.DataFrame]:
     join = _empty_servicer_lookup_frame(include_key=True)
-    preview_samples: List[pd.DataFrame] = []
-    preview_rows_remaining = 30
+    preview_frames: List[pd.DataFrame] = []
+    preview_rows = 0
     file_dates: List[date] = []
     skipped_files: List[str] = []
     total_files = len(servicer_uploads or [])
 
     for idx, upload in enumerate(servicer_uploads or [], start=1):
-        blob = None
-        parsed = None
-        name = getattr(upload, "name", f"file {idx}")
+        name = getattr(upload, "name", f"servicer_{idx}")
+        file_started = time.perf_counter()
 
         def _file_progress(detail: str) -> None:
             if progress_callback:
-                progress_callback(f"servicer {idx}/{total_files} | {name} | {detail}")
+                file_elapsed = time.perf_counter() - file_started
+                progress_callback(f"servicer {idx}/{total_files} | {name} | {detail} | file {file_elapsed:0.1f}s")
 
         try:
             _file_progress("reading upload bytes")
-            blob = make_upload_blob(upload, include_hash=use_cache)
-            name = blob.filename
             if use_cache:
+                blob = make_upload_blob(upload)
                 _file_progress("loading cached parse")
                 parsed = parse_servicer_cached(blob)
+                del blob
             else:
-                parsed = parse_servicer_bytes(blob.filename, blob.data, progress_callback=_file_progress)
+                data = upload.getvalue()
+                parsed = parse_servicer_bytes(name, data, progress_callback=_file_progress)
+                del data
         except Exception as e:
             skipped_files.append(f"{name}: {e}")
-            del parsed
-            del blob
             gc.collect()
             continue
 
-        if parsed is not None and not parsed.empty:
-            parsed = parsed[[c for c in SERVICER_LOOKUP_COLUMNS if c in parsed.columns]].copy()
-            for col in SERVICER_LOOKUP_COLUMNS:
-                if col not in parsed.columns:
-                    parsed[col] = pd.NA
-            parsed = parsed[SERVICER_LOOKUP_COLUMNS]
-
-            if preview_rows_remaining > 0:
-                sample = parsed.head(min(10, preview_rows_remaining)).copy()
-                if not sample.empty:
-                    preview_samples.append(sample)
-                    preview_rows_remaining -= len(sample)
-
-            if "as_of" in parsed.columns and parsed["as_of"].notna().any():
-                try:
-                    d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
-                except Exception:
-                    d = date_from_filename(name)
-            else:
-                d = date_from_filename(name)
-            if d:
-                file_dates.append(d)
-
-            _file_progress(f"collapsing {len(parsed):,} parsed row(s)")
-            join = pd.concat([join[SERVICER_LOOKUP_COLUMNS], parsed], ignore_index=True, copy=False)
-            join = _collapse_servicer_lookup_rows(join)
-            _file_progress(f"parsed {len(parsed):,} row(s); unique servicer ids {len(join):,}")
-        else:
+        if parsed is None or parsed.empty:
             _file_progress("parsed 0 row(s)")
+            del parsed
+            gc.collect()
+            continue
 
+        if "as_of" in parsed.columns and parsed["as_of"].notna().any():
+            try:
+                d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
+            except Exception:
+                d = date_from_filename(name)
+        else:
+            d = date_from_filename(name)
+        if d:
+            file_dates.append(d)
+
+        _file_progress(f"collapsing {len(parsed):,} parsed row(s)")
+        collapsed = _collapse_servicer_lookup_rows(parsed)
         del parsed
-        del blob
+        gc.collect()
+
+        if preview_rows_limit > 0 and preview_rows < preview_rows_limit and not collapsed.empty:
+            need = preview_rows_limit - preview_rows
+            sample = collapsed.head(need).copy()
+            preview_frames.append(sample)
+            preview_rows += len(sample)
+            del sample
+
+        if join.empty:
+            join = collapsed.copy()
+        elif not collapsed.empty:
+            join = _collapse_servicer_lookup_rows(pd.concat([join, collapsed], ignore_index=True, copy=False))
+        _file_progress(f"unique servicer ids {len(join):,}")
+        del collapsed
         gc.collect()
 
     if skipped_files:
@@ -3414,15 +3422,16 @@ def build_servicer_lookup(
         except Exception:
             pass
 
-    if preview_samples:
-        preview = pd.concat(preview_samples, ignore_index=True, copy=False)
+    if preview_rows_limit > 0 and preview_frames:
+        preview = downcast_numeric_frame(pd.concat(preview_frames, ignore_index=True, copy=False).head(preview_rows_limit))
+    elif preview_rows_limit > 0:
+        preview = downcast_numeric_frame(join.head(preview_rows_limit).copy()) if not join.empty else _empty_servicer_lookup_frame(include_key=False)
     else:
         preview = _empty_servicer_lookup_frame(include_key=False)
-    preview = preview.head(30).copy()
-    gc.collect()
 
     run_date = max(file_dates) if file_dates else today_et()
-    return join, run_date, downcast_numeric_frame(preview)
+    gc.collect()
+    return downcast_numeric_frame(join), run_date, preview
 
 
 
@@ -4275,8 +4284,6 @@ def _build_term_loan_salesforce_fallback(
     stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out))).values, index=out.index).astype("string").str.strip()
     final_upb = pd.to_numeric(out[upb_col], errors="coerce").fillna(0)
     sold_segment_retained = _term_segment_is_sold_servicing_retained(out.get("Segment", blank_obj))
-    raw_sold_retained = _sold_servicing_retained_mask(out.get("_sold_servicing_status_raw", pd.Series([pd.NA] * len(out), index=out.index)))
-    prev_sold_retained = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(prev_sold_retained_keys or set())
     is_closed_won = stage_series.eq("Closed Won")
     is_sold = stage_series.eq("Sold")
     is_reo = pd.to_datetime(out["REO Date"], errors="coerce").notna() | stage_series.isin(REO_FAMILY_STAGES)
@@ -4285,16 +4292,9 @@ def _build_term_loan_salesforce_fallback(
     keep_mask = (
         is_closed_won
         | is_reo
-        | ((~raw_sold_retained) & (~prev_sold_retained) & final_upb.gt(0))
-        | raw_sold_retained
-        | prev_sold_retained
+        | (is_expired_or_matured & final_upb.gt(0))
         | (is_sold & sold_segment_retained)
     )
-    excluded_stage = stage_series.isin(["Paid Off", "REO-Sold"])
-    if always_keep_keys:
-        keep_mask = keep_mask & (~excluded_stage | out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(always_keep_keys))
-    else:
-        keep_mask = keep_mask & (~excluded_stage)
     out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
@@ -4480,18 +4480,10 @@ def build_term_loan(
     asset_filter_provided = asset_deal_numbers is not None
     asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
     always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    retained_deal_keys = set()
-    if sf_term_active is not None and not sf_term_active.empty:
-        retained_mask = _sold_servicing_retained_mask(
-            sf_term_active.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index))
-        )
-        retained_deal_keys = set(
-            norm_id_series(sf_term_active.loc[retained_mask, "Deal Loan Number"]).dropna().tolist()
-        )
     if asset_filter_provided and sf_term_active is not None and not sf_term_active.empty:
         sf_term_active = sf_term_active.copy()
         sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
-        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | retained_deal_keys | always_keep_keys)].copy()
+        sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys)].copy()
         sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
 
     out = _build_term_loan_salesforce_fallback(sf_term_active, sf_am, sf_active_rm, serv_lookup, upb_col, prev_maps, template_maps)
@@ -6159,6 +6151,18 @@ build_target = st.selectbox(
     index=4,
 )
 
+show_servicer_preview = st.checkbox(
+    "Show servicer preview table",
+    value=SHOW_SERVICER_PREVIEW_DEFAULT,
+    help="Turn this off to save memory during test runs.",
+)
+
+run_postbuild_qa = st.checkbox(
+    "Run zero-blank repair / QA after build",
+    value=RUN_POSTBUILD_QA_DEFAULT,
+    help="Slower and heavier. Leave unchecked for the leanest test run.",
+)
+
 if st.button("Clear cached Salesforce metadata", type="secondary"):
     st.session_state.sobject_describe_cache = {}
     st.success("Cleared Salesforce metadata cache for this session.")
@@ -6192,6 +6196,7 @@ if build_btn:
             if prev_upload:
                 status.update(label="Reading uploaded completed report for carry-forward...")
                 prev_maps = build_prev_maps(prev_bytes)
+                gc.collect()
 
             if skip_servicer_files:
                 serv_join = pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of", "_sid_key"])
@@ -6213,12 +6218,18 @@ if build_btn:
                     servicer_uploads,
                     progress_callback=_servicer_progress,
                     use_cache=False,
+                    preview_rows_limit=SERVICER_PREVIEW_ROWS if show_servicer_preview else 0,
                 )
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest servicer report date from file contents / report tabs: **{detected_run_date.isoformat()}**")
                 st.caption(f"UPB header (always today): **{upb_col}**")
-                st.dataframe(serv_preview.head(30), use_container_width=True)
+                if show_servicer_preview:
+                    st.dataframe(serv_preview.head(SERVICER_PREVIEW_ROWS), use_container_width=True)
+                else:
+                    st.caption("Servicer preview hidden to save memory during this run.")
+                del serv_preview
+                gc.collect()
 
             status.update(label="Loading Excel template...")
             if prev_upload is None and not _repo_template_available:
@@ -6226,11 +6237,13 @@ if build_btn:
                     "No repo template was found and no completed Active Loans workbook was uploaded. "
                     "Upload the prior completed workbook or add one of the expected template files to the repo."
                 )
-            tmpl_bytes, tmpl_path_used = resolve_template_bytes(prev_upload)
+            tmpl_bytes, tmpl_path_used = resolve_template_bytes(prev_upload, prev_bytes=prev_bytes)
             template_maps = load_template_lookup_maps(tmpl_bytes)
-            wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=True)
+            wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
             mark_workbook_for_recalc(wb)
             restore_template_scaffold(wb, run_dt, upb_col)
+            del tmpl_bytes
+            gc.collect()
 
             need_bridge = build_target in ("Bridge Asset", "Bridge Loan", "All")
             need_term = build_target in ("Term Loan", "Term Asset", "All")
@@ -6381,7 +6394,7 @@ if build_btn:
             ]
             audit_summary = []
             audit_exceptions = []
-            if ENFORCE_ZERO_FILLABLE_BLANKS:
+            if run_postbuild_qa and ENFORCE_ZERO_FILLABLE_BLANKS:
                 status.update(label="Running zero-blank enforcement...")
                 zero_blank_ok, zero_blank_diags, audit_summary, audit_exceptions = enforce_zero_fillable_blanks(
                     wb,
@@ -6403,7 +6416,7 @@ if build_btn:
                     )
                 if any(int(item.get("possible_shift_cells", 0) or 0) for item in audit_summary):
                     diagnostics.append("Blank enforcement passed, but possible shifted values were still detected. Review the QA Exceptions tab before weekly use.")
-            elif POSTBUILD_AUDIT_AVAILABLE and audit_openpyxl_workbook is not None and write_audit_sheets is not None:
+            elif run_postbuild_qa and POSTBUILD_AUDIT_AVAILABLE and audit_openpyxl_workbook is not None and write_audit_sheets is not None:
                 status.update(label="Running post-build QA audit...")
                 audit_summary, audit_exceptions = audit_openpyxl_workbook(
                     wb,
@@ -6417,7 +6430,7 @@ if build_btn:
                 if workbook_needs_attention is not None and workbook_needs_attention(audit_summary):
                     diagnostics.append("QA attention needed: review the QA Summary and QA Exceptions tabs in the completed workbook before weekly use.")
             else:
-                diagnostics.append("Post-build QA audit helper not available in this runtime; workbook-level QA tabs were not added.")
+                diagnostics.append("Post-build QA / zero-blank repair was skipped for a leaner run. Re-enable it only after the core build is stable.")
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
