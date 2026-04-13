@@ -2705,17 +2705,12 @@ def _term_report_keep_mask(
     sold_retained = _term_effective_sold_retained_mask(sold_servicing_status, fallback_prev_mask=fallback_prev_retained_mask)
     is_paid_off = stage.eq("Paid Off")
     is_reo_sold = stage.eq("REO-Sold")
+    is_reo = stage.isin(REO_FAMILY_STAGES)
+    if extra_reo_mask is not None:
+        is_reo = is_reo | pd.Series(extra_reo_mask, index=stage.index, copy=False).fillna(False).astype(bool)
     is_sold = stage.eq("Sold")
-
-    # Term keep rule:
-    # - Closed Won / REO / other non-sold rows must have positive Current Servicer UPB
-    # - Sold rows must have BOTH positive Current Servicer UPB AND servicing retained
-    # - Paid Off and REO-Sold are always excluded
-    # - extra_reo_mask is intentionally not allowed to override the positive-UPB requirement
-    positive_upb = current_upb.gt(0)
-    non_sold_keep = positive_upb & ~is_sold
-    sold_keep = is_sold & positive_upb & sold_retained
-    keep = (non_sold_keep | sold_keep) & ~is_paid_off & ~is_reo_sold
+    positive_upb_keep = current_upb.gt(0) & ~is_sold
+    keep = (is_reo | sold_retained | positive_upb_keep) & ~is_paid_off & ~is_reo_sold
     return keep.fillna(False)
 
 
@@ -2863,15 +2858,13 @@ def _filter_term_population(
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
     in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
-    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    force_keep_mask = out["_deal_key"].isin(always_keep_keys)
     keep_mask = _term_report_keep_mask(
         out.get("Stage", pd.Series([""] * len(out), index=out.index)),
         out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)),
         out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
         fallback_prev_retained_mask=in_prev_sold_retained,
     )
-    return out.loc[keep_mask | force_keep_mask].copy()
+    return out.loc[keep_mask].copy()
 
 
 def _best_header_read_excel(
@@ -4130,8 +4123,6 @@ def _build_term_loan_salesforce_fallback(
     raw_sold_status = pd.Series(sf_term.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)).values, index=out.index)
     prev_retained_mask = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(prev_sold_retained_keys)
     reo_date_mask = pd.to_datetime(out["REO Date"], errors="coerce").notna()
-    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    force_keep_mask = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(always_keep_keys)
     keep_mask = _term_report_keep_mask(
         raw_stage_series,
         raw_current_upb,
@@ -4139,7 +4130,7 @@ def _build_term_loan_salesforce_fallback(
         fallback_prev_retained_mask=prev_retained_mask,
         extra_reo_mask=reo_date_mask,
     )
-    out = out.loc[keep_mask | force_keep_mask].copy()
+    out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
@@ -4324,26 +4315,18 @@ def build_term_loan(
     asset_filter_provided = asset_deal_numbers is not None
     asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
     always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    stage_exception_keys: Set[str] = set()
+    retained_exception_keys: Set[str] = set()
     if sf_term_active is not None and not sf_term_active.empty:
         sf_term_active = sf_term_active.copy()
         sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
         prev_retained_mask = sf_term_active["_deal_key"].isin(prev_sold_retained_keys)
-        raw_stage = sf_term_active.get("Stage", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index)).astype("string").str.strip().fillna("")
-        raw_upb = pd.to_numeric(sf_term_active.get("Current Servicer UPB", pd.Series([np.nan] * len(sf_term_active), index=sf_term_active.index)), errors="coerce").fillna(0)
-        sold_retained_mask = _term_effective_sold_retained_mask(
+        retained_mask = _term_effective_sold_retained_mask(
             sf_term_active.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index)),
             fallback_prev_mask=prev_retained_mask,
         )
-        positive_upb_mask = raw_upb.gt(0)
-        stage_exception_mask = (
-            (raw_stage.eq("Closed Won") & positive_upb_mask)
-            | (raw_stage.isin(REO_FAMILY_STAGES) & positive_upb_mask)
-            | (raw_stage.eq("Sold") & positive_upb_mask & sold_retained_mask)
-        )
-        stage_exception_keys = set(sf_term_active.loc[stage_exception_mask, "_deal_key"].dropna().tolist())
+        retained_exception_keys = set(sf_term_active.loc[retained_mask, "_deal_key"].dropna().tolist())
         if asset_filter_provided:
-            sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys | stage_exception_keys)].copy()
+            sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys | retained_exception_keys)].copy()
         sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
 
     out = _build_term_loan_salesforce_fallback(
@@ -4416,7 +4399,7 @@ def build_term_loan(
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(out.get("Special Loans List (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
     if asset_filter_provided:
-        out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys | stage_exception_keys)].copy()
+        out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys | retained_exception_keys)].copy()
 
     out = out[out["_deal_key"].notna()].copy()
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
