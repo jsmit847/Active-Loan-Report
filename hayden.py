@@ -314,7 +314,7 @@ DRAFT_FORMULA_OVERRIDES = {
         "Maturity Date": '=IF($CG5<>"N/A",$CG5,$CH5)',
         "Days to Maturity": '=+$CJ5-$CK$3',
         "Days Past Due": '=+$CL$3-$AC5',
-        "DQ Status": '=IF(AND($AZ5<>"",$AZ5<>"N/A"),"REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
+        "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
         "Most Recent Valuation Date": '=IF($BE5<>"N/A",$BE5,$BA5)',
         "Most Recent As-Is Value": '=IF($BE5<>"N/A",$BF5,$BB5)',
         "Most Recent ARV": '=IF($BE5<>"N/A",$BG5,$BC5)',
@@ -335,7 +335,7 @@ DRAFT_FORMULA_OVERRIDES = {
     },
     "Term Loan": {
         "Days Past Due": '=+$U$3-$S5',
-        "DQ Status": '=IF(AND($T5<>"",$T5<>"N/A"),"REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
+        "DQ Status": '=IF($T5<>"N/A","REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
         "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
     },
     "Term Asset": {
@@ -698,9 +698,12 @@ def strip_statebridge_display_id(servicer_id, servicer_name):
     if not sid:
         return pd.NA
     sid = re.sub(r"\.0$", "", sid)
+    sid = sid.replace(",", "").strip()
     serv = clean_text(servicer_name).lower()
-    if "statebridge" in serv and sid.startswith("0000"):
-        sid = sid[4:]
+    if "statebridge" in serv:
+        sid = re.sub(r"[^0-9A-Za-z]", "", sid)
+        if sid.startswith("0000"):
+            sid = sid[4:]
     return sid or pd.NA
 
 def normalize_servicer_id_for_report(servicer_ids: pd.Series, servicer_names: pd.Series) -> pd.Series:
@@ -730,26 +733,6 @@ def deal_key(value) -> str:
         return ""
     s = re.sub(r"\.0$", "", s)
     return s
-
-
-def normalize_deal_number_scalar(value) -> str:
-    s = clean_text(value)
-    if not s:
-        return ""
-    return re.sub(r"\.0$", "", s)
-
-
-def nonblank_unique_deal_numbers(values) -> List[str]:
-    out: List[str] = []
-    seen: Set[str] = set()
-    for value in values or []:
-        s = normalize_deal_number_scalar(value)
-        if not s or s.upper() == "N/A":
-            continue
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
 
 
 def deal_lookup_keys(value) -> List[str]:
@@ -2216,7 +2199,7 @@ def _build_sold_term_like() -> pd.DataFrame:
 
 def _build_term_asset_deal_universe(deal_numbers: Optional[Sequence[str]] = None) -> List[str]:
     opp_rel = property_opportunity_relationship_name()
-    deal_numbers = nonblank_unique_deal_numbers(deal_numbers or [])
+    deal_numbers = _nonblank_unique(deal_numbers or [])
 
     select_pairs = [("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c")]
     rename_map = {expr: label for label, expr in select_pairs}
@@ -2227,7 +2210,6 @@ def _build_term_asset_deal_universe(deal_numbers: Optional[Sequence[str]] = None
         _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
-        "ALA__c > 0",
         "Asset_ID__c != NULL",
         _soql_false_or_null("Is_Sub_Unit__c"),
     ]
@@ -2338,7 +2320,7 @@ def _build_term_wide_like() -> pd.DataFrame:
 
 def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     opp_rel = property_opportunity_relationship_name()
-    deal_numbers = nonblank_unique_deal_numbers(deal_numbers or [])
+    deal_numbers = _nonblank_unique(deal_numbers or [])
     soqls = []
 
     generic_value_date_field = first_existing_field_name("Property__c", ["Value_Date__c", "Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"])
@@ -2378,7 +2360,6 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
-        "ALA__c > 0",
         "Asset_ID__c != NULL",
         _soql_false_or_null("Is_Sub_Unit__c"),
     ]
@@ -2726,17 +2707,12 @@ def _term_report_keep_mask(
     sold_retained = _term_effective_sold_retained_mask(sold_servicing_status, fallback_prev_mask=fallback_prev_retained_mask)
     is_paid_off = stage.eq("Paid Off")
     is_reo_sold = stage.eq("REO-Sold")
+    is_reo = stage.isin(REO_FAMILY_STAGES)
+    if extra_reo_mask is not None:
+        is_reo = is_reo | pd.Series(extra_reo_mask, index=stage.index, copy=False).fillna(False).astype(bool)
     is_sold = stage.eq("Sold")
-
-    # Term keep rule:
-    # - non-sold rows only stay in when raw Salesforce Current Servicer UPB > 0
-    # - sold rows only stay in when Current Servicer UPB > 0 AND servicing is retained
-    # - Paid Off / REO-Sold are always excluded
-    # - extra_reo_mask is informational only and does not bypass the positive-UPB requirement
-    positive_upb = current_upb.gt(0)
-    non_sold_keep = positive_upb & ~is_sold
-    sold_keep = is_sold & positive_upb & sold_retained
-    keep = (non_sold_keep | sold_keep) & ~is_paid_off & ~is_reo_sold
+    positive_upb_keep = current_upb.gt(0) & ~is_sold
+    keep = (is_reo | sold_retained | positive_upb_keep) & ~is_paid_off & ~is_reo_sold
     return keep.fillna(False)
 
 
@@ -2883,8 +2859,6 @@ def _filter_term_population(
     prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
     in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
-    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    force_keep_mask = out["_deal_key"].isin(always_keep_keys)
 
     keep_mask = _term_report_keep_mask(
         out.get("Stage", pd.Series([""] * len(out), index=out.index)),
@@ -2892,7 +2866,7 @@ def _filter_term_population(
         out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
         fallback_prev_retained_mask=in_prev_sold_retained,
     )
-    return out.loc[keep_mask | force_keep_mask].copy()
+    return out.loc[keep_mask].copy()
 
 
 def _best_header_read_excel(
@@ -3418,14 +3392,12 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             keep = [
                 c for c in [
                     "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "CBSA",
-                    "# Units", "Property Type", "Property ALA", "Value Date", "As-Is Value", "Special (Y/N)"
+                    "# Units", "Property Type", "Property ALA", "Value Date", "As-Is Value",
+                    "Special (Y/N)", "CPP JV",
                 ] if c in ta.columns
             ]
             if len(keep) >= 2:
                 tmpa = ta[keep].copy()
-                upb_col_prev = _find_upb_col(ta.columns)
-                if upb_col_prev:
-                    tmpa["_prev_asset_upb"] = ta[upb_col_prev].apply(money_to_float)
                 tmpa["_deal_key"] = norm_id_series(tmpa["Deal Number"])
                 tmpa["_asset_key"] = norm_id_series(tmpa["Asset ID"])
                 out["term_asset_manual"] = tmpa.dropna(subset=["_deal_key", "_asset_key"]).drop_duplicates(["_deal_key", "_asset_key"])
@@ -4159,8 +4131,6 @@ def _build_term_loan_salesforce_fallback(
     raw_sold_status = pd.Series(sf_term.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)).values, index=out.index)
     prev_retained_mask = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(prev_sold_retained_keys)
     reo_date_mask = pd.to_datetime(out["REO Date"], errors="coerce").notna()
-    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    force_keep_mask = out.get("_deal_key", pd.Series([pd.NA] * len(out), index=out.index)).isin(always_keep_keys)
     keep_mask = _term_report_keep_mask(
         raw_stage_series,
         raw_current_upb,
@@ -4168,7 +4138,7 @@ def _build_term_loan_salesforce_fallback(
         fallback_prev_retained_mask=prev_retained_mask,
         extra_reo_mask=reo_date_mask,
     )
-    out = out.loc[keep_mask | force_keep_mask].copy()
+    out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
@@ -4335,55 +4305,6 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
     return downcast_numeric_frame(key_df.drop_duplicates("_sid_key", keep="last"))
 
 
-def _supplement_term_loan_force_includes_from_prev(out: pd.DataFrame, upb_col: str, prev_maps: Optional[dict]) -> pd.DataFrame:
-    if out is None:
-        return out
-    always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    current_keys = set(pd.Series(out.get("_deal_key", pd.Series([], dtype="object")), copy=False).dropna().astype(str).tolist())
-    missing_keys = always_keep_keys - current_keys
-    if not missing_keys or not prev_maps or "term_loan_manual" not in prev_maps:
-        return out
-
-    prev = prev_maps.get("term_loan_manual")
-    if not isinstance(prev, pd.DataFrame) or prev.empty:
-        return out
-    prev = prev.copy()
-    if "_deal_key" not in prev.columns:
-        prev["_deal_key"] = norm_id_series(prev.get("Deal Number", pd.Series([None] * len(prev), index=prev.index)))
-    supplement = prev[prev["_deal_key"].isin(missing_keys)].copy()
-    if supplement.empty:
-        return out
-
-    if "term_loan_upb" in prev_maps:
-        prevu = prev_maps["term_loan_upb"].copy()
-        supplement = supplement.merge(prevu, on="_deal_key", how="left")
-        supplement[upb_col] = pd.to_numeric(supplement.get("_prev_upb", pd.Series([np.nan] * len(supplement), index=supplement.index)), errors="coerce")
-        supplement = supplement.drop(columns=["_prev_upb"], errors="ignore")
-    elif upb_col not in supplement.columns:
-        supplement[upb_col] = np.nan
-
-    if "term_loan_reo" in prev_maps:
-        reo = prev_maps["term_loan_reo"][["_deal_key", "REO Date"]].copy()
-        supplement = supplement.merge(reo, on="_deal_key", how="left", suffixes=("", "_prev_reo"))
-        if "REO Date_prev_reo" in supplement.columns:
-            supplement["REO Date"] = coalesce_keep_nonblank(supplement.get("REO Date", pd.Series([pd.NA] * len(supplement), index=supplement.index)), supplement["REO Date_prev_reo"])
-            supplement = supplement.drop(columns=["REO Date_prev_reo"], errors="ignore")
-
-    for col in out.columns:
-        if col not in supplement.columns:
-            supplement[col] = pd.NA
-    supplement["_deal_key"] = norm_id_series(supplement.get("Deal Number", pd.Series([None] * len(supplement), index=supplement.index)))
-    supplement["_sid_key"] = id_key_no_leading_zeros(supplement.get("Servicer ID", pd.Series([None] * len(supplement), index=supplement.index)))
-    supplement["Servicer ID"] = normalize_servicer_id_for_report(supplement.get("Servicer ID", pd.Series([pd.NA] * len(supplement), index=supplement.index)), supplement.get("Servicer", pd.Series([pd.NA] * len(supplement), index=supplement.index)))
-    supplement["Do Not Lend (Y/N)"] = _yn_from_bool_series(supplement.get("Do Not Lend (Y/N)", pd.Series([pd.NA] * len(supplement), index=supplement.index)))
-    supplement["CPP JV"] = coalesce_keep_nonblank(supplement.get("CPP JV", pd.Series([pd.NA] * len(supplement), index=supplement.index)), pd.Series(["N"] * len(supplement), index=supplement.index))
-    supplement["Active RM"] = coalesce_keep_nonblank(supplement.get("Active RM", pd.Series([pd.NA] * len(supplement), index=supplement.index)), pd.Series(["N"] * len(supplement), index=supplement.index))
-    supplement["Special Loans List (Y/N)"] = coalesce_keep_nonblank(supplement.get("Special Loans List (Y/N)", pd.Series([pd.NA] * len(supplement), index=supplement.index)), pd.Series(["N"] * len(supplement), index=supplement.index))
-
-    supplement = supplement[out.columns]
-    return downcast_numeric_frame(pd.concat([out, supplement], ignore_index=True, copy=False).drop_duplicates(subset=["_deal_key"], keep="first"))
-
-
 def build_term_loan(
     sf_term: pd.DataFrame,
     sf_am: pd.DataFrame,
@@ -4399,29 +4320,10 @@ def build_term_loan(
     prev_sold_retained_keys = _prev_term_sold_retained_keys(prev_maps)
     sf_term_active = _filter_term_population(sf_term, prev_keys=prev_keys, prev_positive_keys=prev_positive_keys, prev_sold_retained_keys=prev_sold_retained_keys)
 
-    asset_filter_provided = asset_deal_numbers is not None
-    asset_deal_keys = set(norm_id_series(pd.Series(list(asset_deal_numbers or []), dtype="object")).dropna().tolist())
     always_keep_keys = set(norm_id_series(pd.Series(list(TERM_ALWAYS_INCLUDE_DEALS), dtype="object")).dropna().tolist())
-    stage_exception_keys: Set[str] = set()
     if sf_term_active is not None and not sf_term_active.empty:
         sf_term_active = sf_term_active.copy()
         sf_term_active["_deal_key"] = norm_id_series(sf_term_active.get("Deal Loan Number", pd.Series([None] * len(sf_term_active), index=sf_term_active.index)))
-        prev_retained_mask = sf_term_active["_deal_key"].isin(prev_sold_retained_keys)
-        raw_stage = sf_term_active.get("Stage", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index)).astype("string").str.strip().fillna("")
-        raw_upb = pd.to_numeric(sf_term_active.get("Current Servicer UPB", pd.Series([np.nan] * len(sf_term_active), index=sf_term_active.index)), errors="coerce").fillna(0)
-        sold_retained_mask = _term_effective_sold_retained_mask(
-            sf_term_active.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(sf_term_active), index=sf_term_active.index)),
-            fallback_prev_mask=prev_retained_mask,
-        )
-        positive_upb_mask = raw_upb.gt(0)
-        stage_exception_mask = (
-            (raw_stage.eq("Closed Won") & positive_upb_mask)
-            | (raw_stage.isin(REO_FAMILY_STAGES) & positive_upb_mask)
-            | (raw_stage.eq("Sold") & positive_upb_mask & sold_retained_mask)
-        )
-        stage_exception_keys = set(sf_term_active.loc[stage_exception_mask, "_deal_key"].dropna().tolist())
-        if asset_filter_provided:
-            sf_term_active = sf_term_active[sf_term_active["_deal_key"].isin(asset_deal_keys | always_keep_keys | stage_exception_keys)].copy()
         sf_term_active = sf_term_active.drop(columns=["_deal_key"], errors="ignore")
 
     out = _build_term_loan_salesforce_fallback(
@@ -4493,42 +4395,19 @@ def build_term_loan(
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Special Loans List (Y/N)"] = coalesce_keep_nonblank(out.get("Special Loans List (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
-    if asset_filter_provided:
-        out = out[out["_deal_key"].isin(asset_deal_keys | always_keep_keys | stage_exception_keys)].copy()
+    if always_keep_keys:
+        missing_force = sorted(always_keep_keys - set(out["_deal_key"].dropna().tolist()))
+        if missing_force and "term_loan_manual" in prev_maps:
+            prev_force = prev_maps["term_loan_manual"].copy()
+            prev_force = prev_force[prev_force["_deal_key"].isin(missing_force)].copy()
+            if not prev_force.empty:
+                for col in [c for c in out.columns if c not in prev_force.columns]:
+                    prev_force[col] = pd.NA
+                prev_force = prev_force[out.columns]
+                out = pd.concat([out, prev_force], ignore_index=True, copy=False)
 
-    out = _supplement_term_loan_force_includes_from_prev(out, upb_col, prev_maps)
     out = out[out["_deal_key"].notna()].copy()
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
-
-def _supplement_term_asset_rows_from_prev(out: pd.DataFrame, valid_deals: Set[str], prev_maps: Optional[dict]) -> pd.DataFrame:
-    if not prev_maps or "term_asset_manual" not in prev_maps:
-        return out
-    prev = prev_maps.get("term_asset_manual")
-    if not isinstance(prev, pd.DataFrame) or prev.empty:
-        return out
-
-    prev = prev.copy()
-    if "_deal_key" not in prev.columns:
-        prev["_deal_key"] = norm_id_series(prev.get("Deal Number", pd.Series([None] * len(prev), index=prev.index)))
-    if "_asset_key" not in prev.columns:
-        prev["_asset_key"] = norm_id_series(prev.get("Asset ID", pd.Series([None] * len(prev), index=prev.index)))
-
-    prev = prev[prev["_deal_key"].isin(valid_deals) & prev["_asset_key"].notna()].copy()
-    if prev.empty:
-        return out
-
-    current_pairs = set(zip(out.get("_deal_key", pd.Series(dtype="object")).astype("string"), out.get("_asset_key", pd.Series(dtype="object")).astype("string")))
-    prev["_pair"] = list(zip(prev["_deal_key"].astype("string"), prev["_asset_key"].astype("string")))
-    supplement = prev[~prev["_pair"].isin(current_pairs)].copy()
-    if supplement.empty:
-        return out
-
-    for col in out.columns:
-        if col not in supplement.columns:
-            supplement[col] = pd.NA
-    supplement = supplement[[c for c in out.columns if c in supplement.columns]]
-    return downcast_numeric_frame(pd.concat([out, supplement], ignore_index=True, copy=False))
-
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
     out = pd.DataFrame(index=sf_term_asset.index)
@@ -4546,7 +4425,6 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 
     valid_deals = set(tl["_deal_key"].dropna().tolist())
     out = out[out["_deal_key"].isin(valid_deals) & out["_asset_key"].notna()].copy()
-    out = _supplement_term_asset_rows_from_prev(out, valid_deals, prev_maps)
 
     if "CPP JV" in tl.columns:
         tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
@@ -4570,14 +4448,35 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
 
     if prev_maps and "term_asset_manual" in prev_maps:
         prev = prev_maps["term_asset_manual"].copy()
-        keep = ["_deal_key", "_asset_key"] + [c for c in ["Special (Y/N)"] if c in prev.columns]
+        keep = ["_deal_key", "_asset_key"] + [c for c in [
+            "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "CBSA",
+            "# Units", "Property Type", "Property ALA", "Value Date", "As-Is Value",
+            "Special (Y/N)", "CPP JV",
+        ] if c in prev.columns]
         prev = prev[keep].drop_duplicates(["_deal_key", "_asset_key"])
         out = out.merge(prev, on=["_deal_key", "_asset_key"], how="left", suffixes=("", "_prev"))
-        if "Special (Y/N)_prev" in out.columns:
-            out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out["Special (Y/N)_prev"])
-            out = out.drop(columns=["Special (Y/N)_prev"], errors="ignore")
+        for c in [x for x in keep if x not in {"_deal_key", "_asset_key"}]:
+            if f"{c}_prev" in out.columns:
+                out[c] = coalesce_keep_nonblank(out.get(c, pd.Series([pd.NA] * len(out), index=out.index)), out[f"{c}_prev"])
+                out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
     out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
+
+    if prev_maps and "term_asset_manual" in prev_maps and not term_loan.empty:
+        prev_full = prev_maps["term_asset_manual"].copy()
+        term_deals = set(norm_id_series(term_loan.get("Deal Number", pd.Series([None] * len(term_loan), index=term_loan.index))).dropna().tolist())
+        present_pairs = set(zip(out["_deal_key"].astype(str), out["_asset_key"].astype(str)))
+        prev_full = prev_full[prev_full["_deal_key"].isin(term_deals)].copy()
+        if not prev_full.empty:
+            missing_prev = prev_full[~prev_full.apply(lambda r: (str(r["_deal_key"]), str(r["_asset_key"])) in present_pairs, axis=1)].copy()
+            if not missing_prev.empty:
+                for col in out.columns:
+                    if col not in missing_prev.columns:
+                        missing_prev[col] = pd.NA
+                missing_prev = missing_prev[out.columns]
+                out = pd.concat([out, missing_prev], ignore_index=True, copy=False)
+                out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
+                out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out), index=out.index)))
 
     for c in ["CPP JV"]:
         if c in out.columns:
@@ -6021,18 +5920,20 @@ def enforce_zero_fillable_blanks(
     return False, diagnostics, audit_summary, audit_exceptions
 
 
-def set_summary_as_active_sheet(wb):
+
+def sanitize_summary_formulas(wb):
     if "Summary" not in wb.sheetnames:
         return
-    try:
-        wb.active = wb.sheetnames.index("Summary")
-        ws = wb["Summary"]
-        sel = ws.sheet_view.selection[0]
-        sel.activeCell = "A1"
-        sel.sqref = "A1"
-    except Exception:
-        pass
-
+    ws = wb["Summary"]
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if not (isinstance(v, str) and v.startswith("=")):
+                continue
+            if "IFERROR(" in v.upper():
+                continue
+            if "/" in v:
+                cell.value = f'=IFERROR({v[1:]},"N/A")'
 
 def mark_workbook_for_recalc(wb):
     try:
@@ -6237,6 +6138,7 @@ if build_btn:
             wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
             mark_workbook_for_recalc(wb)
             restore_template_scaffold(wb, run_dt, upb_col)
+            sanitize_summary_formulas(wb)
 
             need_bridge = build_target in ("Bridge Asset", "Bridge Loan", "All")
             need_term = build_target in ("Term Loan", "Term Asset", "All")
@@ -6326,7 +6228,7 @@ if build_btn:
                 status.update(label="Pulling term data from Salesforce...")
                 term_wide = _build_term_wide_like()
 
-                candidate_term_deals = nonblank_unique_deal_numbers(term_wide["Deal Loan Number"].tolist()) if not term_wide.empty and "Deal Loan Number" in term_wide.columns else []
+                candidate_term_deals = _nonblank_unique(term_wide["Deal Loan Number"].tolist()) if not term_wide.empty and "Deal Loan Number" in term_wide.columns else []
 
                 status.update(label="Pulling term asset deal universe from Salesforce...")
                 term_asset_filter_deals = _build_term_asset_deal_universe(candidate_term_deals)
@@ -6359,7 +6261,12 @@ if build_btn:
                     write_output_sheet(wb, "Term Loan", term_loan_df, upb_col)
 
                 if need_term_asset:
-                    term_deal_numbers = nonblank_unique_deal_numbers(term_loan_df["Deal Number"].tolist()) if "Deal Number" in term_loan_df.columns else []
+                    term_deal_numbers = (
+                        norm_id_series(pd.Series([d for d in _nonblank_unique(term_loan_df["Deal Number"].tolist()) if clean_text(d).upper() != "N/A"], dtype="object"))
+                        .dropna()
+                        .astype(str)
+                        .tolist()
+                    ) if "Deal Number" in term_loan_df.columns else []
 
                     status.update(label="Pulling term asset rows from Salesforce...")
                     term_asset_source = _build_term_asset_like(deal_numbers=term_deal_numbers)
@@ -6432,8 +6339,8 @@ if build_btn:
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
+            sanitize_summary_formulas(wb)
             mark_workbook_for_recalc(wb)
-            set_summary_as_active_sheet(wb)
             wb.save(out_bytes)
             out_bytes.seek(0)
             wb.close()
