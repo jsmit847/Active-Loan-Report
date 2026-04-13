@@ -2206,7 +2206,6 @@ def _build_term_asset_deal_universe(deal_numbers: Optional[Sequence[str]] = None
         _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
-        "ALA__c > 0",
         "Asset_ID__c != NULL",
         _soql_false_or_null("Is_Sub_Unit__c"),
     ]
@@ -2357,7 +2356,6 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         _term_dealtype_condition(f"{opp_rel}."),
         _soql_in(f"{opp_rel}.StageName", TERM_ACTIVE_STAGES),
         _soql_in("Status__c", TERM_ACTIVE_PROPERTY_STATUSES),
-        "ALA__c > 0",
         "Asset_ID__c != NULL",
         _soql_false_or_null("Is_Sub_Unit__c"),
     ]
@@ -2849,12 +2847,14 @@ def _filter_term_population(
     prev_keys: Optional[Set[str]] = None,
     prev_positive_keys: Optional[Set[str]] = None,
     prev_sold_retained_keys: Optional[Set[str]] = None,
+    always_keep_keys: Optional[Set[str]] = None,
 ) -> pd.DataFrame:
     if sf_term is None or sf_term.empty:
         return sf_term
 
     out = sf_term.copy()
     prev_sold_retained_keys = prev_sold_retained_keys or set()
+    always_keep_keys = always_keep_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
     in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
 
@@ -2864,6 +2864,8 @@ def _filter_term_population(
         out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
         fallback_prev_retained_mask=in_prev_sold_retained,
     )
+    if always_keep_keys:
+        keep_mask = keep_mask | out["_deal_key"].isin(always_keep_keys)
     return out.loc[keep_mask].copy()
 
 
@@ -3986,6 +3988,7 @@ def _build_term_loan_salesforce_fallback(
     prev_maps: dict,
     template_maps: dict,
     prev_sold_retained_keys: Optional[Set[str]] = None,
+    always_keep_keys: Optional[Set[str]] = None,
 ) -> pd.DataFrame:
     if sf_term is None or sf_term.empty:
         return pd.DataFrame()
@@ -3997,6 +4000,7 @@ def _build_term_loan_salesforce_fallback(
 
     out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
     prev_sold_retained_keys = prev_sold_retained_keys or set()
+    always_keep_keys = always_keep_keys or set()
 
     if "Do Not Lend (Y/N)" in out.columns:
         out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out["Do Not Lend (Y/N)"])
@@ -4130,6 +4134,8 @@ def _build_term_loan_salesforce_fallback(
         fallback_prev_retained_mask=prev_retained_mask,
         extra_reo_mask=reo_date_mask,
     )
+    if always_keep_keys:
+        keep_mask = keep_mask | out["_deal_key"].isin(always_keep_keys)
     out = out.loc[keep_mask].copy()
     out = out[(out.get("_sid_key", pd.Series([pd.NA] * len(out), index=out.index)).notna()) | (out["_deal_key"].notna())].copy()
 
@@ -6230,9 +6236,20 @@ if build_btn:
                     if term_asset_backfill and term_asset_backfill.get("fills"):
                         diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
 
+                    loan_deal_set = set(norm_id_series(term_loan_df.get("Deal Number", pd.Series(dtype="object"))).dropna().tolist())
+                    asset_deal_set = set(norm_id_series(term_asset_df.get("Deal Number", pd.Series(dtype="object"))).dropna().tolist())
+                    missing_term_asset_deals = sorted(loan_deal_set - asset_deal_set)
+                    extra_term_asset_deals = sorted(asset_deal_set - loan_deal_set)
+                    diagnostics.append(f"Term Asset rows: {len(term_asset_df):,}")
+                    diagnostics.append(f"Term loans missing from Term Asset: {len(missing_term_asset_deals):,}")
+                    diagnostics.append(f"Extra Term Asset deal numbers not in Term Loan: {len(extra_term_asset_deals):,}")
+                    spotlight_deals = ["49111", "19735", "20033", "55807", "43422", "43462"]
+                    spotlight_present = {deal: (deal in asset_deal_set) for deal in spotlight_deals}
+                    diagnostics.append("Term Asset spotlight deals present: " + ", ".join(f"{deal}={'Y' if is_present else 'N'}" for deal, is_present in spotlight_present.items()))
+
                     status.update(label="Writing Term Asset sheet...")
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
-                    del term_deal_numbers, term_asset_source, term_asset_df
+                    del term_deal_numbers, term_asset_source, term_asset_df, loan_deal_set, asset_deal_set, missing_term_asset_deals, extra_term_asset_deals, spotlight_present
 
                 del term_wide, term_loan_df, term_asset_filter_deals, candidate_term_deals
                 gc.collect()
