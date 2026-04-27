@@ -237,9 +237,6 @@ BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Origination As-Is Value": "Origination As-Is Value",
     "Origination ARV": "Origination After Repair Value",
     "Most Recent Appraisal Order Date": "Most Recent Appraisal Order Date",
-    "Updated Valuation Date": "Current Appraisal Date",
-    "Updated As-Is Value": "Current Appraised As-Is Value",
-    "Updated ARV": "Current Appraised After Repair Value",
     "Initial Disbursement Funded": "Initial Disbursement Funded",
     "Renovation Holdback": "Approved Renovation Advance Amount",
     "Renovation Holdback Funded": "Renovation Advance Amount Funded",
@@ -315,9 +312,9 @@ DRAFT_FORMULA_OVERRIDES = {
         "Days to Maturity": '=+$CJ5-$CK$3',
         "Days Past Due": '=+$CL$3-$AC5',
         "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
-        "Most Recent Valuation Date": '=IF($BE5<>"N/A",$BE5,$BA5)',
-        "Most Recent As-Is Value": '=IF($BE5<>"N/A",$BF5,$BB5)',
-        "Most Recent ARV": '=IF($BE5<>"N/A",$BG5,$BC5)',
+        "Most Recent Valuation Date": '=IF(OR($BE5="N/A",$BE5=""),$BA5,$BE5)',
+        "Most Recent As-Is Value": '=IF(OR($BE5="N/A",$BE5=""),$BB5,$BF5)',
+        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),$BC5,$BG5)',
         "Needs NPL Value": '=IF(AND($CZ5="Y",$CN5<$CQ$3),"Y","N")',
         "Securitized (Y/N)": '=IF($BR5="Securitized Bridge","Y","N")',
         "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
@@ -933,8 +930,6 @@ def fci_servicer_label_from_filename(filename: str) -> str:
     n = filename.lower()
     if "2012632" in n:
         return "FCI 2012632"
-    if "18105510" in n or "1805510" in n:
-        return "FCI v1805510"
     return "FCI"
 
 
@@ -2039,9 +2034,9 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     if df.empty:
         df = appraisal_df.copy()
     else:
-        df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "BPO Appraisal Date", "Backup Value Date Native"])
-        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
-        df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value", pd.Series([np.nan] * len(df), index=df.index)), errors="coerce")
+        df["Current Appraisal Date"] = pd.NaT
+        df["Current Appraised As-Is Value"] = np.nan
+        df["Current Appraised After Repair Value"] = np.nan
         if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
             app = appraisal_df.copy()
             app["_asset_key"] = norm_id_series(app["Asset ID"])
@@ -2052,7 +2047,10 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
             for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
                 app_col = f"{c}_app"
                 if app_col in df.columns:
-                    df[c] = coalesce_keep_nonblank(df.get(c, pd.Series([pd.NA] * len(df), index=df.index)), df[app_col])
+                    if c in {"Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"}:
+                        df[c] = df[app_col]
+                    else:
+                        df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
                     df = df.drop(columns=[app_col], errors="ignore")
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
@@ -3044,7 +3042,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "servicer_id": _series_to_id(df, ["Servicer Loan ID", "Loan ID", "Loan Number"]),
                 "upb": _series_to_num(df, ["UPB", "Principal Balance", "Current UPB"]),
                 "suspense": np.nan,
-                "next_payment_date": _series_to_dt(df, ["Next Due Date", "Due Date", "Next Payment Date"]),
+                "next_payment_date": _series_to_dt(df, ["Due Date", "Next Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Current Maturity Date", "Maturity Date"]),
                 "status": _series_to_text(df, ["Performing Status", "Status", "Loan Status"]),
                 "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["Report Date", "As Of Date", "Run Date"])),
@@ -3073,7 +3071,10 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "suspense": _series_to_num(df, ["Unapplied Balance", "Suspense Balance", "Suspense"]),
                 "next_payment_date": _series_to_dt(df, ["Due Date", "Next Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Maturity Date", "Current Maturity Date"]),
-                "status": _series_to_text(df, ["Loan Status", "Status"]),
+                "status": coalesce_keep_nonblank(
+                    _series_to_text(df, ["MBA", "MBA Status", "MBA Delinquency Status", "MBA Status Code"]),
+                    _series_to_text(df, ["Loan Status", "Status"]),
+                ),
                 "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["Date", "Run Date", "Report Date", "As Of Date"])),
             }
         )
@@ -3116,7 +3117,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No"]),
                 "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance"]),
                 "suspense": _series_to_num(df, ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"]),
-                "next_payment_date": _series_to_dt(df, ["Next Due Date", "Due Date", "Next Payment Date"]),
+                "next_payment_date": _series_to_dt(df, ["Due Date", "Next Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Maturity Date", "Current Maturity Date"]),
                 "status": _series_to_text(df, ["Status", "Loan Status"]),
                 "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["Report Date", "As Of Date", "Date", "Run Date"])),
@@ -3411,8 +3412,8 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
 SHEET_BASELINE_KEY_CANDIDATES = {
     "Bridge Asset": [["Asset ID"]],
     "Bridge Loan": [["Deal Number"]],
-    "Term Loan": [["Servicer ID"], ["Deal Number"]],
-    "Term Asset": [["Deal Number", "Asset ID"]],
+    "Term Loan": [["Deal Number"], ["Servicer ID"]],
+    "Term Asset": [["Asset ID"], ["Deal Number", "Asset ID"]],
 }
 
 
@@ -3938,7 +3939,7 @@ def build_bridge_asset(
         index=out.index,
         dtype="float64",
     )
-    out["Servicer Status"] = coalesce_keep_nonblank(status_bucket, out.get("Servicer Status", blank_obj))
+    out["Servicer Status"] = coalesce_keep_nonblank(out.get("Servicer Status", blank_obj), status_bucket)
 
     if "Approved Advance Amount Funded" in sf_spine.columns:
         out["SF Funded Amount"] = pd.to_numeric(sf_spine["Approved Advance Amount Funded"], errors="coerce")
@@ -4557,6 +4558,23 @@ def build_bridge_loan(
 
     if bridge_asset is not None and not bridge_asset.empty:
         ba = bridge_asset.copy()
+        upd_dt = pd.to_datetime(ba.get("Updated Valuation Date", pd.Series([pd.NaT] * len(ba), index=ba.index)), errors="coerce")
+        org_dt = pd.to_datetime(ba.get("Origination Value Dt", pd.Series([pd.NaT] * len(ba), index=ba.index)), errors="coerce")
+        has_updated_appraisal = upd_dt.notna()
+        ba["_roll_recent_val_dt"] = upd_dt.where(has_updated_appraisal, org_dt)
+        ba["_roll_recent_asis"] = pd.to_numeric(
+            ba.get("Updated As-Is Value", pd.Series([np.nan] * len(ba), index=ba.index)), errors="coerce"
+        ).where(
+            has_updated_appraisal,
+            pd.to_numeric(ba.get("Origination As-Is Value", pd.Series([np.nan] * len(ba), index=ba.index)), errors="coerce"),
+        )
+        ba["_roll_recent_arv"] = pd.to_numeric(
+            ba.get("Updated ARV", pd.Series([np.nan] * len(ba), index=ba.index)), errors="coerce"
+        ).where(
+            has_updated_appraisal,
+            pd.to_numeric(ba.get("Origination ARV", pd.Series([np.nan] * len(ba), index=ba.index)), errors="coerce"),
+        )
+
         g = ba.groupby("_deal_key", dropna=True)
 
         def _first(series: pd.Series):
@@ -4578,15 +4596,18 @@ def build_bridge_loan(
             {
                 "Servicer ID_active": g["Servicer ID"].apply(first_or_various) if "Servicer ID" in ba.columns else pd.Series(dtype="string"),
                 "Servicer_active": g["Servicer"].apply(first_or_various) if "Servicer" in ba.columns else pd.Series(dtype="string"),
+                "Number of Assets_active": g["_asset_key"].nunique() if "_asset_key" in ba.columns else pd.Series(dtype="float"),
+                "# of Units_active": pd.to_numeric(g["# of Units"].sum(min_count=1), errors="coerce") if "# of Units" in ba.columns else pd.Series(dtype="float"),
+                "State(s)_active": g["State"].apply(lambda s: ", ".join(sorted({clean_text(x) for x in s if clean_text(x)}))) if "State" in ba.columns else pd.Series(dtype="string"),
                 "Primary Contact_active": g["Primary Contact"].apply(_first) if "Primary Contact" in ba.columns else pd.Series(dtype="string"),
                 "Last Funding Date_active": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else pd.NaT,
                 "Days Past Due_active": pd.to_numeric(g["_bridge_dpd_num"].max(), errors="coerce") if "_bridge_dpd_num" in ba.columns else pd.Series(dtype="float"),
                 "Loan Level Delinquency_active": g["_bridge_dq_bucket"].apply(_worst_bridge_bucket) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
                 "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
                 "Suspense Balance_active": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
-                "Most Recent Valuation Date": g["Updated Valuation Date"].apply(_max_dt) if "Updated Valuation Date" in ba.columns else pd.NaT,
-                "Most Recent As-Is Value": pd.to_numeric(g["Updated As-Is Value"].sum(min_count=1), errors="coerce") if "Updated As-Is Value" in ba.columns else np.nan,
-                "Most Recent ARV": pd.to_numeric(g["Updated ARV"].sum(min_count=1), errors="coerce") if "Updated ARV" in ba.columns else np.nan,
+                "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_max_dt),
+                "Most Recent As-Is Value": pd.to_numeric(g["_roll_recent_asis"].sum(min_count=1), errors="coerce"),
+                "Most Recent ARV": pd.to_numeric(g["_roll_recent_arv"].sum(min_count=1), errors="coerce"),
                 "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
                 "Renovation Holdback": pd.to_numeric(g["Renovation Holdback"].sum(min_count=1), errors="coerce") if "Renovation Holdback" in ba.columns else np.nan,
                 "Renovation HB Funded": pd.to_numeric(g["Renovation Holdback Funded"].sum(min_count=1), errors="coerce") if "Renovation Holdback Funded" in ba.columns else np.nan,
@@ -4619,13 +4640,40 @@ def build_bridge_loan(
     )
     out["Servicer ID"] = coalesce_keep_nonblank(out.get("Servicer ID_active", blank_obj), out.get("Servicer ID", blank_obj))
     out["Servicer"] = coalesce_keep_nonblank(out.get("Servicer_active", blank_obj), out.get("Servicer", blank_obj))
-    out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get("Number of Assets SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(), pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"))
-    out["# of Units"] = pd.to_numeric(out.get("# of Units SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get("# of Units SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(), pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"))
-    out["State(s)"] = coalesce_keep_nonblank(out.get("State(s) SF", blank_obj), out.get("State(s)", blank_obj))
-    out["Last Funding Date"] = pd.to_datetime(out.get("Last Funding Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Last Funding Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(), out["Last Funding Date"])
-    out["Most Recent Valuation Date"] = pd.to_datetime(out.get("Most Recent Valuation Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Most Recent Valuation Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out.get("Most Recent Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"))
-    out["Most Recent As-Is Value"] = pd.to_numeric(out.get("Most Recent As-Is Value SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get("Most Recent As-Is Value SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(), pd.to_numeric(out.get("Most Recent As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"))
-    out["Active Funded Amount"] = pd.to_numeric(out.get("Active Funded Amount SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get("Active Funded Amount SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(), pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"))
+    out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("Number of Assets_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Number of Assets"] = pd.to_numeric(out["Number of Assets"], errors="coerce").where(
+        pd.to_numeric(out["Number of Assets"], errors="coerce").notna(),
+        pd.to_numeric(out.get("Number of Assets SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["# of Units"] = pd.to_numeric(out.get("# of Units_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("# of Units_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["# of Units"] = pd.to_numeric(out["# of Units"], errors="coerce").where(
+        pd.to_numeric(out["# of Units"], errors="coerce").notna(),
+        pd.to_numeric(out.get("# of Units SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)_active", blank_obj), out.get("State(s)", blank_obj))
+    out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)", blank_obj), out.get("State(s) SF", blank_obj))
+    out["Last Funding Date"] = pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_datetime(out.get("Last Funding Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Most Recent Valuation Date"] = pd.to_datetime(out.get("Most Recent Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_datetime(out.get("Most Recent Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_datetime(out.get("Most Recent Valuation Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Most Recent As-Is Value"] = pd.to_numeric(out.get("Most Recent As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("Most Recent As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("Most Recent As-Is Value SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
+    out["Active Funded Amount"] = pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("Active Funded Amount SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
 
     out["Active Asset Count"] = pd.to_numeric(out.get("Active Asset Count", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0)
     out["Active Asset UPB"] = pd.to_numeric(out.get("Active Asset UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
