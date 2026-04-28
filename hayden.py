@@ -690,6 +690,97 @@ def clean_text(val) -> str:
         return ""
     return s
 
+DISPLAY_COLLAPSE_WHITESPACE_HEADERS = {
+    "Bridge Loan": {"Deal Name", "Borrower Name", "Account", "Deal Intro Sub-Source"},
+    "Bridge Asset": {
+        "Address", "Borrower Entity", "Account Name", "APN", "Additional APNs",
+        "Tax Commentary", "Delinquency Notes", "Maturity Status", "Special Asset Status",
+        "Title Company", "Deal Name", "Deal Intro Sub-Source",
+    },
+    "Term Loan": {"AM Commentary", "Account Name", "Referral Source Account", "Deal Name", "Borrower Entity"},
+    "Term Asset": {"Address"},
+}
+DISPLAY_DIGIT_TEXT_TO_INT_HEADERS = {
+    "Bridge Loan": {"Servicer ID"},
+    "Bridge Asset": {"Deal Number", "Servicer ID", "SF Yardi ID"},
+    "Term Loan": {"Deal Number", "Servicer ID", "SF Yardi ID", "AM Commentary"},
+}
+DISPLAY_FORCE_TEXT_HEADERS = {
+    "Bridge Asset": {"Year Built", "Square Feet"},
+}
+DISPLAY_CANONICAL_TEXT_BY_HEADER = {
+    "Loan Level Delinquency": {"CURRENT": "Current"},
+}
+DISPLAY_CANONICAL_TEXT_BY_SHEET_HEADER = {
+    ("Bridge Loan", "Deal Intro Sub-Source"): {"5arch": "5arch"},
+    ("Bridge Asset", "Deal Intro Sub-Source"): {"5arch": "5arch"},
+    ("Term Loan", "Deal Intro Sub-Source"): {"5arch": "5arch"},
+}
+
+def collapse_internal_whitespace(val):
+    s = clean_text(val)
+    if not s:
+        return pd.NA
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or pd.NA
+
+def _stringify_numeric_for_display(val):
+    if val is None or val is pd.NA:
+        return pd.NA
+    if isinstance(val, np.generic):
+        val = val.item()
+    if isinstance(val, (int, np.integer)) and not isinstance(val, bool):
+        return str(int(val))
+    if isinstance(val, (float, np.floating)):
+        try:
+            if pd.isna(val):
+                return pd.NA
+        except Exception:
+            pass
+        num = float(val)
+        if num.is_integer():
+            return str(int(num))
+        return ("{:f}".format(num)).rstrip("0").rstrip(".")
+    return clean_text(val) or pd.NA
+
+def _maybe_digit_text_to_int(val):
+    s = clean_text(val)
+    if not s:
+        return pd.NA
+    s = re.sub(r"\.0$", "", s)
+    if re.fullmatch(r"0|[1-9]\d*", s):
+        try:
+            return int(s)
+        except Exception:
+            return s
+    return val
+
+def _normalize_display_value(sheet_name: str, header: str, value):
+    if value is None or value is pd.NA:
+        return value
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except Exception:
+        pass
+    if header in DISPLAY_FORCE_TEXT_HEADERS.get(sheet_name, set()):
+        return _stringify_numeric_for_display(value)
+    if header in DISPLAY_COLLAPSE_WHITESPACE_HEADERS.get(sheet_name, set()):
+        value = collapse_internal_whitespace(value)
+    header_map = DISPLAY_CANONICAL_TEXT_BY_HEADER.get(header)
+    if header_map:
+        s = clean_text(value)
+        if s:
+            value = header_map.get(s.upper(), value)
+    sheet_header_map = DISPLAY_CANONICAL_TEXT_BY_SHEET_HEADER.get((sheet_name, header))
+    if sheet_header_map:
+        s = clean_text(value)
+        if s:
+            value = sheet_header_map.get(s.lower(), value)
+    if header in DISPLAY_DIGIT_TEXT_TO_INT_HEADERS.get(sheet_name, set()):
+        value = _maybe_digit_text_to_int(value)
+    return value
+
 def strip_statebridge_display_id(servicer_id, servicer_name):
     sid = clean_text(servicer_id)
     if not sid:
@@ -5059,16 +5150,16 @@ def _coerce_excel_date_value(val):
     if isinstance(val, pd.Timestamp):
         if pd.isna(val):
             return None
-        return val.to_pydatetime().date()
+        return val.to_pydatetime()
     if isinstance(val, datetime):
-        return val.date()
+        return val
     if isinstance(val, date):
         return val
     try:
         parsed = pd.to_datetime(val, errors="coerce")
         if pd.isna(parsed):
             return val
-        return parsed.to_pydatetime().date()
+        return parsed.to_pydatetime()
     except Exception:
         return val
 
@@ -5158,7 +5249,8 @@ def write_df_to_sheet_preserve_formulas(
     for r_offset, row in enumerate(df_out.itertuples(index=False, name=None), start=0):
         r = start_row + r_offset
         for (c, h), val in zip(write_cols, row):
-            safe_val = _excel_safe_value(val)
+            display_val = _normalize_display_value(ws_formula.title, h, val)
+            safe_val = _excel_safe_value(display_val)
             if _is_date_header(ws_formula.title, h):
                 safe_val = _coerce_excel_date_value(safe_val)
             ws_formula.cell(r, c).value = safe_val
