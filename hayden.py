@@ -2034,9 +2034,10 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     if df.empty:
         df = appraisal_df.copy()
     else:
-        df["Current Appraisal Date"] = pd.NaT
-        df["Current Appraised As-Is Value"] = np.nan
-        df["Current Appraised After Repair Value"] = np.nan
+        df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "Backup Value Date Native", "BPO Appraisal Date"])
+        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
+        df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value"), errors="coerce")
+
         if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
             app = appraisal_df.copy()
             app["_asset_key"] = norm_id_series(app["Asset ID"])
@@ -2047,10 +2048,7 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
             for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
                 app_col = f"{c}_app"
                 if app_col in df.columns:
-                    if c in {"Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"}:
-                        df[c] = df[app_col]
-                    else:
-                        df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
+                    df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
                     df = df.drop(columns=[app_col], errors="ignore")
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
