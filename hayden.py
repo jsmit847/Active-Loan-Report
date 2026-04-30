@@ -776,7 +776,7 @@ def normalize_text_display_series(s: pd.Series) -> pd.Series:
 def normalize_integer_display_series(s: pd.Series) -> pd.Series:
     ser = pd.Series(s, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(ser, copy=True)
+    out = pd.Series(list(ser), index=ser.index, dtype="object")
     mask = num.notna()
     out.loc[mask] = num.loc[mask].round(0).astype("int64")
     return out
@@ -5329,7 +5329,7 @@ def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start
 def _round_report_money_series(series: pd.Series) -> pd.Series:
     ser = pd.Series(series, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(ser, copy=True)
+    out = pd.Series(list(ser), index=ser.index, dtype="object")
     mask = num.notna()
     out.loc[mask] = num.loc[mask].round(2)
     return out
@@ -5340,26 +5340,33 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
         return pd.DataFrame() if df is None else df.copy()
     out = df.copy()
 
-    for header in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set()):
-        if header in out.columns:
-            out[header] = normalize_report_identifier_series(out[header])
-
-    for header in REPORT_INTEGER_HEADERS.get(sheet_name, set()):
-        if header in out.columns:
-            out[header] = normalize_integer_display_series(out[header])
-
-    text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
-    text_headers = {h for h in text_headers if h not in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())}
-    for header in text_headers:
-        if header in out.columns:
-            out[header] = normalize_text_display_series(out[header])
-
+    identifier_headers = REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())
+    integer_headers = REPORT_INTEGER_HEADERS.get(sheet_name, set())
     money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
     if upb_col:
         money_headers.add(upb_col)
+
+    for header in identifier_headers:
+        if header in out.columns:
+            out[header] = normalize_report_identifier_series(out[header])
+
+    for header in integer_headers:
+        if header in out.columns:
+            out[header] = normalize_integer_display_series(out[header])
+
     for header in money_headers:
         if header in out.columns:
             out[header] = _round_report_money_series(out[header])
+
+    text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
+    text_headers = {
+        h
+        for h in text_headers
+        if h not in identifier_headers and h not in integer_headers and h not in money_headers
+    }
+    for header in text_headers:
+        if header in out.columns:
+            out[header] = normalize_text_display_series(out[header])
 
     return out
 
