@@ -173,6 +173,27 @@ SHEET_DATE_HEADERS = {
     "Term Asset": {"Value Date"},
 }
 
+SHEET_DATETIME_HEADERS = {
+    "Bridge Asset": {"Most Recent Appraisal Order Date"},
+}
+
+REPORT_IDENTIFIER_HEADERS = {
+    "Bridge Asset": {"Deal Number", "Servicer ID", "SF Yardi ID", "Asset ID"},
+    "Bridge Loan": {"Deal Number", "Servicer ID"},
+    "Term Loan": {"Deal Number", "Servicer ID", "SF Yardi ID"},
+    "Term Asset": {"Deal Number", "Asset ID"},
+}
+
+DEFAULT_TEXT_HEADERS = {
+    "Bridge Asset": {"Year Built", "Square Feet", "Zip", "APN", "Additional APNs"},
+}
+
+REPORT_INTEGER_HEADERS = {
+    "Bridge Asset": {"# of Units", "Days to Maturity", "Days Past Due"},
+    "Bridge Loan": {"Number of Assets", "# of Units", "Days Past Due"},
+    "Term Asset": {"# Units"},
+}
+
 SHEET_MONEY2_HEADERS = {
     "Bridge Asset": {
         "SF Funded Amount", "Suspense Balance", "Origination As-Is Value", "Origination ARV",
@@ -710,6 +731,55 @@ def normalize_servicer_id_for_report(servicer_ids: pd.Series, servicer_names: pd
     for i in sid.index:
         out.append(strip_statebridge_display_id(sid.loc[i], serv.loc[i] if i in serv.index else pd.NA))
     return pd.Series(out, index=sid.index, dtype="object")
+
+
+def normalize_report_identifier_scalar(val):
+    txt = clean_text(val)
+    if not txt:
+        return pd.NA
+    txt = re.sub(r"\.0$", "", txt)
+    txt = txt.strip()
+    if re.fullmatch(r"\d+", txt):
+        if len(txt) > 1 and txt.startswith("0"):
+            return txt
+        try:
+            return int(txt)
+        except Exception:
+            return txt
+    return txt
+
+
+def normalize_report_identifier_series(s: pd.Series) -> pd.Series:
+    return pd.Series(s, copy=False).map(normalize_report_identifier_scalar)
+
+
+def normalize_text_display_scalar(val):
+    if not has_any_value(val):
+        return pd.NA
+    if isinstance(val, pd.Timestamp):
+        if pd.isna(val):
+            return pd.NA
+        return _excel_strip_timezone(val)
+    if isinstance(val, (datetime, date)):
+        return _excel_strip_timezone(val) if isinstance(val, datetime) else val
+    if isinstance(val, np.generic):
+        val = val.item()
+    txt = clean_text(val)
+    txt = re.sub(r"\.0$", "", txt)
+    return txt if txt else pd.NA
+
+
+def normalize_text_display_series(s: pd.Series) -> pd.Series:
+    return pd.Series(s, copy=False).map(normalize_text_display_scalar)
+
+
+def normalize_integer_display_series(s: pd.Series) -> pd.Series:
+    ser = pd.Series(s, copy=False)
+    num = pd.to_numeric(ser, errors="coerce")
+    out = pd.Series(ser, copy=True)
+    mask = num.notna()
+    out.loc[mask] = num.loc[mask].round(0).astype("int64")
+    return out
 
 
 def blankish_mask(s: pd.Series) -> pd.Series:
@@ -1565,6 +1635,17 @@ def _coalesce_numeric_columns(df: pd.DataFrame, columns: Sequence[str], default=
             out = out.where(out.notna(), cur)
     return out
 
+
+def _coalesce_numeric_columns_zeroaware(df: pd.DataFrame, columns: Sequence[str], default=np.nan) -> pd.Series:
+    out = pd.Series([default] * len(df), index=df.index, dtype="float64")
+    for col in columns:
+        if col in df.columns:
+            cur = pd.to_numeric(df[col], errors="coerce")
+            cur = cur.where(~cur.eq(0), np.nan)
+            out = out.where(out.notna(), cur)
+    return out
+
+
 def _coalesce_datetime_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
     out = pd.Series([pd.NaT] * len(df), index=df.index)
     for col in columns:
@@ -1939,8 +2020,16 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
     effective_field = first_existing_field_name("Appraisal__c", ["Appraisal_Effective_Date__c", "Appraisal_Report_Date__c"])
     report_field = first_existing_field_name("Appraisal__c", ["Appraisal_Report_Date__c", "Appraisal_Effective_Date__c"])
     order_field = first_existing_field_name("Appraisal__c", ["Order_Received_Date__c"])
-    as_is_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_As_Is_Value__c", "Appraised_Value_Amount__c"])
-    arv_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_After_Repair_Value__c", "Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c"])
+    reviewed_as_is_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_As_Is_Value__c"])
+    fallback_as_is_field = first_existing_field_name("Appraisal__c", ["Appraised_Value_Amount__c"])
+    reviewed_arv_field = first_existing_field_name(
+        "Appraisal__c",
+        ["Reviewed_Appraisal_After_Repair_Value__c", "Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c"],
+    )
+    fallback_arv_field = first_existing_field_name(
+        "Appraisal__c",
+        ["Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c", "Appraised_Value_Amount__c"],
+    )
 
     select_pairs = [
         ("Asset ID", f"{property_rel}.Asset_ID__c"),
@@ -1956,10 +2045,16 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         select_pairs.append(("Appraisal Effective Date", effective_field))
     if report_field and report_field != effective_field:
         select_pairs.append(("Appraisal Report Date", report_field))
-    if as_is_field:
-        select_pairs.append(("Appraisal As-Is Value", as_is_field))
-    if arv_field:
-        select_pairs.append(("Appraisal ARV", arv_field))
+    if reviewed_as_is_field:
+        select_pairs.append(("Appraisal Reviewed As-Is Value", reviewed_as_is_field))
+    if fallback_as_is_field and fallback_as_is_field != reviewed_as_is_field:
+        select_pairs.append(("Appraisal As-Is Fallback Value", fallback_as_is_field))
+    if reviewed_arv_field:
+        select_pairs.append(("Appraisal Reviewed ARV", reviewed_arv_field))
+    if fallback_arv_field and fallback_arv_field not in {reviewed_arv_field, reviewed_as_is_field, fallback_as_is_field}:
+        select_pairs.append(("Appraisal ARV Fallback", fallback_arv_field))
+    elif fallback_arv_field and fallback_arv_field == fallback_as_is_field and fallback_arv_field not in {reviewed_arv_field}:
+        select_pairs.append(("Appraisal ARV Fallback", fallback_arv_field))
 
     rename_map = {expr: label for label, expr in select_pairs}
     soqls = []
@@ -1977,8 +2072,14 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         df["Asset ID"] = df["Property Asset Id"]
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Appraisal Effective Date", "Appraisal Report Date"])
-    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraisal As-Is Value"])
-    df["Current Appraised After Repair Value"] = _coalesce_numeric_columns(df, ["Appraisal ARV"])
+    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(
+        df,
+        [c for c in ["Appraisal Reviewed As-Is Value", "Appraisal As-Is Fallback Value"] if c in df.columns],
+    )
+    df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
+        df,
+        [c for c in ["Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in df.columns],
+    )
     df["_sort_dt"] = pd.to_datetime(df.get("Current Appraisal Date"), errors="coerce")
     df["_nonnull_score"] = 0
     for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value", "Most Recent Appraisal Order Date"]:
@@ -1989,7 +2090,9 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
     df = df.drop_duplicates(["_asset_key"], keep="last")
     return downcast_numeric_frame(df.drop(columns=["_sort_dt", "_nonnull_score"], errors="ignore"))
 
+
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
+
     asset_ids = _nonblank_unique(asset_ids or [])
     soqls = []
 
@@ -2035,8 +2138,8 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
         df = appraisal_df.copy()
     else:
         df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "Backup Value Date Native", "BPO Appraisal Date"])
-        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
-        df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value"), errors="coerce")
+        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(df, ["Appraised Value Amount", "Generic Value Native"])
+        df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(df, ["After Repair Value", "Appraised Value Amount", "Generic Value Native"])
 
         if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
             app = appraisal_df.copy()
@@ -2541,13 +2644,80 @@ def _bridge_status_severity(status) -> int:
     s = clean_text(status).upper()
     order = {
         "CURRENT": 0,
-        "30 - 59 DAYS": 1,
-        "60 - 89 DAYS": 2,
-        "90 + DAYS": 3,
-        "BK": 4,
-        "REO": 5,
+        "CURRENT": 0,
+        "DQ 1-29": 1,
+        "30 - 59 DAYS": 2,
+        "DQ 30-59": 2,
+        "60 - 89 DAYS": 3,
+        "DQ 60-89": 3,
+        "90 + DAYS": 4,
+        "DQ 90+": 4,
+        "BK": 5,
+        "REO": 6,
     }
     return order.get(s, -1)
+
+
+def _bridge_bucket_to_report_label(bucket, days_past_due=np.nan):
+    s = clean_text(bucket).upper()
+    try:
+        days = float(days_past_due)
+    except Exception:
+        days = np.nan
+    if s == "REO":
+        return "REO"
+    if s == "BK":
+        return "BK"
+    if s in {"90 + DAYS", "DQ 90+"}:
+        return "DQ 90+"
+    if s in {"60 - 89 DAYS", "DQ 60-89"}:
+        return "DQ 60-89"
+    if s in {"30 - 59 DAYS", "DQ 30-59"}:
+        return "DQ 30-59"
+    if s == "DQ 1-29":
+        return "DQ 1-29"
+    if s == "CURRENT":
+        if not pd.isna(days) and days >= 1:
+            return "DQ 1-29"
+        return "Current"
+    if not pd.isna(days):
+        if days >= 90:
+            return "DQ 90+"
+        if days >= 60:
+            return "DQ 60-89"
+        if days >= 30:
+            return "DQ 30-59"
+        if days >= 1:
+            return "DQ 1-29"
+        return "Current"
+    return pd.NA
+
+
+def _bridge_loan_rollup_label(bucket_series: pd.Series, days_series: pd.Series):
+    labels = {
+        clean_text(_bridge_bucket_to_report_label(bucket, days))
+        for bucket, days in zip(bucket_series, days_series)
+        if clean_text(_bridge_bucket_to_report_label(bucket, days))
+    }
+    if "REO" in labels:
+        return "REO"
+    if "BK" in labels:
+        return "BK"
+    if "DQ 90+" in labels:
+        return "DQ 90+"
+    if "DQ 60-89" in labels:
+        return "DQ 60-89"
+    has_30 = "DQ 30-59" in labels
+    has_1_29 = "DQ 1-29" in labels
+    if has_30 and has_1_29:
+        return "DQ 1-29 / DQ 30-59"
+    if has_30:
+        return "DQ 30-59"
+    if has_1_29:
+        return "DQ 1-29"
+    if "Current" in labels:
+        return "Current"
+    return pd.NA
 
 
 def _guess_days_past_due(next_payment_date, run_date: date) -> float:
@@ -2562,11 +2732,17 @@ def _guess_days_from_bridge_bucket(status) -> float:
     s = clean_text(status).upper()
     mapping = {
         "CURRENT": 0.0,
+        "DQ 1-29": 14.0,
         "30 - 59 DAYS": 45.0,
+        "DQ 30-59": 45.0,
+        "DQ 1-29 / DQ 30-59": 45.0,
         "60 - 89 DAYS": 75.0,
+        "DQ 60-89": 75.0,
         "90 + DAYS": 90.0,
+        "DQ 90+": 90.0,
         "BK": 90.0,
         "REO": 90.0,
+        "CURRENT": 0.0,
     }
     return mapping.get(s, np.nan)
 
@@ -4600,7 +4776,7 @@ def build_bridge_loan(
                 "Primary Contact_active": g["Primary Contact"].apply(_first) if "Primary Contact" in ba.columns else pd.Series(dtype="string"),
                 "Last Funding Date_active": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else pd.NaT,
                 "Days Past Due_active": pd.to_numeric(g["_bridge_dpd_num"].max(), errors="coerce") if "_bridge_dpd_num" in ba.columns else pd.Series(dtype="float"),
-                "Loan Level Delinquency_active": g["_bridge_dq_bucket"].apply(_worst_bridge_bucket) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
+                "Loan Level Delinquency_active": g.apply(lambda grp: _bridge_loan_rollup_label(grp.get("_bridge_dq_bucket", pd.Series(dtype="object")), grp.get("_bridge_dpd_num", pd.Series(dtype="float")))) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
                 "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
                 "Suspense Balance_active": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
                 "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_max_dt),
@@ -4740,11 +4916,16 @@ def build_bridge_loan(
         index=out.index,
         dtype="object",
     )
-    out["Loan Level Delinquency"] = coalesce_keep_nonblank(out.get("Loan Level Delinquency_active", blank_obj), loan_status_bucket)
+    servicer_report_bucket = pd.Series(
+        [_bridge_bucket_to_report_label(bucket, _guess_days_past_due(npd, run_dt)) for bucket, npd in zip(loan_status_bucket, out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)))],
+        index=out.index,
+        dtype="object",
+    )
+    out["Loan Level Delinquency"] = coalesce_keep_nonblank(out.get("Loan Level Delinquency_active", blank_obj), servicer_report_bucket)
     out["Days Past Due"] = pd.to_numeric(out.get("Days Past Due_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     derived_days = pd.Series(
         [
-            min(_guess_days_past_due(npd, run_dt), 29.0) if has_any_value(bucket) and clean_text(bucket).upper() == "CURRENT" else _guess_days_from_bridge_bucket(bucket)
+            _guess_days_from_bridge_bucket(bucket) if not pd.isna(_guess_days_from_bridge_bucket(bucket)) else _guess_days_past_due(npd, run_dt)
             for bucket, npd in zip(out["Loan Level Delinquency"], out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)))
         ],
         index=out.index,
@@ -5110,6 +5291,79 @@ def _is_date_header(sheet_name: str, header: str) -> bool:
     return header in SHEET_DATE_HEADERS.get(sheet_name, set())
 
 
+def _should_preserve_datetime(sheet_name: str, header: str) -> bool:
+    return header in SHEET_DATETIME_HEADERS.get(sheet_name, set())
+
+
+def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start_row: int = 5, sample_limit: int = 120, scan_limit: int = 1000) -> Set[str]:
+    hinted: Set[str] = set()
+    max_row = min(ws.max_row, start_row + scan_limit - 1)
+    for col_idx, header in header_tuples:
+        if not header or header in REPORT_IDENTIFIER_HEADERS.get(ws.title, set()):
+            continue
+        text_like = 0
+        number_like = 0
+        samples = 0
+        for r in range(start_row, max_row + 1):
+            val = ws.cell(r, col_idx).value
+            if not has_any_value(val):
+                continue
+            if isinstance(val, pd.Timestamp):
+                if pd.isna(val):
+                    continue
+                break
+            if isinstance(val, (datetime, date)):
+                break
+            if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(val, bool):
+                number_like += 1
+            else:
+                text_like += 1
+            samples += 1
+            if samples >= sample_limit:
+                break
+        if text_like and not number_like:
+            hinted.add(header)
+    return hinted
+
+
+def _round_report_money_series(series: pd.Series) -> pd.Series:
+    ser = pd.Series(series, copy=False)
+    num = pd.to_numeric(ser, errors="coerce")
+    out = pd.Series(ser, copy=True)
+    mask = num.notna()
+    out.loc[mask] = num.loc[mask].round(2)
+    return out
+
+
+def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str, template_text_headers: Optional[Set[str]] = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+
+    for header in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            out[header] = normalize_report_identifier_series(out[header])
+
+    for header in REPORT_INTEGER_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            out[header] = normalize_integer_display_series(out[header])
+
+    text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
+    text_headers = {h for h in text_headers if h not in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())}
+    for header in text_headers:
+        if header in out.columns:
+            out[header] = normalize_text_display_series(out[header])
+
+    money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
+    if upb_col:
+        money_headers.add(upb_col)
+    for header in money_headers:
+        if header in out.columns:
+            out[header] = _round_report_money_series(out[header])
+
+    return out
+
+
 def _copy_reference_row_style(ws_formula, col_idx: int, target_cell):
     ref_cell = ws_formula.cell(5, col_idx)
     if ref_cell.has_style:
@@ -5183,7 +5437,10 @@ def write_df_to_sheet_preserve_formulas(
         for (c, h), val in zip(write_cols, row):
             safe_val = _excel_safe_value(val)
             if _is_date_header(ws_formula.title, h):
-                safe_val = _coerce_excel_date_value(safe_val)
+                if _should_preserve_datetime(ws_formula.title, h):
+                    safe_val = _excel_safe_value(safe_val)
+                else:
+                    safe_val = _coerce_excel_date_value(safe_val)
             ws_formula.cell(r, c).value = safe_val
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
@@ -5197,6 +5454,8 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
 
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
+    template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
+    df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
 
     if sheet_name == "Term Asset":
@@ -6180,7 +6439,7 @@ if build_btn:
 
                 st.markdown("### Servicer lookup preview")
                 st.caption("Servicer files were skipped. Servicer-driven columns will use Salesforce fallback where available.")
-                st.caption(f"UPB header (always today): **{upb_col}**")
+                st.caption(f"UPB header (build report date): **{upb_col}**")
             else:
                 servicer_phase_started = time.perf_counter()
 
@@ -6198,7 +6457,7 @@ if build_btn:
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected latest servicer report date from file contents / report tabs: **{detected_run_date.isoformat()}**")
-                st.caption(f"UPB header (always today): **{upb_col}**")
+                st.caption(f"UPB header (build report date): **{upb_col}**")
                 if show_servicer_preview:
                     st.dataframe(serv_preview.head(30), use_container_width=True)
                 else:
@@ -6206,7 +6465,10 @@ if build_btn:
                 serv_preview = pd.DataFrame()
                 gc.collect()
 
-            status.update(label="Loading Excel template...")
+            run_dt = detected_run_date
+            upb_col = make_upb_header(run_dt)
+
+            status.update(label=f"Loading Excel template for report date {run_dt.isoformat()} ({upb_col})...")
             if prev_upload is None and not _repo_template_available:
                 raise FileNotFoundError(
                     "No repo template was found and no completed Active Loans workbook was uploaded. "
