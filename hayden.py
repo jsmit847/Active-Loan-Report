@@ -335,7 +335,7 @@ DRAFT_FORMULA_OVERRIDES = {
         "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
         "Most Recent Valuation Date": '=IF(OR($BE5="N/A",$BE5=""),$BA5,$BE5)',
         "Most Recent As-Is Value": '=IF(OR($BE5="N/A",$BE5=""),$BB5,$BF5)',
-        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),$BC5,$BG5)',
+        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),IF(OR($BC5="",$BC5=0),"N/A",$BC5),IF(OR($BG5="",$BG5=0),"N/A",$BG5))',
         "Needs NPL Value": '=IF(AND($CZ5="Y",$CN5<$CQ$3),"Y","N")',
         "Securitized (Y/N)": '=IF($BR5="Securitized Bridge","Y","N")',
         "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
@@ -776,7 +776,7 @@ def normalize_text_display_series(s: pd.Series) -> pd.Series:
 def normalize_integer_display_series(s: pd.Series) -> pd.Series:
     ser = pd.Series(s, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(list(ser), index=ser.index, dtype="object")
+    out = pd.Series(ser, copy=True)
     mask = num.notna()
     out.loc[mask] = num.loc[mask].round(0).astype("int64")
     return out
@@ -1661,6 +1661,65 @@ def _coalesce_text_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.Serie
             out = coalesce_keep_nonblank(out, pd.Series(df[col], index=df.index, dtype="object"))
     return out
 
+
+def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_df: pd.DataFrame) -> pd.DataFrame:
+    bundle_fields = [
+        "Most Recent Appraisal Order Date",
+        "Current Appraisal Date",
+        "Current Appraised As-Is Value",
+        "Current Appraised After Repair Value",
+    ]
+    frames: List[pd.DataFrame] = []
+
+    if property_df is not None and not property_df.empty and "_asset_key" in property_df.columns:
+        prop_keep = ["_asset_key"] + [c for c in bundle_fields if c in property_df.columns]
+        prop = property_df[prop_keep].copy()
+        prop["_bundle_source_priority"] = 0
+        frames.append(prop)
+
+    if appraisal_df is not None and not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
+        app = appraisal_df.copy()
+        app["_asset_key"] = norm_id_series(app["Asset ID"])
+        app_keep = ["_asset_key"] + [c for c in bundle_fields if c in app.columns]
+        app = app[app_keep].copy()
+        app["_bundle_source_priority"] = 1
+        frames.append(app)
+
+    if not frames:
+        return pd.DataFrame(columns=["_asset_key"] + bundle_fields)
+
+    cand = pd.concat(frames, ignore_index=True, copy=False, sort=False)
+    cand = cand[cand["_asset_key"].notna()].copy()
+    if cand.empty:
+        return pd.DataFrame(columns=["_asset_key"] + bundle_fields)
+
+    cand["_bundle_value_dt"] = pd.to_datetime(
+        cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)),
+        errors="coerce",
+    )
+    cand["_bundle_order_dt"] = pd.to_datetime(
+        cand.get("Most Recent Appraisal Order Date", pd.Series([pd.NaT] * len(cand), index=cand.index)),
+        errors="coerce",
+    )
+    cand["_bundle_nonnull_score"] = 0
+    for c in bundle_fields:
+        if c in cand.columns:
+            cand["_bundle_nonnull_score"] = cand["_bundle_nonnull_score"] + (~blankish_mask(cand[c])).astype("int8")
+
+    cand = cand[cand["_bundle_nonnull_score"].gt(0)].copy()
+    if cand.empty:
+        return pd.DataFrame(columns=["_asset_key"] + bundle_fields)
+
+    cand = cand.sort_values(
+        ["_asset_key", "_bundle_value_dt", "_bundle_order_dt", "_bundle_nonnull_score", "_bundle_source_priority"],
+        ascending=[True, True, True, True, True],
+    )
+    cand = cand.drop_duplicates(["_asset_key"], keep="last")
+
+    keep_cols = ["_asset_key"] + [c for c in bundle_fields if c in cand.columns]
+    return cand[keep_cols].copy()
+
+
 def _build_bridge_spine_like() -> pd.DataFrame:
     opp_rel = property_opportunity_relationship_name()
 
@@ -2081,14 +2140,15 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         [c for c in ["Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in df.columns],
     )
     df["_sort_dt"] = pd.to_datetime(df.get("Current Appraisal Date"), errors="coerce")
+    df["_order_dt"] = pd.to_datetime(df.get("Most Recent Appraisal Order Date"), errors="coerce")
     df["_nonnull_score"] = 0
     for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value", "Most Recent Appraisal Order Date"]:
         if c in df.columns:
             df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
     df = df[df["_asset_key"].notna()].copy()
-    df = df.sort_values(["_asset_key", "_sort_dt", "_nonnull_score"], ascending=[True, True, True])
+    df = df.sort_values(["_asset_key", "_sort_dt", "_order_dt", "_nonnull_score"], ascending=[True, True, True, True])
     df = df.drop_duplicates(["_asset_key"], keep="last")
-    return downcast_numeric_frame(df.drop(columns=["_sort_dt", "_nonnull_score"], errors="ignore"))
+    return downcast_numeric_frame(df.drop(columns=["_sort_dt", "_order_dt", "_nonnull_score"], errors="ignore"))
 
 
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
@@ -2141,18 +2201,37 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
         df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(df, ["Appraised Value Amount", "Generic Value Native"])
         df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(df, ["After Repair Value", "Appraised Value Amount", "Generic Value Native"])
 
-        if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
-            app = appraisal_df.copy()
-            app["_asset_key"] = norm_id_series(app["Asset ID"])
-            keep = ["_asset_key"] + [c for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"] if c in app.columns]
-            app = app[keep].drop_duplicates("_asset_key")
-            df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
-            df = df.merge(app, on="_asset_key", how="left", suffixes=("", "_app"))
-            for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
-                app_col = f"{c}_app"
-                if app_col in df.columns:
-                    df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
-                    df = df.drop(columns=[app_col], errors="ignore")
+        df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+        best_bundle = _select_best_current_appraisal_bundle(df, appraisal_df)
+        if not best_bundle.empty:
+            best_bundle = best_bundle.copy()
+            best_bundle["_has_best_current_appraisal_bundle"] = 1
+            merge_cols = ["_asset_key", "_has_best_current_appraisal_bundle"] + [
+                c for c in [
+                    "Most Recent Appraisal Order Date",
+                    "Current Appraisal Date",
+                    "Current Appraised As-Is Value",
+                    "Current Appraised After Repair Value",
+                ]
+                if c in best_bundle.columns
+            ]
+            df = df.merge(best_bundle[merge_cols], on="_asset_key", how="left", suffixes=("", "_best"))
+            use_best_bundle = pd.Series(
+                df.get("_has_best_current_appraisal_bundle", pd.Series([pd.NA] * len(df), index=df.index)),
+                index=df.index,
+                dtype="object",
+            ).notna()
+            for c in [
+                "Most Recent Appraisal Order Date",
+                "Current Appraisal Date",
+                "Current Appraised As-Is Value",
+                "Current Appraised After Repair Value",
+            ]:
+                best_col = f"{c}_best"
+                if best_col in df.columns:
+                    df[c] = df[c].where(~use_best_bundle, df[best_col])
+                    df = df.drop(columns=[best_col], errors="ignore")
+            df = df.drop(columns=["_has_best_current_appraisal_bundle"], errors="ignore")
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
@@ -3916,6 +3995,23 @@ def build_bridge_asset(
                 )
                 out = out.drop(columns=[tmpcol], errors="ignore")
 
+        updated_val_dt = pd.to_datetime(
+            out.get("Updated Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)),
+            errors="coerce",
+        )
+        updated_arv_raw = pd.Series(
+            out.get("Updated ARV", pd.Series([pd.NA] * len(out), index=out.index)),
+            index=out.index,
+            dtype="object",
+        )
+        updated_arv_num = pd.to_numeric(updated_arv_raw, errors="coerce")
+        updated_arv_na_mask = updated_val_dt.notna() & (
+            blankish_mask(updated_arv_raw) | updated_arv_num.fillna(0).eq(0)
+        )
+        if bool(updated_arv_na_mask.any()):
+            out["Updated ARV"] = updated_arv_raw
+            out.loc[updated_arv_na_mask, "Updated ARV"] = "N/A"
+
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
         am["_deal_key"] = norm_id_series(am["Deal Loan Number"])
@@ -4963,6 +5059,17 @@ def build_bridge_loan(
     out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
+    most_recent_arv_raw = pd.Series(
+        out.get("Most Recent ARV", pd.Series([pd.NA] * len(out), index=out.index)),
+        index=out.index,
+        dtype="object",
+    )
+    most_recent_arv_num = pd.to_numeric(most_recent_arv_raw, errors="coerce")
+    most_recent_arv_na_mask = blankish_mask(most_recent_arv_raw) | most_recent_arv_num.fillna(0).eq(0)
+    if bool(most_recent_arv_na_mask.any()):
+        out["Most Recent ARV"] = most_recent_arv_raw
+        out.loc[most_recent_arv_na_mask, "Most Recent ARV"] = "N/A"
+
     out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
 
@@ -5329,7 +5436,7 @@ def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start
 def _round_report_money_series(series: pd.Series) -> pd.Series:
     ser = pd.Series(series, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(list(ser), index=ser.index, dtype="object")
+    out = pd.Series(ser, copy=True)
     mask = num.notna()
     out.loc[mask] = num.loc[mask].round(2)
     return out
@@ -5340,33 +5447,26 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
         return pd.DataFrame() if df is None else df.copy()
     out = df.copy()
 
-    identifier_headers = REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())
-    integer_headers = REPORT_INTEGER_HEADERS.get(sheet_name, set())
-    money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
-    if upb_col:
-        money_headers.add(upb_col)
-
-    for header in identifier_headers:
+    for header in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set()):
         if header in out.columns:
             out[header] = normalize_report_identifier_series(out[header])
 
-    for header in integer_headers:
+    for header in REPORT_INTEGER_HEADERS.get(sheet_name, set()):
         if header in out.columns:
             out[header] = normalize_integer_display_series(out[header])
 
-    for header in money_headers:
-        if header in out.columns:
-            out[header] = _round_report_money_series(out[header])
-
     text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
-    text_headers = {
-        h
-        for h in text_headers
-        if h not in identifier_headers and h not in integer_headers and h not in money_headers
-    }
+    text_headers = {h for h in text_headers if h not in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())}
     for header in text_headers:
         if header in out.columns:
             out[header] = normalize_text_display_series(out[header])
+
+    money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
+    if upb_col:
+        money_headers.add(upb_col)
+    for header in money_headers:
+        if header in out.columns:
+            out[header] = _round_report_money_series(out[header])
 
     return out
 
