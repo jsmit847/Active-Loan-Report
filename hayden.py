@@ -793,9 +793,10 @@ def normalize_text_display_series(s: pd.Series) -> pd.Series:
 def normalize_integer_display_series(s: pd.Series) -> pd.Series:
     ser = pd.Series(s, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(ser, copy=True)
+    out = _object_series_like(ser)
     mask = num.notna()
-    out.loc[mask] = num.loc[mask].round(0).astype("int64")
+    if bool(mask.any()):
+        out.loc[mask] = num.loc[mask].round(0).astype("int64").astype("object")
     return out
 
 
@@ -5418,9 +5419,10 @@ def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start
 def _round_report_money_series(series: pd.Series) -> pd.Series:
     ser = pd.Series(series, copy=False)
     num = pd.to_numeric(ser, errors="coerce")
-    out = pd.Series(ser, copy=True)
+    out = _object_series_like(ser)
     mask = num.notna()
-    out.loc[mask] = num.loc[mask].round(2)
+    if bool(mask.any()):
+        out.loc[mask] = num.loc[mask].round(2).astype("object")
     return out
 
 
