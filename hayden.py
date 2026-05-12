@@ -179,7 +179,7 @@ SHEET_DATE_HEADERS = {
         "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
     },
     "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
-    "Term Asset": {"Value Date"},
+    "Term Asset": set(),
 }
 
 SHEET_DATETIME_HEADERS = {
@@ -206,7 +206,9 @@ REPORT_NA_FILL_HEADERS = {
         "Remedy Plan", "Delinquency Notes", "Maturity Status", "Is Special Asset (Y/N)",
         "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
         "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date",
-        "Origination Value Dt", "Most Recent Appraisal Order Date", "Updated Valuation Date",
+        # Origination Value Dt intentionally becomes N/A when Salesforce has no origination valuation date.
+        # Updated valuation fields should remain blank when no updated value exists; do not N/A-fill them.
+        "Origination Value Dt",
         "Title Company", "Tax Due Date", "Tax Frequency", "Tax Commentary",
         "Servicer Status", "Servicer Maturity Date", "CV Maturity Date",
         "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
@@ -216,6 +218,20 @@ REPORT_NA_FILL_HEADERS = {
         "AM 2 Assigned Date", "CM Assigned Date", "AM Commentary",
     },
     "Term Loan": {"REO Date", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary"},
+    "Term Asset": set(),
+}
+
+
+# Columns that must stay truly blank when source/carry-forward is blank.
+# This prevents the QA/default pass from turning intentionally blank report fields
+# into N/A, especially Term Asset and updated valuation fields.
+REPORT_FORCE_BLANK_HEADERS = {
+    "Bridge Asset": {
+        "Most Recent Appraisal Order Date", "Updated Valuation Date",
+        "Updated As-Is Value", "Updated ARV",
+    },
+    "Bridge Loan": set(),
+    "Term Loan": set(),
     "Term Asset": {"Value Date"},
 }
 
@@ -546,7 +562,7 @@ SHEET_BLUEPRINTS = {
             23: "Loan Level Delinquency",
             24: "Loan Commitment",
             25: "Active Funded Amount",
-            26: "=+'Bridge Asset'!$AI$4",
+            26: "__UPB__",
             27: "Suspense Balance",
             28: "Remaining Commitment",
             29: "Most Recent Valuation Date",
@@ -635,7 +651,7 @@ SHEET_BLUEPRINTS = {
             9: "# Units",
             10: "Property Type",
             11: "Property ALA",
-            12: "=+'Term Loan'!$P$4",
+            12: "__UPB__",
             13: "Special (Y/N)",
             14: "Value Date",
             15: "As-Is Value",
@@ -844,6 +860,21 @@ def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series
     p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index)
     f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index)
     return p.where(~blankish_mask(p), f)
+
+
+def coalesce_report_display_first(primary: pd.Series, fallback: pd.Series) -> pd.Series:
+    """Carry-forward coalesce where report placeholders like N/A are valid.
+
+    coalesce_keep_nonblank intentionally treats only true blanks as missing, but
+    some normalization paths can treat placeholder values as effectively blank. For
+    prior completed workbook carry-forward fields like Financing, an explicit N/A
+    is the value the report should keep.
+    """
+    p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index, dtype="object")
+    f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index, dtype="object")
+    p_text = p.astype("string").str.strip().str.lower()
+    has_primary = p.notna() & p_text.ne("") & ~p_text.isin(["nan", "none", "<na>", "nat"])
+    return p.where(has_primary, f)
 
 
 def deal_key(value) -> str:
@@ -1869,10 +1900,15 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Valuation Date Native", "BPO Appraisal Date", "Generic Value Date"])
-    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value"])
+    # Updated valuation columns should only use actual updated/current appraisal inputs.
+    # Do not fall back to generic/origination valuation fields. If no updated value exists,
+    # these remain blank and the report/carry-forward logic can decide what to preserve.
+    df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Valuation Date Native", "BPO Appraisal Date"])
+    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount"])
     if "After Repair Value" in df.columns:
         df["Current Appraised After Repair Value"] = pd.to_numeric(df["After Repair Value"], errors="coerce")
+    else:
+        df["Current Appraised After Repair Value"] = np.nan
 
     for c in ["Servicer Loan Number", "Servicer Commitment Id", "Deal Loan Number", "Asset ID", "Property ID", "Unique Active Id"]:
         if c in df.columns:
@@ -2255,11 +2291,13 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     if df.empty:
         df = best_bundle.copy()
     else:
-        df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "Backup Value Date Native", "BPO Appraisal Date"])
+        # Updated/current valuation fields are strict: do not backfill them from
+        # origination, backup, or generic property values.
+        df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "BPO Appraisal Date"])
         if "Most Recent Appraisal Order Date" in df.columns:
             df["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(df["Most Recent Appraisal Order Date"])
-        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(df, ["Appraised Value Amount", "Generic Value Native"])
-        df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(df, ["After Repair Value", "Appraised Value Amount", "Generic Value Native"])
+        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(df, ["Appraised Value Amount"])
+        df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(df, ["After Repair Value"])
 
         if not best_bundle.empty and "_asset_key" in best_bundle.columns:
             app = best_bundle.copy()
@@ -4444,7 +4482,9 @@ def _reconcile_bridge_loan_from_asset_rollup(bridge_loan: pd.DataFrame, bridge_a
 
     upb_roll_col = f"{upb_col}_asset_rollup"
     if upb_roll_col in out.columns:
-        out[upb_col] = _choose_bridge_loan_upb(out, upb_col, asset_rollup_col=upb_roll_col)
+        # Bridge Loan UPB must reflect the sum of finalized Bridge Asset UPB values.
+        # Do not replace this rollup with a deal-level balance after asset values are set.
+        out[upb_col] = pd.to_numeric(out[upb_roll_col], errors="coerce")
         out = out.drop(columns=[upb_roll_col], errors="ignore")
 
     for col in ["Most Recent As-Is Value", "Most Recent ARV"]:
@@ -4455,7 +4495,8 @@ def _reconcile_bridge_loan_from_asset_rollup(bridge_loan: pd.DataFrame, bridge_a
             out[col] = cur_num.where(cur_num.notna(), src_num)
             out = out.drop(columns=[src], errors="ignore")
 
-    out, _diags = _repair_bridge_loan_commitment_math(out, upb_col)
+    # Do not run the same-deal UPB repair after applying the asset rollup; that repair
+    # can replace the asset-summed UPB with a loan-level fallback. Keep the rollup.
     return downcast_numeric_frame(out)
 
 def _prev_sid_to_deal_map(prev_maps: Optional[dict]) -> Dict[str, str]:
@@ -4888,10 +4929,22 @@ def build_bridge_asset(
     servicer_file_upb = pd.to_numeric(out.get("_servicer_file_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     prev_loan_upb = pd.to_numeric(out.get("_prev_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
 
-    # Correct Bridge Asset rule: use the loan-level UPB for the deal and allocate it to
-    # assets by the report's SF Funded Amount. Servicer-file UPB is a fallback for
-    # missing Salesforce loan-level UPB; property Current UPB is only a last-resort
-    # row-level fallback when no loan-level balance is available.
+    # Correct Bridge Asset UPB rule from the completed report process:
+    # each Bridge Asset row should carry its own asset-level UPB. Do not allocate
+    # the same loan-level UPB across all assets when Salesforce/servicer already
+    # provides an asset/property-level UPB. This prevents repeated UPB values inside
+    # the same deal and lets Bridge Loan roll up the true sum of the asset rows.
+    prev_asset_upb_vals = pd.to_numeric(out.get("_prev_asset_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
+    out["_asset_count_in_deal"] = out.groupby("_deal_key", dropna=True)["_deal_key"].transform("size").replace({0: np.nan})
+    sid_count = out.groupby(["_deal_key", "_sid_key"], dropna=False)["_sid_key"].transform("size") if "_sid_key" in out.columns else pd.Series([np.nan] * len(out), index=out.index)
+    safe_servicer_asset_upb = servicer_file_upb.where(out["_asset_count_in_deal"].le(1) | sid_count.eq(1))
+
+    asset_level_upb = _coalesce_positive_then_any_numeric(sf_current_upb, safe_servicer_asset_upb, prev_asset_upb_vals, index=out.index)
+
+    # Last-resort only: if no asset-level balance exists, allocate the deal-level
+    # UPB so that the report can still roll Bridge Loan UPB. This path should be
+    # rare and is intentionally after asset-level and prior asset UPB.
     loan_upb_candidate = _coalesce_positive_then_any_numeric(sf_loan_upb, servicer_file_upb, prev_loan_upb, index=out.index)
     out["_loan_upb_for_alloc_raw"] = loan_upb_candidate
     out["_loan_upb_for_alloc"] = out.groupby("_deal_key", dropna=True)["_loan_upb_for_alloc_raw"].transform(_group_first_positive_then_any_numeric)
@@ -4899,21 +4952,17 @@ def build_bridge_asset(
     funded_weight = pd.to_numeric(out.get("SF Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
     out["_funded_weight"] = funded_weight.where(funded_weight.gt(0), 0.0)
     out["_funded_weight_sum"] = out.groupby("_deal_key", dropna=True)["_funded_weight"].transform("sum")
-    out["_asset_count_in_deal"] = out.groupby("_deal_key", dropna=True)["_deal_key"].transform("size").replace({0: np.nan})
 
-    allocated_upb = np.where(
+    allocated_fallback = np.where(
         out["_funded_weight_sum"].fillna(0).gt(0),
         out["_loan_upb_for_alloc"] * (out["_funded_weight"] / out["_funded_weight_sum"]),
         out["_loan_upb_for_alloc"] / out["_asset_count_in_deal"],
     )
-    out[upb_col] = pd.to_numeric(allocated_upb, errors="coerce")
+    allocated_fallback = pd.to_numeric(pd.Series(allocated_fallback, index=out.index), errors="coerce")
 
-    # Last resort: if the deal had no loan-level UPB from SF/servicer/prior, keep the
-    # property-level Current UPB instead of manufacturing a cap or funded amount.
-    current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
-    out[upb_col] = current_upb_series.where(current_upb_series.notna(), sf_current_upb)
+    out[upb_col] = pd.to_numeric(asset_level_upb, errors="coerce")
+    out[upb_col] = out[upb_col].where(out[upb_col].notna(), allocated_fallback)
 
-    prev_asset_upb_vals = pd.to_numeric(out.get("_prev_asset_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     current_upb_series = pd.to_numeric(out[upb_col], errors="coerce")
     out[upb_col] = current_upb_series.where(
         ~((reo_mask | late_stage_mask) & (current_upb_series.isna() | current_upb_series.le(0))),
@@ -4951,7 +5000,8 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
-            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            # Updated valuation fields are strict source fields now and are intentionally
+            # not carried forward here. If Salesforce has no updated value, they stay blank.
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
@@ -4960,8 +5010,7 @@ def build_bridge_asset(
             "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
-            "Maturity Status", "Title Company", "Most Recent Appraisal Order Date",
-            "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            "Maturity Status", "Title Company",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         }
         for c in [x for x in keep_cols if x != "_asset_key"]:
@@ -5103,7 +5152,7 @@ def _build_term_loan_salesforce_fallback(
     if "term_loan_manual" in prev_maps:
         man = prev_maps["term_loan_manual"].copy()
         keep_cols = ["_deal_key"] + [c for c in [
-            "Portfolio", "Segment", "CPP JV", "Special Loans List (Y/N)",
+            "Portfolio", "Segment", "Financing", "CPP JV", "Special Loans List (Y/N)",
             "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
             "Referral Source Contact", "AM Commentary", "Servicer", "Loan Buyer", "Servicer ID",
             "Active RM",
@@ -5118,7 +5167,7 @@ def _build_term_loan_salesforce_fallback(
         for c in [x for x in keep_cols if x != "_deal_key"]:
             if f"{c}_prev" in out.columns:
                 if c in term_loan_carry_forward_first:
-                    out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
+                    out[c] = coalesce_report_display_first(out[f"{c}_prev"], out.get(c, blank_obj))
                 else:
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
@@ -5139,7 +5188,15 @@ def _build_term_loan_salesforce_fallback(
 
     base_sf_servicer = pd.Series(out.get("Servicer", blank_obj), index=out.index, dtype="object")
     match_df = _select_term_servicer_matches(sf_term, serv_lookup, base_sf_servicer, prev_maps=prev_maps)
-    out["Servicer ID"] = coalesce_keep_nonblank(match_df["selected_servicer_id"], out.get("Servicer ID", blank_obj))
+    if "Servicer Commitment Id" in sf_term.columns and len(sf_term) == len(out):
+        sf_commitment_display = pd.Series(sf_term["Servicer Commitment Id"].to_numpy(), index=out.index, dtype="object")
+    else:
+        sf_commitment_display = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
+    # The completed report displays the Salesforce Servicer Commitment Id first.
+    # Alternate servicer keys can still supply UPB/name via match_df, but should not
+    # replace the visible Servicer ID unless Salesforce is blank.
+    out["Servicer ID"] = coalesce_keep_nonblank(sf_commitment_display, match_df["selected_servicer_id"])
+    out["Servicer ID"] = coalesce_keep_nonblank(out["Servicer ID"], out.get("Servicer ID", blank_obj))
 
     sf_upb_fallback = pd.to_numeric(
         sf_term["Current Servicer UPB"] if "Current Servicer UPB" in sf_term.columns else pd.Series([np.nan] * len(out)),
@@ -5510,6 +5567,20 @@ def build_term_loan(
     out = out[out["_deal_key"].notna()].copy()
     out = _clear_duplicate_term_servicer_assignments(out, upb_col, prev_maps=prev_maps)
     out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
+
+    # Final display guard: the completed report displays Salesforce Servicer
+    # Commitment Id by Deal Number. Servicer-file/alternate keys can enrich UPB,
+    # but should not replace the visible report ID.
+    if (sf_term_active is not None and not sf_term_active.empty
+            and {"Deal Loan Number", "Servicer Commitment Id"}.issubset(sf_term_active.columns)):
+        sf_commit = sf_term_active[["Deal Loan Number", "Servicer Commitment Id"]].copy()
+        sf_commit["_deal_key"] = norm_id_series(sf_commit["Deal Loan Number"])
+        sf_commit = sf_commit.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key", keep="last")
+        sf_commit = sf_commit[["_deal_key", "Servicer Commitment Id"]].rename(columns={"Servicer Commitment Id": "_sf_commitment_display_final"})
+        out = out.merge(sf_commit, on="_deal_key", how="left")
+        if "_sf_commitment_display_final" in out.columns:
+            out["Servicer ID"] = coalesce_keep_nonblank(out["_sf_commitment_display_final"], out.get("Servicer ID", blank_obj))
+            out = out.drop(columns=["_sf_commitment_display_final"], errors="ignore")
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
@@ -5599,6 +5670,12 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     for c in ["CPP JV"]:
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
+
+    # Term Asset Value Date should remain blank unless carried from the prior completed
+    # workbook as an actual date. Do not default blank dates to N/A.
+    if "Value Date" in out.columns:
+        vd = pd.Series(out["Value Date"], index=out.index, dtype="object")
+        out["Value Date"] = vd.where(~blankish_mask(vd) & vd.astype("string").str.strip().str.upper().ne("N/A"), pd.NA)
 
     out = _allocate_term_asset_upb_from_loan(out, term_loan, upb_col)
 
@@ -5906,20 +5983,20 @@ def build_bridge_loan(
         man = prev_maps["bridge_loan_manual"].copy()
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
         bridge_loan_carry_forward_first = {
-            "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency",
+            "Portfolio", "Segment", "Financing", "Strategy Grouping", "Loan Level Delinquency",
             "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value",
             "Active RM", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
             "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date",
         }
         for c in [
-            "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)",
+            "Portfolio", "Segment", "Financing", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)",
             "AM Commentary", "3/31 NPL", "Needs NPL Value", "Active RM",
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date",
         ]:
             if f"{c}_prev" in out.columns:
                 if c in bridge_loan_carry_forward_first:
-                    out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
+                    out[c] = coalesce_report_display_first(out[f"{c}_prev"], out.get(c, blank_obj))
                 else:
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
@@ -6313,6 +6390,30 @@ def _round_report_money_series(series: pd.Series) -> pd.Series:
     return out
 
 
+def _apply_report_blank_na_policy(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    """Apply final report-specific blank vs N/A rules before writing Excel.
+
+    This is the automated NA/blank QA cleanup: columns in REPORT_FORCE_BLANK_HEADERS
+    remain true blanks, while columns in REPORT_NA_FILL_HEADERS become N/A when blank.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+
+    # Force blank-preserve columns first. These columns should not be filled with N/A.
+    for header in REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            ser = pd.Series(out[header], index=out.index, dtype="object")
+            out[header] = ser.where(~blankish_mask(ser), pd.NA)
+
+    # Origination valuation date is intentionally N/A when not found in SF.
+    if sheet_name == "Bridge Asset" and "Origination Value Dt" in out.columns:
+        ser = pd.Series(out["Origination Value Dt"], index=out.index, dtype="object")
+        out["Origination Value Dt"] = ser.where(~blankish_mask(ser), "N/A")
+
+    return out
+
+
 def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str, template_text_headers: Optional[Set[str]] = None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df.copy()
@@ -6332,7 +6433,12 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
         if header in out.columns:
             out[header] = normalize_text_display_series(out[header])
 
+    out = _apply_report_blank_na_policy(out, sheet_name)
+
+    force_blank_headers = REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set())
     for header in REPORT_NA_FILL_HEADERS.get(sheet_name, set()):
+        if header in force_blank_headers:
+            continue
         if header in out.columns:
             ser = pd.Series(out[header], index=out.index, dtype="object")
             out[header] = ser.where(~blankish_mask(ser), "N/A")
@@ -7445,7 +7551,7 @@ if build_btn:
 
                 st.markdown("### Servicer lookup preview")
                 st.caption(f"Detected dominant servicer tape date from uploaded filenames / report tabs: **{detected_run_date.isoformat()}**")
-                st.caption(f"UPB header used for this build: **{upb_col}**")
+                st.caption(f"UPB header used for this build: **{make_upb_header(detected_run_date)}**")
                 if show_servicer_preview:
                     st.dataframe(serv_preview.head(30), use_container_width=True)
                 else:
