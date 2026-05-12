@@ -57,6 +57,15 @@ OUTPUT_TEST_FILENAME = "active loan report test.xlsx"
 ENFORCE_ZERO_FILLABLE_BLANKS = True
 ZERO_BLANK_MAX_ROUNDS = 4
 FORCE_QUARTER_END = None
+MATH_TOLERANCE_DOLLARS = 1.00
+TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT = 1.10
+BRIDGE_UPB_COMMITMENT_RATIO_LIMIT = 1.10
+# Math QA should repair and report issues by default, not block the weekly build.
+# Set this to True only for development / intentional fail-fast testing.
+STRICT_MATH_HARD_STOP = False
+BRIDGE_OVER_COMMITMENT_WARN_TOLERANCE_DOLLARS = 2500.00
+BRIDGE_OVER_COMMITMENT_WARN_RATIO = 0.0005
+BRIDGE_EXCEPTION_STAGES_ALLOW_OVER_COMMITMENT = {"Expired", "Matured", "Sold", "REO", "REO-Sold"}
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 
 VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
@@ -171,6 +180,49 @@ SHEET_DATE_HEADERS = {
     },
     "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
     "Term Asset": {"Value Date"},
+}
+
+SHEET_DATETIME_HEADERS = {
+    "Bridge Asset": set(),
+}
+
+REPORT_IDENTIFIER_HEADERS = {
+    "Bridge Asset": {"Deal Number", "Servicer ID", "SF Yardi ID", "Asset ID"},
+    "Bridge Loan": {"Deal Number", "Servicer ID"},
+    "Term Loan": {"Deal Number", "Servicer ID", "SF Yardi ID"},
+    "Term Asset": {"Deal Number", "Asset ID"},
+}
+
+DEFAULT_TEXT_HEADERS = {
+    "Bridge Asset": {"Year Built", "Square Feet", "Zip", "APN", "Additional APNs"},
+}
+
+# The completed report intentionally uses "N/A" in several formula-driver and manual-review
+# fields. Leaving these as true Excel blanks can break downstream formulas (for example,
+# Bridge Asset DQ Status treats a blank REO Date as if the asset were REO).
+REPORT_NA_FILL_HEADERS = {
+    "Bridge Asset": {
+        "Additional APNs", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
+        "Remedy Plan", "Delinquency Notes", "Maturity Status", "Is Special Asset (Y/N)",
+        "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
+        "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date",
+        "Origination Value Dt", "Most Recent Appraisal Order Date", "Updated Valuation Date",
+        "Title Company", "Tax Due Date", "Tax Frequency", "Tax Commentary",
+        "Servicer Status", "Servicer Maturity Date", "CV Maturity Date",
+        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+    },
+    "Bridge Loan": {
+        "Next Advance Maturity Date", "Next Payment Date", "AM 1 Assigned Date",
+        "AM 2 Assigned Date", "CM Assigned Date", "AM Commentary",
+    },
+    "Term Loan": {"REO Date", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary"},
+    "Term Asset": {"Value Date"},
+}
+
+REPORT_INTEGER_HEADERS = {
+    "Bridge Asset": {"# of Units", "Days to Maturity", "Days Past Due"},
+    "Bridge Loan": {"Number of Assets", "# of Units", "Days Past Due"},
+    "Term Asset": {"# Units"},
 }
 
 SHEET_MONEY2_HEADERS = {
@@ -314,7 +366,7 @@ DRAFT_FORMULA_OVERRIDES = {
         "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
         "Most Recent Valuation Date": '=IF(OR($BE5="N/A",$BE5=""),$BA5,$BE5)',
         "Most Recent As-Is Value": '=IF(OR($BE5="N/A",$BE5=""),$BB5,$BF5)',
-        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),$BC5,$BG5)',
+        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),IF(OR($BC5=0,$BC5=""),"N/A",$BC5),IF(OR($BG5=0,$BG5=""),"N/A",$BG5))',
         "Needs NPL Value": '=IF(AND($CZ5="Y",$CN5<$CQ$3),"Y","N")',
         "Securitized (Y/N)": '=IF($BR5="Securitized Bridge","Y","N")',
         "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
@@ -657,10 +709,27 @@ def money_to_float(x):
     return pd.to_numeric(s, errors="coerce")
 
 
-def to_dt(x):
+def _to_datetime_scalar_mixed_utc_naive(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return pd.NaT
-    return pd.to_datetime(x, errors="coerce")
+    try:
+        ts = pd.to_datetime(x, errors="coerce", format="mixed", utc=True)
+    except TypeError:
+        ts = pd.to_datetime(x, errors="coerce", utc=True)
+    except Exception:
+        ts = pd.to_datetime(x, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+        try:
+            ts = ts.tz_convert(None)
+        except Exception:
+            ts = ts.tz_localize(None)
+    return ts
+
+
+def to_dt(x):
+    return _to_datetime_scalar_mixed_utc_naive(x)
 
 
 def is_reo_stage(val) -> bool:
@@ -713,6 +782,56 @@ def normalize_servicer_id_for_report(servicer_ids: pd.Series, servicer_names: pd
     for i in sid.index:
         out.append(strip_statebridge_display_id(sid.loc[i], serv.loc[i] if i in serv.index else pd.NA))
     return pd.Series(out, index=sid.index, dtype="object")
+
+
+def normalize_report_identifier_scalar(val):
+    txt = clean_text(val)
+    if not txt:
+        return pd.NA
+    txt = re.sub(r"\.0$", "", txt)
+    txt = txt.strip()
+    if re.fullmatch(r"\d+", txt):
+        if len(txt) > 1 and txt.startswith("0"):
+            return txt
+        try:
+            return int(txt)
+        except Exception:
+            return txt
+    return txt
+
+
+def normalize_report_identifier_series(s: pd.Series) -> pd.Series:
+    return pd.Series(s, copy=False).map(normalize_report_identifier_scalar)
+
+
+def normalize_text_display_scalar(val):
+    if not has_any_value(val):
+        return pd.NA
+    if isinstance(val, pd.Timestamp):
+        if pd.isna(val):
+            return pd.NA
+        return _excel_strip_timezone(val)
+    if isinstance(val, (datetime, date)):
+        return _excel_strip_timezone(val) if isinstance(val, datetime) else val
+    if isinstance(val, np.generic):
+        val = val.item()
+    txt = clean_text(val)
+    txt = re.sub(r"\.0$", "", txt)
+    return txt if txt else pd.NA
+
+
+def normalize_text_display_series(s: pd.Series) -> pd.Series:
+    return pd.Series(s, copy=False).map(normalize_text_display_scalar)
+
+
+def normalize_integer_display_series(s: pd.Series) -> pd.Series:
+    ser = pd.Series(s, copy=False)
+    num = pd.to_numeric(ser, errors="coerce")
+    out = _object_series_like(ser)
+    mask = num.notna()
+    if bool(mask.any()):
+        out.loc[mask] = num.loc[mask].round(0).astype("int64").astype("object")
+    return out
 
 
 def blankish_mask(s: pd.Series) -> pd.Series:
@@ -825,14 +944,35 @@ def _looks_like_date_string(x) -> bool:
 
 
 def _to_datetime_series_mixed(s: pd.Series) -> pd.Series:
-    s_str = pd.Series(s, copy=False).astype("string").str.strip()
+    base = pd.Series(list(pd.Series(s, copy=False)), index=pd.Series(s, copy=False).index, dtype="object")
+    if base.empty:
+        return pd.Series([], index=base.index, dtype="datetime64[ns]")
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         warnings.simplefilter("ignore", FutureWarning)
         try:
-            return pd.to_datetime(s_str, errors="coerce", format="mixed")
+            parsed = pd.to_datetime(base, errors="coerce", format="mixed", utc=True)
         except TypeError:
-            return pd.to_datetime(s_str, errors="coerce")
+            parsed = pd.to_datetime(base, errors="coerce", utc=True)
+        except Exception:
+            parsed = base.map(_to_datetime_scalar_mixed_utc_naive)
+
+    if not isinstance(parsed, pd.Series):
+        parsed = pd.Series(parsed, index=base.index)
+    else:
+        parsed = parsed.reindex(base.index)
+
+    try:
+        if getattr(parsed.dt, "tz", None) is not None:
+            parsed = parsed.dt.tz_convert(None)
+    except Exception:
+        try:
+            parsed = parsed.dt.tz_localize(None)
+        except Exception:
+            parsed = parsed.map(_to_datetime_scalar_mixed_utc_naive)
+
+    return pd.to_datetime(parsed, errors="coerce")
 
 
 def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -1412,20 +1552,6 @@ def resolve_template_bytes(prev_upload) -> Tuple[bytes, str]:
     return load_repo_template_bytes()
 
 
-def resolve_build_template_bytes(prev_upload) -> Tuple[bytes, str]:
-    """Use the committed clean template first; use the prior report only as fallback.
-
-    The prior completed workbook is still used for carry-forward/backfill, but it
-    should not be the primary construction scaffold when the repo template exists.
-    """
-    try:
-        return load_repo_template_bytes()
-    except Exception:
-        if prev_upload is not None:
-            return prev_upload.getvalue(), f"uploaded completed workbook fallback template: {prev_upload.name}"
-        raise
-
-
 @st.cache_data(show_spinner=False)
 def load_template_lookup_maps(template_bytes: bytes) -> dict:
     maps = {
@@ -1582,13 +1708,24 @@ def _coalesce_numeric_columns(df: pd.DataFrame, columns: Sequence[str], default=
             out = out.where(out.notna(), cur)
     return out
 
+
+def _coalesce_numeric_columns_zeroaware(df: pd.DataFrame, columns: Sequence[str], default=np.nan) -> pd.Series:
+    out = pd.Series([default] * len(df), index=df.index, dtype="float64")
+    for col in columns:
+        if col in df.columns:
+            cur = pd.to_numeric(df[col], errors="coerce")
+            cur = cur.where(~cur.eq(0), np.nan)
+            out = out.where(out.notna(), cur)
+    return out
+
+
 def _coalesce_datetime_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
     out = pd.Series([pd.NaT] * len(df), index=df.index)
     for col in columns:
         if col in df.columns:
-            cur = pd.to_datetime(df[col], errors="coerce")
+            cur = _to_datetime_series_mixed(df[col])
             out = out.where(out.notna(), cur)
-    return pd.to_datetime(out, errors="coerce")
+    return _to_datetime_series_mixed(out)
 
 def _coalesce_text_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
     out = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
@@ -1654,7 +1791,6 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Loan Commitment", f"{opp_rel}.LOC_Commitment__c"),
         ("Remaining Commitment", f"{opp_rel}.Outstanding_Facility_Amount__c"),
         ("Salesforce Suspense Balance", f"{opp_rel}.Suspense_Balance__c"),
-        ("Current Servicer UPB", f"{opp_rel}.Current_UPB__c"),
         ("Remedy Plan", "Remedy_Plan__c"),
         ("Delinquency Status Notes", "Delinquency_Status_Notes__c"),
         ("Maturity Status", "Maturity_Status__c"),
@@ -1695,6 +1831,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Stage", f"{opp_rel}.StageName"),
         ("Status", "Status__c"),
         ("Current UPB", "Current_UPB__c"),
+        # Loan-level UPB from the Opportunity. Bridge Asset allocates this by deal/funded amount.
+        ("Current Servicer UPB", f"{opp_rel}.Current_UPB__c"),
         ("Approved Advance Amount Funded", "Approved_Advance_Amount_Used__c"),
         ("Comments AM", f"{opp_rel}.Asset_Management_Comments__c"),
         ("Property Created Date", "CreatedDate"),
@@ -1750,8 +1888,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     for c in ["Address", "City", "State", "Zip", "CBSA", "Servicer Loan Number", "Origination Valuation Date", "Origination As-Is Value", "Current Appraisal Date", "Current Appraised As-Is Value"]:
         if c in df.columns:
             df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
-    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
-    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df["_mod_dt"] = _to_datetime_series_mixed(df.get("Property Last Modified Date", pd.Series([pd.NaT] * len(df), index=df.index)))
+    df["_created_dt"] = _to_datetime_series_mixed(df.get("Property Created Date", pd.Series([pd.NaT] * len(df), index=df.index)))
     df = df[df["_asset_key"].notna()].copy()
     df = df.sort_values(["_asset_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt", "_property_id_key"], ascending=[True, False, True, True, True, True])
     df = df.drop_duplicates(["_asset_key"], keep="last")
@@ -1957,8 +2095,16 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
     effective_field = first_existing_field_name("Appraisal__c", ["Appraisal_Effective_Date__c", "Appraisal_Report_Date__c"])
     report_field = first_existing_field_name("Appraisal__c", ["Appraisal_Report_Date__c", "Appraisal_Effective_Date__c"])
     order_field = first_existing_field_name("Appraisal__c", ["Order_Received_Date__c"])
-    as_is_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_As_Is_Value__c", "Appraised_Value_Amount__c"])
-    arv_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_After_Repair_Value__c", "Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c"])
+    reviewed_as_is_field = first_existing_field_name("Appraisal__c", ["Reviewed_Appraisal_As_Is_Value__c"])
+    fallback_as_is_field = first_existing_field_name("Appraisal__c", ["Appraised_Value_Amount__c"])
+    reviewed_arv_field = first_existing_field_name(
+        "Appraisal__c",
+        ["Reviewed_Appraisal_After_Repair_Value__c", "Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c"],
+    )
+    fallback_arv_field = first_existing_field_name(
+        "Appraisal__c",
+        ["Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c", "Appraised_Value_Amount__c"],
+    )
 
     select_pairs = [
         ("Asset ID", f"{property_rel}.Asset_ID__c"),
@@ -1974,10 +2120,16 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         select_pairs.append(("Appraisal Effective Date", effective_field))
     if report_field and report_field != effective_field:
         select_pairs.append(("Appraisal Report Date", report_field))
-    if as_is_field:
-        select_pairs.append(("Appraisal As-Is Value", as_is_field))
-    if arv_field:
-        select_pairs.append(("Appraisal ARV", arv_field))
+    if reviewed_as_is_field:
+        select_pairs.append(("Appraisal Reviewed As-Is Value", reviewed_as_is_field))
+    if fallback_as_is_field and fallback_as_is_field != reviewed_as_is_field:
+        select_pairs.append(("Appraisal As-Is Fallback Value", fallback_as_is_field))
+    if reviewed_arv_field:
+        select_pairs.append(("Appraisal Reviewed ARV", reviewed_arv_field))
+    if fallback_arv_field and fallback_arv_field not in {reviewed_arv_field, reviewed_as_is_field, fallback_as_is_field}:
+        select_pairs.append(("Appraisal ARV Fallback", fallback_arv_field))
+    elif fallback_arv_field and fallback_arv_field == fallback_as_is_field and fallback_arv_field not in {reviewed_arv_field}:
+        select_pairs.append(("Appraisal ARV Fallback", fallback_arv_field))
 
     rename_map = {expr: label for label, expr in select_pairs}
     soqls = []
@@ -1993,21 +2145,71 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
 
     if "Asset ID" not in df.columns and "Property Asset Id" in df.columns:
         df["Asset ID"] = df["Property Asset Id"]
-    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+
     df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Appraisal Effective Date", "Appraisal Report Date"])
-    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraisal As-Is Value"])
-    df["Current Appraised After Repair Value"] = _coalesce_numeric_columns(df, ["Appraisal ARV"])
-    df["_sort_dt"] = pd.to_datetime(df.get("Current Appraisal Date"), errors="coerce")
-    df["_nonnull_score"] = 0
+    if "Most Recent Appraisal Order Date" in df.columns:
+        df["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(df["Most Recent Appraisal Order Date"])
+    df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(
+        df,
+        [c for c in ["Appraisal Reviewed As-Is Value", "Appraisal As-Is Fallback Value"] if c in df.columns],
+    )
+    df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
+        df,
+        [c for c in ["Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in df.columns],
+    )
+    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
+    return downcast_numeric_frame(df)
+
+
+def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_df: pd.DataFrame) -> pd.DataFrame:
+    if appraisal_df is None or appraisal_df.empty:
+        return pd.DataFrame()
+
+    cand = appraisal_df.copy()
+    if "Asset ID" not in cand.columns and "Property Asset Id" in cand.columns:
+        cand["Asset ID"] = cand["Property Asset Id"]
+    cand["_asset_key"] = norm_id_series(cand.get("Asset ID", pd.Series([None] * len(cand), index=cand.index)))
+
+    if property_df is not None and not property_df.empty and "Asset ID" in property_df.columns:
+        valid_asset_keys = set(norm_id_series(property_df["Asset ID"]).dropna().tolist())
+        if valid_asset_keys:
+            cand = cand[cand["_asset_key"].isin(valid_asset_keys)].copy()
+
+    if cand.empty:
+        return pd.DataFrame()
+
+    cand["Current Appraisal Date"] = _coalesce_datetime_columns(cand, ["Current Appraisal Date", "Appraisal Effective Date", "Appraisal Report Date"])
+    if "Most Recent Appraisal Order Date" in cand.columns:
+        cand["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(cand["Most Recent Appraisal Order Date"])
+    cand["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(
+        cand,
+        [c for c in ["Current Appraised As-Is Value", "Appraisal Reviewed As-Is Value", "Appraisal As-Is Fallback Value"] if c in cand.columns],
+    )
+    cand["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
+        cand,
+        [c for c in ["Current Appraised After Repair Value", "Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in cand.columns],
+    )
+
+    cand["_bundle_effective_dt"] = _to_datetime_series_mixed(cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
+    cand["_bundle_order_dt"] = _to_datetime_series_mixed(cand.get("Most Recent Appraisal Order Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
+    cand["_nonnull_score"] = 0
     for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value", "Most Recent Appraisal Order Date"]:
-        if c in df.columns:
-            df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
-    df = df[df["_asset_key"].notna()].copy()
-    df = df.sort_values(["_asset_key", "_sort_dt", "_nonnull_score"], ascending=[True, True, True])
-    df = df.drop_duplicates(["_asset_key"], keep="last")
-    return downcast_numeric_frame(df.drop(columns=["_sort_dt", "_nonnull_score"], errors="ignore"))
+        if c in cand.columns:
+            cand["_nonnull_score"] = cand["_nonnull_score"] + (~blankish_mask(cand[c])).astype("int8")
+
+    cand = cand[cand["_asset_key"].notna()].copy()
+    cand = cand.sort_values(["_asset_key", "_bundle_effective_dt", "_bundle_order_dt", "_nonnull_score"], ascending=[True, True, True, True])
+    cand = cand.drop_duplicates(["_asset_key"], keep="last")
+
+    keep = ["_asset_key"] + [
+        c for c in ["Asset ID", "Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]
+        if c in cand.columns
+    ]
+    return downcast_numeric_frame(cand[keep].drop_duplicates("_asset_key"))
+
 
 def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
+
     asset_ids = _nonblank_unique(asset_ids or [])
     soqls = []
 
@@ -2046,21 +2248,21 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
 
     df = _run_bulk_union(soqls, rename_map=rename_map)
     appraisal_df = _build_appraisal_like(asset_ids=asset_ids)
-    if df.empty and appraisal_df.empty:
+    best_bundle = _select_best_current_appraisal_bundle(df, appraisal_df)
+    if df.empty and best_bundle.empty:
         return df
 
     if df.empty:
-        df = appraisal_df.copy()
+        df = best_bundle.copy()
     else:
         df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Value Date Native", "Backup Value Date Native", "BPO Appraisal Date"])
-        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value Native"])
-        df["Current Appraised After Repair Value"] = pd.to_numeric(df.get("After Repair Value"), errors="coerce")
+        if "Most Recent Appraisal Order Date" in df.columns:
+            df["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(df["Most Recent Appraisal Order Date"])
+        df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(df, ["Appraised Value Amount", "Generic Value Native"])
+        df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(df, ["After Repair Value", "Appraised Value Amount", "Generic Value Native"])
 
-        if not appraisal_df.empty and "Asset ID" in appraisal_df.columns:
-            app = appraisal_df.copy()
-            app["_asset_key"] = norm_id_series(app["Asset ID"])
-            keep = ["_asset_key"] + [c for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"] if c in app.columns]
-            app = app[keep].drop_duplicates("_asset_key")
+        if not best_bundle.empty and "_asset_key" in best_bundle.columns:
+            app = best_bundle.copy()
             df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
             df = df.merge(app, on="_asset_key", how="left", suffixes=("", "_app"))
             for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
@@ -2076,8 +2278,8 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value", "Origination Valuation Date", "Origination As-Is Value", "Origination After Repair Value"]:
         if c in df.columns:
             df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
-    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
-    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df["_mod_dt"] = _to_datetime_series_mixed(df.get("Property Last Modified Date", pd.Series([pd.NaT] * len(df), index=df.index)))
+    df["_created_dt"] = _to_datetime_series_mixed(df.get("Property Created Date", pd.Series([pd.NaT] * len(df), index=df.index)))
     df = df[df["_asset_key"].notna()].copy()
     df = df.sort_values(["_asset_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt", "_property_id_key"], ascending=[True, False, True, True, True, True])
     df = df.drop_duplicates(["_asset_key"], keep="last")
@@ -2389,8 +2591,12 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["Value Date"] = _coalesce_datetime_columns(df, ["Updated Valuation Date", "Generic Value Date", "BPO Appraisal Date"])
-    df["As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount", "Generic Value"])
+    # Term Asset valuation fields in the completed report are carry-forward/manual
+    # fields, not a full refresh from current Property/Appraisal fields. Leave the
+    # Salesforce-built rows blank here; build_term_asset() will carry forward prior
+    # completed values and only use these current rows for brand-new assets.
+    df["Value Date"] = pd.NaT
+    df["As-Is Value"] = np.nan
 
     df["_deal_key"] = norm_id_series(df.get("Deal Loan Number", pd.Series([None] * len(df), index=df.index)))
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
@@ -2404,8 +2610,8 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
             df["_nonnull_score"] = df["_nonnull_score"] + (~blankish_mask(df[c])).astype("int8")
     df["_ala_sort"] = pd.to_numeric(df.get("ALA", np.nan), errors="coerce").fillna(0)
     df["_value_dt"] = pd.to_datetime(df.get("Value Date"), errors="coerce")
-    df["_mod_dt"] = pd.to_datetime(df.get("Property Last Modified Date"), errors="coerce")
-    df["_created_dt"] = pd.to_datetime(df.get("Property Created Date"), errors="coerce")
+    df["_mod_dt"] = _to_datetime_series_mixed(df.get("Property Last Modified Date", pd.Series([pd.NaT] * len(df), index=df.index)))
+    df["_created_dt"] = _to_datetime_series_mixed(df.get("Property Created Date", pd.Series([pd.NaT] * len(df), index=df.index)))
     df = df.sort_values(["_deal_key", "_asset_key", "_is_sub_unit", "_nonnull_score", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt", "_property_id_key"], ascending=[True, True, False, True, True, True, True, True, True])
     df = df.drop_duplicates(["_deal_key", "_asset_key"], keep="last")
     return downcast_numeric_frame(df)
@@ -2480,24 +2686,6 @@ def detect_servicer_type(filename: str) -> str:
         "Could not detect servicer file type from the filename. "
         "Use one of these naming patterns: Shellpoint, CHL, CoreVest_Data_Tape, CoreVestLoanData, FCI, Midland."
     )
-
-
-def choose_report_as_of_date(file_dates: Sequence[date]) -> date:
-    """Choose the weekly report as-of date from uploaded servicer files.
-
-    The completed Active Loan Report has historically used the dominant / common
-    servicer tape as-of date for the UPB and DQ labels, not necessarily the newest
-    filename. This avoids one off-cycle servicer file shifting every UPB header.
-    """
-    dates = [d for d in file_dates if d]
-    if not dates:
-        return today_et()
-    counts: Dict[date, int] = {}
-    for d in dates:
-        counts[d] = counts.get(d, 0) + 1
-    top_count = max(counts.values())
-    candidates = [d for d, c in counts.items() if c == top_count]
-    return max(candidates)
 
 
 def report_date_from_scalar(value) -> Optional[date]:
@@ -2577,13 +2765,80 @@ def _bridge_status_severity(status) -> int:
     s = clean_text(status).upper()
     order = {
         "CURRENT": 0,
-        "30 - 59 DAYS": 1,
-        "60 - 89 DAYS": 2,
-        "90 + DAYS": 3,
-        "BK": 4,
-        "REO": 5,
+        "CURRENT": 0,
+        "DQ 1-29": 1,
+        "30 - 59 DAYS": 2,
+        "DQ 30-59": 2,
+        "60 - 89 DAYS": 3,
+        "DQ 60-89": 3,
+        "90 + DAYS": 4,
+        "DQ 90+": 4,
+        "BK": 5,
+        "REO": 6,
     }
     return order.get(s, -1)
+
+
+def _bridge_bucket_to_report_label(bucket, days_past_due=np.nan):
+    s = clean_text(bucket).upper()
+    try:
+        days = float(days_past_due)
+    except Exception:
+        days = np.nan
+    if s == "REO":
+        return "REO"
+    if s == "BK":
+        return "BK"
+    if s in {"90 + DAYS", "DQ 90+"}:
+        return "DQ 90+"
+    if s in {"60 - 89 DAYS", "DQ 60-89"}:
+        return "DQ 60-89"
+    if s in {"30 - 59 DAYS", "DQ 30-59"}:
+        return "DQ 30-59"
+    if s == "DQ 1-29":
+        return "DQ 1-29"
+    if s == "CURRENT":
+        if not pd.isna(days) and days >= 1:
+            return "DQ 1-29"
+        return "Current"
+    if not pd.isna(days):
+        if days >= 90:
+            return "DQ 90+"
+        if days >= 60:
+            return "DQ 60-89"
+        if days >= 30:
+            return "DQ 30-59"
+        if days >= 1:
+            return "DQ 1-29"
+        return "Current"
+    return pd.NA
+
+
+def _bridge_loan_rollup_label(bucket_series: pd.Series, days_series: pd.Series):
+    labels = {
+        clean_text(_bridge_bucket_to_report_label(bucket, days))
+        for bucket, days in zip(bucket_series, days_series)
+        if clean_text(_bridge_bucket_to_report_label(bucket, days))
+    }
+    if "REO" in labels:
+        return "REO"
+    if "BK" in labels:
+        return "BK"
+    if "DQ 90+" in labels:
+        return "DQ 90+"
+    if "DQ 60-89" in labels:
+        return "DQ 60-89"
+    has_30 = "DQ 30-59" in labels
+    has_1_29 = "DQ 1-29" in labels
+    if has_30 and has_1_29:
+        return "DQ 1-29 / DQ 30-59"
+    if has_30:
+        return "DQ 30-59"
+    if has_1_29:
+        return "DQ 1-29"
+    if "Current" in labels:
+        return "Current"
+    return pd.NA
 
 
 def _guess_days_past_due(next_payment_date, run_date: date) -> float:
@@ -2598,11 +2853,17 @@ def _guess_days_from_bridge_bucket(status) -> float:
     s = clean_text(status).upper()
     mapping = {
         "CURRENT": 0.0,
+        "DQ 1-29": 14.0,
         "30 - 59 DAYS": 45.0,
+        "DQ 30-59": 45.0,
+        "DQ 1-29 / DQ 30-59": 45.0,
         "60 - 89 DAYS": 75.0,
+        "DQ 60-89": 75.0,
         "90 + DAYS": 90.0,
+        "DQ 90+": 90.0,
         "BK": 90.0,
         "REO": 90.0,
+        "CURRENT": 0.0,
     }
     return mapping.get(s, np.nan)
 
@@ -2758,8 +3019,8 @@ def _id_key_no_leading_zeros_scalar(val) -> str:
     if not s:
         return ""
     s = re.sub(r"\.0$", "", s)
-    s = re.sub(r"COM$", "", s, flags=re.I)
     s = re.sub(r"[^0-9A-Za-z]", "", s)
+    s = re.sub(r"COM$", "", s, flags=re.I)
     s = s.lstrip("0")
     return s
 
@@ -2771,7 +3032,12 @@ def _first_nonblank_scalar(values: Sequence) -> object:
     return pd.NA
 
 
-def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFrame, sf_servicer: pd.Series) -> pd.DataFrame:
+def _select_term_servicer_matches(
+    sf_term: pd.DataFrame,
+    serv_lookup: pd.DataFrame,
+    sf_servicer: pd.Series,
+    prev_maps: Optional[dict] = None,
+) -> pd.DataFrame:
     result = pd.DataFrame(index=sf_term.index)
     result["selected_servicer_id"] = pd.NA
     result["selected_sid_key"] = pd.NA
@@ -2780,6 +3046,7 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     result["matched_next_payment_date"] = pd.NaT
     result["matched_maturity_date"] = pd.NaT
     result["matched_source"] = pd.NA
+    result["_selected_match_score"] = np.nan
 
     candidate_cols = []
     if "Servicer Commitment Id" in sf_term.columns:
@@ -2796,7 +3063,21 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     result["selected_servicer_id"] = pd.Series(preferred_raw, index=sf_term.index, dtype="object")
     result["selected_sid_key"] = id_key_no_leading_zeros(pd.Series(preferred_raw, index=sf_term.index, dtype="object"))
 
+    prev_sid_owner = _prev_sid_to_deal_map(prev_maps)
+    current_deal_key = norm_id_series(sf_term.get("Deal Loan Number", pd.Series([pd.NA] * len(sf_term), index=sf_term.index)))
+    loan_amount = pd.to_numeric(sf_term.get("Loan Amount", pd.Series([np.nan] * len(sf_term), index=sf_term.index)), errors="coerce")
+
     if serv_lookup is None or serv_lookup.empty or "_sid_key" not in serv_lookup.columns:
+        # Even without servicer files, do not carry a servicer ID known from the prior workbook to belong to another deal.
+        conflict_mask = []
+        for idx in sf_term.index:
+            sid_key = _id_key_no_leading_zeros_scalar(result.at[idx, "selected_servicer_id"])
+            deal_key = clean_text(current_deal_key.loc[idx]) if idx in current_deal_key.index else ""
+            prev_owner = prev_sid_owner.get(sid_key)
+            conflict_mask.append(bool(sid_key and deal_key and prev_owner and prev_owner != deal_key))
+        conflict_mask = pd.Series(conflict_mask, index=sf_term.index)
+        if bool(conflict_mask.any()):
+            result.loc[conflict_mask, ["selected_servicer_id", "selected_sid_key"]] = pd.NA
         return result
 
     base = serv_lookup.dropna(subset=["_sid_key"]).copy()
@@ -2816,9 +3097,12 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     selected_npd = []
     selected_mat = []
     selected_source = []
+    selected_scores = []
 
     for idx in sf_term.index:
         sf_serv = sf_servicer.loc[idx] if idx in sf_servicer.index else pd.NA
+        deal_key = clean_text(current_deal_key.loc[idx]) if idx in current_deal_key.index else ""
+        loan_amt = loan_amount.loc[idx] if idx in loan_amount.index else np.nan
         best = None
         best_score = -10**9
         fallback = None
@@ -2831,29 +3115,55 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
             sid_key = _id_key_no_leading_zeros_scalar(raw)
             if not sid_key:
                 continue
+
+            prev_owner = prev_sid_owner.get(sid_key)
+            if prev_owner and deal_key and prev_owner != deal_key:
+                # Prior completed workbook says this servicer ID belonged to a different active deal.
+                # Never attach it here without explicit evidence outside this automated matcher.
+                continue
+
             info = info_map.get(sid_key)
             has_file = info is not None
             file_serv = info.get("servicer") if info else pd.NA
             file_upb = money_to_float(info.get("upb")) if info else np.nan
+
+            amount_conflict = False
+            if has_file and pd.notna(file_upb) and pd.notna(loan_amt) and float(loan_amt) > 0:
+                amount_conflict = float(file_upb) > float(loan_amt) * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT
+            if amount_conflict:
+                continue
+
             checkpoint_ok = bool(has_file and _servicer_checkpoint_ok(sf_serv, file_serv))
+            # Servicer Commitment Id is the reliable term loan key in the completed report.
+            # Salesforce's Servicer Name can lag/misclassify the current servicing family, so a
+            # current servicer-file hit on the commitment ID is allowed even when the SF family
+            # text disagrees. This prevents good Midland/Berkadia/FCI UPB from being blanked.
+            if has_file and col == "Servicer Commitment Id":
+                checkpoint_ok = True
+            # alternate Term Servicer Key fields are useful only as lower-priority fallbacks.
             pref = 100 if col == "Servicer Commitment Id" else max(0, 10 - pos)
+            prev_bonus = 50 if (prev_owner and deal_key and prev_owner == deal_key) else 0
             file_bonus = 20 if has_file else 0
             upb_bonus = 5 if (pd.notna(file_upb) and float(file_upb) > 0) else 0
-            ok_score = 100 + file_bonus + upb_bonus + pref if checkpoint_ok else -10**9
-            raw_score = file_bonus + upb_bonus + pref
+            amount_bonus = 5 if (pd.notna(file_upb) and pd.notna(loan_amt) and float(loan_amt) > 0 and float(file_upb) <= float(loan_amt) * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT) else 0
+            ok_score = 100 + prev_bonus + file_bonus + upb_bonus + amount_bonus + pref if checkpoint_ok else -10**9
+            raw_score = prev_bonus + file_bonus + upb_bonus + amount_bonus + pref
             if ok_score > best_score:
                 best_score = ok_score
-                best = (raw, sid_key, info, col)
+                best = (raw, sid_key, info, col, ok_score)
             if raw_score > fallback_score:
                 fallback_score = raw_score
-                fallback = (raw, sid_key, info, col)
+                fallback = (raw, sid_key, info, col, raw_score)
 
         chosen = best if best is not None else None
-        if chosen is None and not clean_text(sf_serv):
+        # If the SF servicer family checkpoint failed but the commitment/key still matched a
+        # current servicer file, keep that fallback instead of creating blanks. The later
+        # servicer-file merge overwrites stale SF servicer names.
+        if chosen is None:
             chosen = fallback
 
         if chosen is not None:
-            raw, sid_key, info, col = chosen
+            raw, sid_key, info, col, score = chosen
             selected_raw.append(raw)
             selected_key.append(sid_key or pd.NA)
             selected_serv.append(info.get("servicer") if info else pd.NA)
@@ -2861,6 +3171,7 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
             selected_npd.append(pd.to_datetime(info.get("next_payment_date"), errors="coerce") if info else pd.NaT)
             selected_mat.append(pd.to_datetime(info.get("maturity_date"), errors="coerce") if info else pd.NaT)
             selected_source.append(col)
+            selected_scores.append(score)
         else:
             raw = result.at[idx, "selected_servicer_id"]
             selected_raw.append(raw)
@@ -2870,6 +3181,7 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
             selected_npd.append(pd.NaT)
             selected_mat.append(pd.NaT)
             selected_source.append(pd.NA)
+            selected_scores.append(np.nan)
 
     result["selected_servicer_id"] = pd.Series(selected_raw, index=sf_term.index, dtype="object")
     result["selected_sid_key"] = pd.Series(selected_key, index=sf_term.index, dtype="object")
@@ -2878,7 +3190,16 @@ def _select_term_servicer_matches(sf_term: pd.DataFrame, serv_lookup: pd.DataFra
     result["matched_next_payment_date"] = pd.to_datetime(pd.Series(selected_npd, index=sf_term.index), errors="coerce")
     result["matched_maturity_date"] = pd.to_datetime(pd.Series(selected_mat, index=sf_term.index), errors="coerce")
     result["matched_source"] = pd.Series(selected_source, index=sf_term.index, dtype="object")
+    result["_selected_match_score"] = pd.to_numeric(pd.Series(selected_scores, index=sf_term.index), errors="coerce")
+    result["_deal_key"] = current_deal_key
+
+    # Do not blank duplicate-looking servicer IDs here. In practice, duplicate / stale SF servicer
+    # naming issues are common around service transfers, and clearing them caused thousands of
+    # downstream Term Asset UPB blanks. Keep the best selected key and let the QA diagnostics flag
+    # duplicates for review instead of destroying the usable balance/source fields.
+
     return result
+
 
 def _filter_term_population(
     sf_term: pd.DataFrame,
@@ -2893,6 +3214,7 @@ def _filter_term_population(
     prev_sold_retained_keys = prev_sold_retained_keys or set()
     out["_deal_key"] = norm_id_series(out.get("Deal Loan Number", pd.Series([None] * len(out), index=out.index)))
     in_prev_sold_retained = out["_deal_key"].isin(prev_sold_retained_keys)
+    in_prev_positive = out["_deal_key"].isin(prev_positive_keys or set())
 
     keep_mask = _term_report_keep_mask(
         out.get("Stage", pd.Series([""] * len(out), index=out.index)),
@@ -2900,6 +3222,9 @@ def _filter_term_population(
         out.get("Sold Loan: Servicing Status", pd.Series([pd.NA] * len(out), index=out.index)),
         fallback_prev_retained_mask=in_prev_sold_retained,
     )
+    stage = out.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    carry_forward_active = in_prev_positive & (~stage.isin(["Paid Off", "REO-Sold"]))
+    keep_mask = keep_mask | carry_forward_active
     return out.loc[keep_mask].copy()
 
 
@@ -3199,6 +3524,25 @@ def parse_servicer_cached(blob: UploadBlob) -> pd.DataFrame:
     return parse_servicer_bytes(blob.filename, blob.data)
 
 
+def choose_dominant_servicer_report_date(file_dates: Sequence[date]) -> date:
+    """Return the common tape as-of date used for the report UPB header.
+
+    The completed Active Loan Report uses the dominant external servicer tape date
+    from the uploaded filenames. It should not drift to a later workbook run date
+    embedded inside one servicer file. If there is a tie, choose the earlier date
+    because that is the safer/common weekly cutoff.
+    """
+    counts: Dict[date, int] = {}
+    for d in file_dates or []:
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+    if not counts:
+        return today_et()
+    top_count = max(counts.values())
+    candidates = [d for d, c in counts.items() if c == top_count]
+    return min(candidates)
+
+
 def build_servicer_lookup(
     servicer_uploads: List,
     progress_hook=None,
@@ -3250,10 +3594,12 @@ def build_servicer_lookup(
         else:
             combined = pd.concat([combined, parsed], ignore_index=True, copy=False)
 
-        if "as_of" in parsed.columns and parsed["as_of"].notna().any():
+        # Use the uploaded filename date first. Some servicer workbooks carry a later
+        # internal run date, but the completed report's UPB header follows the common
+        # external tape date encoded in filenames.
+        d = date_from_filename(filename)
+        if not d and "as_of" in parsed.columns and parsed["as_of"].notna().any():
             d = pd.to_datetime(parsed["as_of"].dropna().iloc[0]).date()
-        else:
-            d = date_from_filename(filename)
         if d:
             file_dates.append(d)
 
@@ -3304,7 +3650,7 @@ def build_servicer_lookup(
         join = full.copy()
         preview = full.head(0).copy()
 
-    run_date = choose_report_as_of_date(file_dates)
+    run_date = choose_dominant_servicer_report_date(file_dates) if file_dates else today_et()
     return downcast_numeric_frame(join), run_date, downcast_numeric_frame(preview)
 
 
@@ -3337,6 +3683,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
                     "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                     "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
                     "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+                    "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
                     "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
                 ] if c in ba.columns
             ]
@@ -3629,80 +3976,6 @@ def _parse_npl_or_reo_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-
-def _numeric_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
-    if df is None or col not in getattr(df, "columns", []):
-        idx = df.index if isinstance(df, pd.DataFrame) else pd.RangeIndex(0)
-        return pd.Series([default] * len(idx), index=idx, dtype="float64")
-    return pd.to_numeric(df[col], errors="coerce")
-
-
-def _coalesce_positive_then_any_numeric(*series_like, index=None) -> pd.Series:
-    """Choose first positive numeric source, then first non-null numeric source."""
-    if index is None:
-        for obj in series_like:
-            if isinstance(obj, pd.Series):
-                index = obj.index
-                break
-    if index is None:
-        index = pd.RangeIndex(0)
-
-    candidates = []
-    for obj in series_like:
-        if isinstance(obj, pd.Series):
-            ser = pd.to_numeric(obj.reindex(index), errors="coerce")
-        else:
-            ser = pd.to_numeric(pd.Series(obj, index=index), errors="coerce")
-        candidates.append(ser)
-
-    out = pd.Series([np.nan] * len(index), index=index, dtype="float64")
-    for ser in candidates:
-        vals = ser.where(ser.gt(0))
-        out = out.where(out.notna(), vals)
-    for ser in candidates:
-        vals = ser.where(ser.notna())
-        out = out.where(out.notna(), vals)
-    return pd.to_numeric(out, errors="coerce")
-
-
-def _group_first_positive_then_any_numeric(values: pd.Series):
-    vals = pd.to_numeric(values, errors="coerce").dropna()
-    if vals.empty:
-        return np.nan
-    positive = vals[vals.gt(0)]
-    if not positive.empty:
-        return float(positive.iloc[0])
-    return float(vals.iloc[0])
-
-
-def _bridge_component_funded_sum(df: pd.DataFrame) -> pd.Series:
-    if df is None or df.empty:
-        return pd.Series(dtype="float64")
-    init = _numeric_series(df, "Initial Disbursement Funded")
-    reno = _numeric_series(df, "Renovation Holdback Funded")
-    interest = _numeric_series(df, "Interest Allocation Funded")
-    has_any_component = init.notna() | reno.notna() | interest.notna()
-    funded = init.fillna(0.0) + reno.fillna(0.0) + interest.fillna(0.0)
-    return funded.where(has_any_component, np.nan)
-
-
-def _recompute_bridge_asset_funded_amount(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df.copy()
-    out = df.copy()
-    out["SF Funded Amount"] = _bridge_component_funded_sum(out)
-
-    if {"Renovation Holdback", "Renovation Holdback Funded", "Renovation Holdback Remaining"}.issubset(out.columns):
-        reno_total = _numeric_series(out, "Renovation Holdback")
-        reno_funded = _numeric_series(out, "Renovation Holdback Funded")
-        calc_remaining = reno_total.fillna(0.0) - reno_funded.fillna(0.0)
-        has_calc = reno_total.notna() | reno_funded.notna()
-        out["Renovation Holdback Remaining"] = pd.to_numeric(out["Renovation Holdback Remaining"], errors="coerce").where(
-            ~has_calc,
-            calc_remaining,
-        )
-    return downcast_numeric_frame(out)
-
 def parse_npl_reo_bytes(file_bytes: bytes) -> dict:
     out = {
         "loan_flags": pd.DataFrame(columns=["_deal_key", "NPL Flag", "Needs NPL Value", "Special Focus (Y/N)"]),
@@ -3772,6 +4045,648 @@ def parse_npl_reo_bytes(file_bytes: bytes) -> dict:
     return out
 
 
+
+
+
+def _numeric_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
+    if df is None:
+        return pd.Series(dtype="float64")
+    if col in df.columns:
+        return pd.to_numeric(pd.Series(df[col], index=df.index), errors="coerce")
+    return pd.to_numeric(pd.Series([default] * len(df), index=df.index), errors="coerce")
+
+
+def _coalesce_positive_then_any_numeric(*series_like, index=None) -> pd.Series:
+    """Choose the first positive numeric source, then the first non-null numeric source.
+
+    This is intentionally stricter than normal text coalescing: a servicer zero
+    should not hide a positive Salesforce/prior balance, but zero is preserved
+    when every source is truly zero or blank.
+    """
+    if index is None:
+        for obj in series_like:
+            if isinstance(obj, pd.Series):
+                index = obj.index
+                break
+    if index is None:
+        index = pd.RangeIndex(0)
+
+    candidates = []
+    for obj in series_like:
+        if isinstance(obj, pd.Series):
+            ser = pd.to_numeric(obj.reindex(index), errors="coerce")
+        else:
+            ser = pd.to_numeric(pd.Series(obj, index=index), errors="coerce")
+        candidates.append(ser)
+
+    out = pd.Series([np.nan] * len(index), index=index, dtype="float64")
+    for ser in candidates:
+        vals = ser.where(ser.gt(0))
+        out = out.where(out.notna(), vals)
+    for ser in candidates:
+        vals = ser.where(ser.notna())
+        out = out.where(out.notna(), vals)
+    return pd.to_numeric(out, errors="coerce")
+
+
+def _group_first_positive_then_any_numeric(values: pd.Series):
+    vals = pd.to_numeric(values, errors="coerce").dropna()
+    if vals.empty:
+        return np.nan
+    positive = vals[vals.gt(0)]
+    if not positive.empty:
+        return float(positive.iloc[0])
+    return float(vals.iloc[0])
+
+
+def _ensure_deal_key(df: pd.DataFrame, source_col: str = "Deal Number") -> pd.DataFrame:
+    out = df.copy()
+    if "_deal_key" not in out.columns:
+        out["_deal_key"] = norm_id_series(out.get(source_col, pd.Series([None] * len(out), index=out.index)))
+    return out
+
+
+def _bridge_component_funded_sum(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+    idx = df.index
+    init = _numeric_series(df, "Initial Disbursement Funded")
+    reno = _numeric_series(df, "Renovation Holdback Funded")
+    interest = _numeric_series(df, "Interest Allocation Funded")
+    has_any_component = init.notna() | reno.notna() | interest.notna()
+    funded = init.fillna(0.0) + reno.fillna(0.0) + interest.fillna(0.0)
+    return funded.where(has_any_component, np.nan)
+
+
+def _recompute_bridge_asset_funded_amount(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+    out["SF Funded Amount"] = _bridge_component_funded_sum(out)
+
+    if {"Renovation Holdback", "Renovation Holdback Funded", "Renovation Holdback Remaining"}.issubset(out.columns):
+        reno_total = _numeric_series(out, "Renovation Holdback")
+        reno_funded = _numeric_series(out, "Renovation Holdback Funded")
+        calc_remaining = reno_total.fillna(0.0) - reno_funded.fillna(0.0)
+        has_calc = reno_total.notna() | reno_funded.notna()
+        out["Renovation Holdback Remaining"] = pd.to_numeric(out["Renovation Holdback Remaining"], errors="coerce").where(
+            ~has_calc,
+            calc_remaining,
+        )
+    return downcast_numeric_frame(out)
+
+
+def _rollup_bridge_asset_math(bridge_asset: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    if bridge_asset is None or bridge_asset.empty:
+        return pd.DataFrame(columns=["_deal_key"])
+    ba = _recompute_bridge_asset_funded_amount(bridge_asset)
+    ba = _ensure_deal_key(ba, "Deal Number")
+    ba = ba[ba["_deal_key"].notna()].copy()
+    if ba.empty:
+        return pd.DataFrame(columns=["_deal_key"])
+
+    g = ba.groupby("_deal_key", dropna=True)
+    roll = pd.DataFrame(index=g.size().index)
+    sum_pairs = {
+        "Active Funded Amount": "SF Funded Amount",
+        "Initial Disbursement Funded": "Initial Disbursement Funded",
+        "Renovation Holdback": "Renovation Holdback",
+        "Renovation HB Funded": "Renovation Holdback Funded",
+        "Renovation HB Remaining": "Renovation Holdback Remaining",
+        "Interest Allocation": "Interest Allocation",
+        "Interest Allocation Funded": "Interest Allocation Funded",
+        "Suspense Balance": "Suspense Balance",
+        "Most Recent As-Is Value": "Most Recent As-Is Value",
+        "Most Recent ARV": "Most Recent ARV",
+    }
+    for target, source in sum_pairs.items():
+        if source in ba.columns:
+            roll[target] = pd.to_numeric(g[source].sum(min_count=1), errors="coerce")
+    if upb_col in ba.columns:
+        roll[upb_col] = pd.to_numeric(g[upb_col].sum(min_count=1), errors="coerce")
+    return roll.reset_index()
+
+
+
+def _bridge_material_tolerance(base_series) -> pd.Series:
+    base = pd.to_numeric(pd.Series(base_series, copy=False), errors="coerce").abs().fillna(0.0)
+    return pd.Series(
+        np.maximum(BRIDGE_OVER_COMMITMENT_WARN_TOLERANCE_DOLLARS, base * BRIDGE_OVER_COMMITMENT_WARN_RATIO),
+        index=base.index,
+        dtype="float64",
+    )
+
+
+def _bridge_stage_exception_mask(stage_series: pd.Series) -> pd.Series:
+    txt = pd.Series(stage_series, copy=False).astype("string").str.strip()
+    return txt.isin(BRIDGE_EXCEPTION_STAGES_ALLOW_OVER_COMMITMENT).fillna(False)
+
+
+def _bridge_limit_base(commitment_series, funded_series=None) -> pd.Series:
+    commitment = pd.to_numeric(pd.Series(commitment_series, copy=False), errors="coerce")
+    if funded_series is None:
+        funded = pd.Series([np.nan] * len(commitment), index=commitment.index, dtype="float64")
+    else:
+        funded = pd.to_numeric(pd.Series(funded_series, index=commitment.index, copy=False), errors="coerce")
+    base = pd.concat([commitment.where(commitment.gt(0)), funded.where(funded.gt(0))], axis=1).max(axis=1)
+    return pd.to_numeric(base, errors="coerce")
+
+
+def _bridge_value_plausible_against_commitment(value_series, commitment_series, ratio: float = BRIDGE_UPB_COMMITMENT_RATIO_LIMIT) -> pd.Series:
+    value = pd.to_numeric(pd.Series(value_series, copy=False), errors="coerce")
+    commitment = pd.to_numeric(pd.Series(commitment_series, index=value.index, copy=False), errors="coerce")
+    tol = _bridge_material_tolerance(commitment)
+    no_commitment = commitment.isna() | commitment.le(0)
+    return value.gt(0) & (no_commitment | value.le(commitment * ratio + tol))
+
+
+def _bridge_value_plausible_for_upb(value_series, commitment_series, funded_series=None, ratio: float = BRIDGE_UPB_COMMITMENT_RATIO_LIMIT) -> pd.Series:
+    value = pd.to_numeric(pd.Series(value_series, copy=False), errors="coerce")
+    commitment = pd.to_numeric(pd.Series(commitment_series, index=value.index, copy=False), errors="coerce")
+    funded = None if funded_series is None else pd.to_numeric(pd.Series(funded_series, index=value.index, copy=False), errors="coerce")
+    base = _bridge_limit_base(commitment, funded)
+    tol = _bridge_material_tolerance(base)
+    no_base = base.isna() | base.le(0)
+    return value.gt(0) & (no_base | value.le(base * ratio + tol))
+
+
+def _allocate_group_amount_by_weights(out: pd.DataFrame, row_indices: Sequence, target_col: str, target_amount: float, weight_col: str) -> None:
+    idxs = list(row_indices)
+    if not idxs:
+        return
+    weights = pd.to_numeric(out.loc[idxs, weight_col] if weight_col in out.columns else pd.Series([np.nan] * len(idxs), index=idxs), errors="coerce").fillna(0.0)
+    weights = weights.where(weights.gt(0), 0.0)
+    if float(weights.sum()) > 0:
+        alloc = float(target_amount) * (weights / float(weights.sum()))
+    else:
+        alloc = pd.Series([float(target_amount) / len(idxs)] * len(idxs), index=idxs, dtype="float64")
+    out.loc[idxs, target_col] = alloc
+    # Fix floating-point drift on the last row so the group ties exactly before workbook rounding.
+    diff = float(target_amount) - float(pd.to_numeric(out.loc[idxs, target_col], errors="coerce").fillna(0.0).sum())
+    out.loc[idxs[-1], target_col] = float(pd.to_numeric(pd.Series([out.loc[idxs[-1], target_col]]), errors="coerce").fillna(0.0).iloc[0]) + diff
+
+
+def repair_bridge_asset_math(bridge_asset: pd.DataFrame, upb_col: str) -> Tuple[pd.DataFrame, List[str]]:
+    """Repair Bridge Asset funded amount and obviously contaminated UPB using same-deal fields.
+
+    The main invariant is not "UPB must be capped to commitment." Some valid exception / sold / overfunded
+    situations can exceed current commitment. The real production rule is: do not publish an asset UPB rollup
+    that is wildly above every same-deal basis when there is a safer same-deal source such as funded components
+    or prior asset UPB. This function records repairs in diagnostics and leaves unresolved exception-stage rows
+    visible for review instead of fabricating a cap.
+    """
+    if bridge_asset is None or bridge_asset.empty:
+        return (pd.DataFrame() if bridge_asset is None else bridge_asset.copy()), []
+
+    out = _recompute_bridge_asset_funded_amount(bridge_asset)
+    out = _ensure_deal_key(out, "Deal Number")
+    diagnostics: List[str] = []
+
+    if upb_col not in out.columns:
+        return downcast_numeric_frame(out), diagnostics
+
+    before_total = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0).sum()
+    repaired_count = 0
+    unresolved_count = 0
+
+    for deal_key, idxs in out.groupby("_deal_key", dropna=True).groups.items():
+        idxs = list(idxs)
+        if not idxs:
+            continue
+
+        commitment_vals = pd.to_numeric(
+            out.loc[idxs, "Loan Commitment"] if "Loan Commitment" in out.columns else pd.Series([np.nan] * len(idxs), index=idxs),
+            errors="coerce",
+        )
+        funded_vals = pd.to_numeric(
+            out.loc[idxs, "SF Funded Amount"] if "SF Funded Amount" in out.columns else pd.Series([np.nan] * len(idxs), index=idxs),
+            errors="coerce",
+        )
+        upb_vals = pd.to_numeric(out.loc[idxs, upb_col], errors="coerce")
+        prev_vals = pd.to_numeric(
+            out.loc[idxs, "_prev_asset_upb"] if "_prev_asset_upb" in out.columns else pd.Series([np.nan] * len(idxs), index=idxs),
+            errors="coerce",
+        )
+
+        commitment = float(commitment_vals[commitment_vals.gt(0)].max()) if bool(commitment_vals.gt(0).any()) else np.nan
+        funded_sum = float(funded_vals.fillna(0.0).sum())
+        upb_sum = float(upb_vals.fillna(0.0).sum())
+        prev_sum = float(prev_vals.fillna(0.0).sum())
+
+        basis_values = [x for x in [commitment, funded_sum] if pd.notna(x) and float(x) > 0]
+        if not basis_values or upb_sum <= 0:
+            continue
+        limit_base = max(float(x) for x in basis_values)
+        tol = max(BRIDGE_OVER_COMMITMENT_WARN_TOLERANCE_DOLLARS, abs(limit_base) * BRIDGE_OVER_COMMITMENT_WARN_RATIO)
+        if upb_sum <= limit_base * BRIDGE_UPB_COMMITMENT_RATIO_LIMIT + tol:
+            continue
+
+        stage_exception = False
+        if "Loan Stage" in out.columns:
+            stage_exception = bool(_bridge_stage_exception_mask(out.loc[idxs, "Loan Stage"]).any())
+
+        candidates: List[Tuple[str, float]] = []
+        # Do not repair UPB to funded amount. Funded amount is only an allocation
+        # weight/source for Active Funded Amount, not a UPB substitute. Only use a
+        # prior completed-report UPB when it is plausible; otherwise leave the row
+        # visible for review.
+        if prev_sum > 0 and prev_sum <= limit_base * BRIDGE_UPB_COMMITMENT_RATIO_LIMIT + tol:
+            candidates.append(("prior asset UPB rollup", prev_sum))
+
+        if candidates:
+            source_label, target_amount = candidates[0]
+            _allocate_group_amount_by_weights(out, idxs, upb_col, float(target_amount), "SF Funded Amount")
+            repaired_count += 1
+            if repaired_count <= 20:
+                display_deal = clean_text(out.loc[idxs[0], "Deal Number"] if "Deal Number" in out.columns else deal_key)
+                diagnostics.append(
+                    f"Bridge Asset UPB repair: deal {display_deal} had asset UPB rollup {upb_sum:,.2f} versus same-deal basis {limit_base:,.2f}; replaced with {source_label} {float(target_amount):,.2f}."
+                )
+        else:
+            unresolved_count += 1
+            if unresolved_count <= 20:
+                display_deal = clean_text(out.loc[idxs[0], "Deal Number"] if "Deal Number" in out.columns else deal_key)
+                diagnostics.append(
+                    f"Bridge Asset UPB review: deal {display_deal} has asset UPB rollup {upb_sum:,.2f} above same-deal basis {limit_base:,.2f}, but no safer funded/prior source was available; value was left unchanged."
+                )
+
+    after_total = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0).sum()
+    if repaired_count or unresolved_count:
+        diagnostics.insert(
+            0,
+            f"Bridge Asset UPB repair summary: repaired {repaired_count:,} deal(s), left {unresolved_count:,} deal(s) for review; total UPB changed by {after_total - before_total:,.2f}.",
+        )
+    return downcast_numeric_frame(out), diagnostics
+
+
+def _choose_bridge_loan_upb(out: pd.DataFrame, upb_col: str, asset_rollup_col: Optional[str] = None) -> pd.Series:
+    idx = out.index
+    commitment = pd.to_numeric(out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=idx)), errors="coerce")
+    funded = pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=idx)), errors="coerce")
+    stage_exception = _bridge_stage_exception_mask(out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=idx)))
+
+    # Bridge Loan UPB should tie to the already-built Bridge Asset rows. Treat the
+    # asset rollup as authoritative when present, then use same-deal fallbacks only
+    # for rows that did not receive an asset rollup.
+    authoritative_rollup = None
+    if asset_rollup_col and asset_rollup_col in out.columns:
+        authoritative_rollup = pd.to_numeric(out[asset_rollup_col], errors="coerce")
+
+    candidates: List[Tuple[str, pd.Series]] = []
+    for label, col in [
+        ("loan servicer UPB", "_loan_upb"),
+        ("current Bridge Loan UPB", upb_col),
+        ("SF current UPB", "SF Current UPB"),
+        ("active asset UPB", "Active Asset UPB"),
+        ("prior workbook UPB", "_prev_upb"),
+        ("funded amount", "Active Funded Amount"),
+    ]:
+        if col in out.columns:
+            candidates.append((label, pd.to_numeric(out[col], errors="coerce")))
+
+    chosen = pd.Series([np.nan] * len(out), index=idx, dtype="float64")
+    if authoritative_rollup is not None:
+        chosen.loc[authoritative_rollup.notna()] = authoritative_rollup.loc[authoritative_rollup.notna()]
+    for _label, values in candidates:
+        values = pd.to_numeric(pd.Series(values, index=idx), errors="coerce")
+        plausible = _bridge_value_plausible_for_upb(values, commitment, funded)
+        fill_mask = chosen.isna() & plausible
+        chosen.loc[fill_mask] = values.loc[fill_mask]
+
+    # Exception stages stay visible. If no candidate passes the active-loan plausibility test, keep the first
+    # positive same-deal value rather than blanking the row. The diagnostics will surface it for review.
+    if bool(stage_exception.any()):
+        for _label, values in candidates:
+            values = pd.to_numeric(pd.Series(values, index=idx), errors="coerce")
+            fill_mask = chosen.isna() & stage_exception & values.gt(0)
+            chosen.loc[fill_mask] = values.loc[fill_mask]
+
+    # Last-resort same-deal presentation fallback. Prefer funded amount; only use commitment when there is no
+    # funded amount. This avoids publishing a contaminated servicer/property value while avoiding a blank UPB.
+    funded_fallback = funded.where(funded.gt(0))
+    fill_mask = chosen.isna() & funded_fallback.notna()
+    chosen.loc[fill_mask] = funded_fallback.loc[fill_mask]
+    commitment_fallback = commitment.where(commitment.gt(0))
+    fill_mask = chosen.isna() & commitment_fallback.notna()
+    chosen.loc[fill_mask] = commitment_fallback.loc[fill_mask]
+
+    return pd.to_numeric(chosen, errors="coerce")
+
+
+def _repair_bridge_loan_commitment_math(bridge_loan: pd.DataFrame, upb_col: str) -> Tuple[pd.DataFrame, List[str]]:
+    if bridge_loan is None or bridge_loan.empty:
+        return (pd.DataFrame() if bridge_loan is None else bridge_loan.copy()), []
+    out = bridge_loan.copy()
+    diagnostics: List[str] = []
+    idx = out.index
+    commitment = pd.to_numeric(out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=idx)), errors="coerce")
+    stage_exception = _bridge_stage_exception_mask(out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=idx)))
+
+    if "Active Funded Amount" in out.columns:
+        funded = pd.to_numeric(out["Active Funded Amount"], errors="coerce")
+        tol = _bridge_material_tolerance(commitment)
+        material_over = commitment.gt(0) & funded.gt(commitment + tol) & (~stage_exception)
+        if bool(material_over.any()):
+            diagnostics.append(
+                f"Bridge Loan review: Active Funded Amount exceeds Loan Commitment for {int(material_over.sum()):,} non-exception active deal(s). The amount was not capped; Remaining Commitment was preserved from Salesforce/template."
+            )
+
+        # Remaining Commitment is a source/template field in the active-loan report.
+        # Do not recompute it as commitment minus funded amount, because that caused
+        # mismatches on the completed 4/27 report and can overwrite business-approved
+        # remaining-facility values.
+        if "Remaining Commitment" not in out.columns:
+            out["Remaining Commitment"] = np.nan
+
+    if upb_col in out.columns:
+        before = pd.to_numeric(out[upb_col], errors="coerce")
+        chosen = _choose_bridge_loan_upb(out, upb_col, asset_rollup_col=None)
+        changed = before.fillna(-999999999.12345).round(2).ne(chosen.fillna(-999999999.12345).round(2)) & chosen.notna()
+        if bool(changed.any()):
+            diagnostics.append(
+                f"Bridge Loan repair: replaced implausible/missing UPB for {int(changed.sum()):,} deal(s) using same-deal asset, servicer, Salesforce, prior, or funded-source rules."
+            )
+            out.loc[changed, upb_col] = chosen.loc[changed]
+
+    return downcast_numeric_frame(out), diagnostics
+
+
+def _reconcile_bridge_loan_from_asset_rollup(bridge_loan: pd.DataFrame, bridge_asset: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    if bridge_loan is None or bridge_loan.empty:
+        return pd.DataFrame() if bridge_loan is None else bridge_loan.copy()
+    out = _ensure_deal_key(bridge_loan, "Deal Number")
+    roll = _rollup_bridge_asset_math(bridge_asset, upb_col)
+    if roll.empty:
+        out, _diags = _repair_bridge_loan_commitment_math(out, upb_col)
+        return out
+
+    out = out.merge(roll, on="_deal_key", how="left", suffixes=("", "_asset_rollup"))
+    critical_rollup_cols = [
+        "Active Funded Amount",
+        "Initial Disbursement Funded",
+        "Renovation Holdback",
+        "Renovation HB Funded",
+        "Renovation HB Remaining",
+        "Interest Allocation",
+        "Interest Allocation Funded",
+        "Suspense Balance",
+    ]
+    for col in critical_rollup_cols:
+        src = f"{col}_asset_rollup"
+        if src not in out.columns:
+            continue
+        if col not in out.columns:
+            out[col] = np.nan
+        src_num = pd.to_numeric(out[src], errors="coerce")
+        cur_num = pd.to_numeric(out[col], errors="coerce")
+        out[col] = cur_num.where(src_num.isna(), src_num)
+        out = out.drop(columns=[src], errors="ignore")
+
+    upb_roll_col = f"{upb_col}_asset_rollup"
+    if upb_roll_col in out.columns:
+        out[upb_col] = _choose_bridge_loan_upb(out, upb_col, asset_rollup_col=upb_roll_col)
+        out = out.drop(columns=[upb_roll_col], errors="ignore")
+
+    for col in ["Most Recent As-Is Value", "Most Recent ARV"]:
+        src = f"{col}_asset_rollup"
+        if src in out.columns:
+            cur_num = pd.to_numeric(out.get(col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+            src_num = pd.to_numeric(out[src], errors="coerce")
+            out[col] = cur_num.where(cur_num.notna(), src_num)
+            out = out.drop(columns=[src], errors="ignore")
+
+    out, _diags = _repair_bridge_loan_commitment_math(out, upb_col)
+    return downcast_numeric_frame(out)
+
+def _prev_sid_to_deal_map(prev_maps: Optional[dict]) -> Dict[str, str]:
+    if not prev_maps or "term_loan_sid" not in prev_maps:
+        return {}
+    prev_sid = prev_maps.get("term_loan_sid")
+    if not isinstance(prev_sid, pd.DataFrame) or prev_sid.empty or not {"_sid_key", "_deal_key"}.issubset(prev_sid.columns):
+        return {}
+    tmp = prev_sid.dropna(subset=["_sid_key", "_deal_key"]).copy()
+    tmp["_sid_key"] = tmp["_sid_key"].astype("string").str.strip()
+    tmp["_deal_key"] = tmp["_deal_key"].astype("string").str.strip()
+    tmp = tmp[(tmp["_sid_key"] != "") & (tmp["_deal_key"] != "")]
+    return tmp.drop_duplicates("_sid_key", keep="last").set_index("_sid_key")["_deal_key"].to_dict()
+
+
+def _guard_term_loan_upb_vs_amount(df: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
+    if df is None or df.empty or upb_col not in df.columns or "Loan Amount" not in df.columns:
+        return pd.DataFrame() if df is None else df.copy()
+    out = _ensure_deal_key(df, "Deal Number")
+    loan_amount = pd.to_numeric(out["Loan Amount"], errors="coerce")
+    upb = pd.to_numeric(out[upb_col], errors="coerce")
+    implausible = loan_amount.gt(0) & upb.gt(loan_amount * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT)
+
+    if bool(implausible.any()) and prev_maps and "term_loan_upb" in prev_maps:
+        prev = prev_maps["term_loan_upb"]
+        if isinstance(prev, pd.DataFrame) and not prev.empty and {"_deal_key", "_prev_upb"}.issubset(prev.columns):
+            prev_map = prev.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key").set_index("_deal_key")["_prev_upb"]
+            prev_upb = pd.to_numeric(out["_deal_key"].map(prev_map), errors="coerce")
+            plausible_prev = prev_upb.gt(0) & loan_amount.gt(0) & prev_upb.le(loan_amount * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT)
+            out.loc[implausible & plausible_prev, upb_col] = prev_upb.loc[implausible & plausible_prev]
+            upb = pd.to_numeric(out[upb_col], errors="coerce")
+            implausible = loan_amount.gt(0) & upb.gt(loan_amount * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT)
+
+    if bool(implausible.any()):
+        # Keep the current value instead of blanking the row. A blank Term Loan UPB creates
+        # blank Term Asset UPB for every asset on the deal. Implausible balances are still
+        # surfaced by validate_term_loan_amounts_or_raise / QA diagnostics.
+        pass
+    return downcast_numeric_frame(out)
+
+
+def _clear_duplicate_term_servicer_assignments(df: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
+    if df is None or df.empty or "Servicer ID" not in df.columns:
+        return pd.DataFrame() if df is None else df.copy()
+    out = _ensure_deal_key(df, "Deal Number")
+    # Duplicate-looking servicer IDs should not be cleared automatically. Clearing them
+    # caused blank UPB to cascade from Term Loan into Term Asset. Keep values in the
+    # report and rely on QA diagnostics for duplicate review instead of blanking balances.
+    return downcast_numeric_frame(out)
+
+def _allocate_term_asset_upb_from_loan(term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    if term_asset is None or term_asset.empty:
+        return pd.DataFrame() if term_asset is None else term_asset.copy()
+    if term_loan is None or term_loan.empty or upb_col not in term_loan.columns:
+        return term_asset.copy()
+
+    out = _ensure_deal_key(term_asset, "Deal Number")
+    if "_asset_key" not in out.columns:
+        out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out), index=out.index)))
+
+    tl = _ensure_deal_key(term_loan, "Deal Number")
+    tl_upb = tl[["_deal_key", upb_col]].dropna(subset=["_deal_key"]).drop_duplicates("_deal_key", keep="last")
+    tl_upb = tl_upb.rename(columns={upb_col: "_loan_upb_for_alloc"})
+
+    out = out.drop(columns=[upb_col, "_loan_upb_for_alloc"], errors="ignore")
+    out = out.merge(tl_upb, on="_deal_key", how="left")
+
+    loan_upb = pd.to_numeric(out["_loan_upb_for_alloc"], errors="coerce")
+    ala = pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
+    positive_ala = ala.where(ala.gt(0), 0.0)
+    ala_sum = positive_ala.groupby(out["_deal_key"]).transform("sum")
+    asset_count = out.groupby("_deal_key")["_asset_key"].transform("count").replace({0: np.nan})
+
+    alloc = pd.Series([np.nan] * len(out), index=out.index, dtype="float64")
+    ala_mask = loan_upb.notna() & ala_sum.gt(0)
+    alloc.loc[ala_mask] = loan_upb.loc[ala_mask] * (positive_ala.loc[ala_mask] / ala_sum.loc[ala_mask])
+    equal_mask = loan_upb.notna() & (~ala_sum.gt(0)) & asset_count.gt(0)
+    alloc.loc[equal_mask] = loan_upb.loc[equal_mask] / asset_count.loc[equal_mask]
+    out[upb_col] = alloc
+
+    # Correct rounding drift so each deal's Term Asset UPB exactly ties to Term Loan UPB before workbook rounding.
+    for deal, idxs in out.groupby("_deal_key", dropna=True).groups.items():
+        idxs = list(idxs)
+        loan_vals = pd.to_numeric(out.loc[idxs, "_loan_upb_for_alloc"], errors="coerce").dropna()
+        if loan_vals.empty:
+            continue
+        loan_val = float(loan_vals.iloc[0])
+        cur_vals = pd.to_numeric(out.loc[idxs, upb_col], errors="coerce").fillna(0.0)
+        if cur_vals.empty:
+            continue
+        diff = loan_val - float(cur_vals.sum())
+        nonblank_alloc = cur_vals[cur_vals.ne(0)].index.tolist() or idxs
+        adjust_idx = nonblank_alloc[-1]
+        current_adjust_val = pd.to_numeric(pd.Series([out.loc[adjust_idx, upb_col]]), errors="coerce").iloc[0]
+        if pd.isna(current_adjust_val):
+            current_adjust_val = 0.0
+        out.loc[adjust_idx, upb_col] = float(current_adjust_val) + diff
+
+    out = out.drop(columns=["_loan_upb_for_alloc"], errors="ignore")
+    return downcast_numeric_frame(out)
+
+
+
+def _math_issue_message(title: str, examples: pd.DataFrame, max_rows: int = 12) -> str:
+    shown = examples.head(max_rows).copy()
+    try:
+        rendered = shown.to_string(index=False)
+    except Exception:
+        rendered = str(shown.head(max_rows).to_dict("records"))
+    return f"{title}\n\nFirst {min(len(shown), max_rows)} example(s):\n{rendered}"
+
+
+def _math_issues_to_diagnostics(prefix: str, issues: List[Tuple[str, pd.DataFrame]]) -> List[str]:
+    if not issues:
+        return []
+    detail = "\n\n".join(_math_issue_message(title, df) for title, df in issues)
+    if STRICT_MATH_HARD_STOP:
+        raise RuntimeError(f"{prefix}\n\n" + detail)
+    lines = [f"{prefix} The workbook was allowed to continue; review/fix source data or QA examples below."]
+    for title, df in issues:
+        lines.append(_math_issue_message(title, df, max_rows=5))
+    return lines
+
+
+def validate_bridge_math_or_raise(bridge_asset: pd.DataFrame, bridge_loan: Optional[pd.DataFrame], upb_col: str) -> List[str]:
+    issues: List[Tuple[str, pd.DataFrame]] = []
+    if bridge_asset is not None and not bridge_asset.empty:
+        ba = _recompute_bridge_asset_funded_amount(bridge_asset)
+        if "SF Funded Amount" in ba.columns:
+            expected = _bridge_component_funded_sum(ba)
+            actual = pd.to_numeric(ba["SF Funded Amount"], errors="coerce")
+            diff = (actual.fillna(0.0) - expected.fillna(0.0)).abs()
+            mask = diff.gt(MATH_TOLERANCE_DOLLARS)
+            if bool(mask.any()):
+                cols = [c for c in ["Deal Number", "Asset ID", "SF Funded Amount", "Initial Disbursement Funded", "Renovation Holdback Funded", "Interest Allocation Funded"] if c in ba.columns]
+                ex = ba.loc[mask, cols].copy()
+                ex["expected_component_sum"] = expected.loc[mask]
+                ex["difference"] = actual.loc[mask] - expected.loc[mask]
+                issues.append(("Bridge Asset SF Funded Amount does not equal funded components.", ex))
+
+    if bridge_loan is not None and not bridge_loan.empty and bridge_asset is not None and not bridge_asset.empty:
+        bl = _ensure_deal_key(bridge_loan, "Deal Number")
+        roll = _rollup_bridge_asset_math(bridge_asset, upb_col)
+        if not roll.empty:
+            check = bl.merge(roll[[c for c in ["_deal_key", "Active Funded Amount", upb_col] if c in roll.columns]], on="_deal_key", how="left", suffixes=("", "_asset_rollup"))
+            if "Active Funded Amount_asset_rollup" in check.columns:
+                actual = pd.to_numeric(check.get("Active Funded Amount"), errors="coerce")
+                expected = pd.to_numeric(check.get("Active Funded Amount_asset_rollup"), errors="coerce")
+                diff = actual.fillna(0.0) - expected.fillna(0.0)
+                commitment = pd.to_numeric(check.get("Loan Commitment", pd.Series([np.nan] * len(check), index=check.index)), errors="coerce")
+                stage_exception = _bridge_stage_exception_mask(check.get("Loan Stage", pd.Series([pd.NA] * len(check), index=check.index)))
+                material_tol = _bridge_material_tolerance(commitment)
+                mask = expected.notna() & diff.abs().gt(material_tol) & (~stage_exception)
+                if bool(mask.any()):
+                    ex = check.loc[mask, [c for c in ["Deal Number", "Loan Commitment", "Active Funded Amount", "Active Funded Amount_asset_rollup"] if c in check.columns]].copy()
+                    ex["difference"] = diff.loc[mask]
+                    issues.append(("Bridge Loan Active Funded Amount materially differs from Bridge Asset funded rollup.", ex))
+            upb_roll_col = f"{upb_col}_asset_rollup"
+            if upb_roll_col in check.columns and upb_col in check.columns:
+                actual = pd.to_numeric(check[upb_col], errors="coerce")
+                expected = pd.to_numeric(check[upb_roll_col], errors="coerce")
+                diff = actual.fillna(0.0) - expected.fillna(0.0)
+                commitment = pd.to_numeric(check.get("Loan Commitment", pd.Series([np.nan] * len(check), index=check.index)), errors="coerce")
+                funded = pd.to_numeric(check.get("Active Funded Amount", pd.Series([np.nan] * len(check), index=check.index)), errors="coerce")
+                plausible_expected = _bridge_value_plausible_for_upb(expected, commitment, funded)
+                mask = expected.notna() & plausible_expected & diff.abs().gt(_bridge_material_tolerance(_bridge_limit_base(commitment, funded)))
+                if bool(mask.any()):
+                    ex = check.loc[mask, [c for c in ["Deal Number", upb_col, upb_roll_col] if c in check.columns]].copy()
+                    ex["difference"] = diff.loc[mask]
+                    issues.append(("Bridge Loan UPB differs from plausible Bridge Asset UPB rollup.", ex))
+
+        if {"Loan Commitment", "Active Funded Amount"}.issubset(bl.columns):
+            commitment = pd.to_numeric(bl["Loan Commitment"], errors="coerce")
+            funded = pd.to_numeric(bl["Active Funded Amount"], errors="coerce")
+            tol = _bridge_material_tolerance(commitment)
+            stage_exception = _bridge_stage_exception_mask(bl.get("Loan Stage", pd.Series([pd.NA] * len(bl), index=bl.index)))
+            mask = commitment.gt(0) & funded.gt(commitment + tol) & (~stage_exception)
+            if bool(mask.any()):
+                ex = bl.loc[mask, [c for c in ["Deal Number", "Loan Stage", "Loan Commitment", "Active Funded Amount"] if c in bl.columns]].copy()
+                ex["over_by"] = funded.loc[mask] - commitment.loc[mask]
+                issues.append(("Bridge Loan Active Funded Amount materially exceeds Loan Commitment for non-exception active loans.", ex))
+        if {"Loan Commitment", upb_col}.issubset(bl.columns):
+            commitment = pd.to_numeric(bl["Loan Commitment"], errors="coerce")
+            upb = pd.to_numeric(bl[upb_col], errors="coerce")
+            funded = pd.to_numeric(bl.get("Active Funded Amount", pd.Series([np.nan] * len(bl), index=bl.index)), errors="coerce")
+            base = _bridge_limit_base(commitment, funded)
+            tol = _bridge_material_tolerance(base)
+            stage_exception = _bridge_stage_exception_mask(bl.get("Loan Stage", pd.Series([pd.NA] * len(bl), index=bl.index)))
+            mask = base.gt(0) & upb.gt(base * BRIDGE_UPB_COMMITMENT_RATIO_LIMIT + tol) & (~stage_exception)
+            if bool(mask.any()):
+                ex = bl.loc[mask, [c for c in ["Deal Number", "Loan Stage", "Loan Commitment", upb_col] if c in bl.columns]].copy()
+                ex["over_ratio"] = upb.loc[mask] / commitment.loc[mask]
+                issues.append(("Bridge Loan UPB remains implausibly above Loan Commitment after repair.", ex))
+
+    return _math_issues_to_diagnostics("Bridge math validation found review items.", issues)
+
+
+def validate_term_loan_amounts_or_raise(term_loan: pd.DataFrame, upb_col: str) -> List[str]:
+    if term_loan is None or term_loan.empty or upb_col not in term_loan.columns or "Loan Amount" not in term_loan.columns:
+        return []
+    tl = _ensure_deal_key(term_loan, "Deal Number")
+    loan_amount = pd.to_numeric(tl["Loan Amount"], errors="coerce")
+    upb = pd.to_numeric(tl[upb_col], errors="coerce")
+    mask = loan_amount.gt(0) & upb.gt(loan_amount * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT)
+    issues: List[Tuple[str, pd.DataFrame]] = []
+    if bool(mask.any()):
+        ex = tl.loc[mask, [c for c in ["Deal Number", "Servicer ID", "Servicer", "Loan Amount", upb_col] if c in tl.columns]].copy()
+        ex["over_ratio"] = upb.loc[mask] / loan_amount.loc[mask]
+        issues.append(("Term Loan UPB remains implausibly above Loan Amount after repair.", ex))
+    return _math_issues_to_diagnostics("Term Loan amount validation found review items.", issues)
+
+
+def validate_term_math_or_raise(term_loan: pd.DataFrame, term_asset: pd.DataFrame, upb_col: str) -> List[str]:
+    diagnostics = validate_term_loan_amounts_or_raise(term_loan, upb_col)
+    if term_loan is None or term_loan.empty or term_asset is None or term_asset.empty or upb_col not in term_loan.columns or upb_col not in term_asset.columns:
+        return diagnostics
+    tl = _ensure_deal_key(term_loan, "Deal Number")
+    ta = _ensure_deal_key(term_asset, "Deal Number")
+    asset_roll = ta.groupby("_deal_key", dropna=True)[upb_col].sum(min_count=1).reset_index().rename(columns={upb_col: "Term Asset UPB Rollup"})
+    check = tl.merge(asset_roll, on="_deal_key", how="left")
+    loan_upb = pd.to_numeric(check[upb_col], errors="coerce")
+    asset_upb = pd.to_numeric(check["Term Asset UPB Rollup"], errors="coerce")
+    diff = loan_upb.fillna(0.0) - asset_upb.fillna(0.0)
+    mask = loan_upb.notna() & asset_upb.notna() & diff.abs().gt(MATH_TOLERANCE_DOLLARS)
+    issues: List[Tuple[str, pd.DataFrame]] = []
+    if bool(mask.any()):
+        ex = check.loc[mask, [c for c in ["Deal Number", "Servicer ID", "Loan Amount", upb_col, "Term Asset UPB Rollup"] if c in check.columns]].copy()
+        ex["difference"] = diff.loc[mask]
+        issues.append(("Term Loan UPB does not equal Term Asset UPB rollup.", ex))
+    diagnostics.extend(_math_issues_to_diagnostics("Term math validation found review items.", issues))
+    return diagnostics
 
 def build_bridge_asset(
     sf_spine: pd.DataFrame,
@@ -4036,12 +4951,25 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
+        bridge_asset_carry_forward_first = {
+            "Portfolio", "Segment", "Strategy Grouping", "REO Date", "Active RM",
+            "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
+            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+            "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
+            "Maturity Status", "Title Company", "Most Recent Appraisal Order Date",
+            "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        }
         for c in [x for x in keep_cols if x != "_asset_key"]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
+                if c in bridge_asset_carry_forward_first:
+                    out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
+                else:
+                    out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
     status_bucket = pd.Series(
@@ -4181,9 +5109,18 @@ def _build_term_loan_salesforce_fallback(
             "Active RM",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_deal_key", how="left", suffixes=("", "_prev"))
+        term_loan_carry_forward_first = {
+            "Portfolio", "Segment", "Financing", "CPP JV", "Loan Buyer",
+            "Asset Manager", "Active RM", "Deal Intro Sub-Source",
+            "Referral Source Account", "Referral Source Contact", "AM Commentary",
+            "Special Loans List (Y/N)",
+        }
         for c in [x for x in keep_cols if x != "_deal_key"]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
+                if c in term_loan_carry_forward_first:
+                    out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
+                else:
+                    out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
@@ -4201,7 +5138,7 @@ def _build_term_loan_salesforce_fallback(
         out["Asset Manager"] = out.get("Asset Manager", blank_obj)
 
     base_sf_servicer = pd.Series(out.get("Servicer", blank_obj), index=out.index, dtype="object")
-    match_df = _select_term_servicer_matches(sf_term, serv_lookup, base_sf_servicer)
+    match_df = _select_term_servicer_matches(sf_term, serv_lookup, base_sf_servicer, prev_maps=prev_maps)
     out["Servicer ID"] = coalesce_keep_nonblank(match_df["selected_servicer_id"], out.get("Servicer ID", blank_obj))
 
     sf_upb_fallback = pd.to_numeric(
@@ -4210,18 +5147,17 @@ def _build_term_loan_salesforce_fallback(
     )
 
     out["Servicer"] = coalesce_keep_nonblank(match_df["matched_servicer"], out["Servicer"])
-    out["Maturity Date"] = pd.to_datetime(match_df["matched_maturity_date"], errors="coerce").where(
-        pd.to_datetime(match_df["matched_maturity_date"], errors="coerce").notna(),
-        pd.to_datetime(out["Maturity Date"], errors="coerce"),
-    )
-    out["Next Payment Date"] = pd.to_datetime(match_df["matched_next_payment_date"], errors="coerce").where(
-        pd.to_datetime(match_df["matched_next_payment_date"], errors="coerce").notna(),
-        pd.to_datetime(out["Next Payment Date"], errors="coerce"),
-    )
+    matched_mat = pd.to_datetime(match_df["matched_maturity_date"], errors="coerce")
+    cur_mat = pd.to_datetime(out["Maturity Date"], errors="coerce")
+    out["Maturity Date"] = cur_mat.where(cur_mat.notna(), matched_mat)
+    matched_npd = pd.to_datetime(match_df["matched_next_payment_date"], errors="coerce")
+    cur_npd = pd.to_datetime(out["Next Payment Date"], errors="coerce")
+    out["Next Payment Date"] = cur_npd.where(cur_npd.notna(), matched_npd)
     out[upb_col] = pd.to_numeric(match_df["matched_upb"], errors="coerce").where(
         pd.to_numeric(match_df["matched_upb"], errors="coerce").notna(),
         sf_upb_fallback,
     )
+    out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
 
     if "term_loan_manual" in prev_maps and "Servicer ID" in prev_maps["term_loan_manual"].columns:
         prev_sid = prev_maps["term_loan_manual"][["_deal_key", "Servicer ID"]].copy()
@@ -4250,6 +5186,8 @@ def _build_term_loan_salesforce_fallback(
         fill_val = prev_upb.fillna(0.0)
         out[upb_col] = np.where(reo_mask & ((cur_upb.isna()) | (cur_upb <= 0)), fill_val, cur_upb)
         out = out.drop(columns=["_prev_upb"], errors="ignore")
+
+    out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
 
     raw_stage_series = pd.Series(sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).values, index=out.index)
     raw_current_upb = pd.Series(sf_term.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)).values, index=out.index)
@@ -4412,6 +5350,12 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
             prev_sid_match = prev_sid_present & deal_key_present & key_df["_deal_key"].eq(prev_deal)
             key_df["_prev_sid_present"] = prev_sid_present.astype("int8")
             key_df["_prev_sid_match"] = prev_sid_match.astype("int8")
+            # Prior completed reports are useful hints, but not hard blockers. Do not drop
+            # current Salesforce key rows solely because the prior workbook mapped the same
+            # servicer ID differently; service transfers and corrected SF IDs can make that stale.
+
+    if key_df.empty:
+        return pd.DataFrame()
 
     key_df = key_df.sort_values(
         [
@@ -4471,9 +5415,19 @@ def build_term_loan(
 
     sf_sid = _build_term_sf_sid_lookup(sf_term_active, prev_maps=prev_maps)
     if not sf_sid.empty:
-        sf_keep = [c for c in ["_sid_key", "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name", "Do Not Lend", "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "Comments AM", "Sold Loan: Sold To", "Sold Loan: Servicing Status", "Type", "Servicer Name", "Stage", "Current Servicer UPB", "Original Loan Maturity Date", "Next Payment Date"] if c in sf_sid.columns]
+        sf_keep = [c for c in ["_sid_key", "_deal_key", "Deal Loan Number", "Yardi ID", "Deal Name", "Borrower Entity", "Account Name", "Do Not Lend", "Current Funding Vehicle", "Loan Amount", "Close Date", "CAF Originator", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "Comments AM", "Sold Loan: Sold To", "Sold Loan: Servicing Status", "Type", "Servicer Name", "Stage", "Current Servicer UPB", "Original Loan Maturity Date", "Next Payment Date"] if c in sf_sid.columns]
         sf_pick = sf_sid[sf_keep].drop_duplicates("_sid_key")
         out = out.merge(sf_pick, on="_sid_key", how="left", suffixes=("", "_sid"))
+
+        sid_detail_deal = norm_id_series(
+            out.get("Deal Loan Number_sid", out.get("_deal_key_sid", pd.Series([pd.NA] * len(out), index=out.index)))
+        )
+        current_deal = norm_id_series(out.get("Deal Number", pd.Series([pd.NA] * len(out), index=out.index)))
+        sid_same_deal = sid_detail_deal.isna() | current_deal.eq(sid_detail_deal)
+
+        def _sid_source(source_col: str) -> pd.Series:
+            return pd.Series(out[source_col], index=out.index, dtype="object").where(sid_same_deal, pd.NA)
+
         map_pairs = {
             "Deal Number": "Deal Loan Number_sid",
             "SF Yardi ID": "Yardi ID_sid",
@@ -4492,34 +5446,49 @@ def build_term_loan(
         }
         for target, source in map_pairs.items():
             if source in out.columns:
+                safe_source = _sid_source(source)
                 if target == "Do Not Lend (Y/N)":
-                    out[target] = coalesce_keep_nonblank(out.get(target, blank_obj), _yn_from_bool_series(out[source]))
+                    out[target] = coalesce_keep_nonblank(out.get(target, blank_obj), _yn_from_bool_series(safe_source))
                 else:
-                    out[target] = coalesce_keep_nonblank(out.get(target, blank_obj), out[source])
+                    out[target] = coalesce_keep_nonblank(out.get(target, blank_obj), safe_source)
         if "Loan Amount_sid" in out.columns:
-            out["Loan Amount"] = pd.to_numeric(out.get("Loan Amount", pd.Series([np.nan]*len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get("Loan Amount", pd.Series([np.nan]*len(out), index=out.index)), errors="coerce").notna(), pd.to_numeric(out["Loan Amount_sid"], errors="coerce"))
+            cur_amt = pd.to_numeric(out.get("Loan Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+            src_amt = pd.to_numeric(pd.Series(out["Loan Amount_sid"], index=out.index).where(sid_same_deal), errors="coerce")
+            out["Loan Amount"] = cur_amt.where(cur_amt.notna(), src_amt)
         if "Close Date_sid" in out.columns:
-            out["Origination Date"] = pd.to_datetime(out.get("Origination Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Origination Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out["Close Date_sid"], errors="coerce"))
+            cur_dt = pd.to_datetime(out.get("Origination Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+            src_dt = pd.to_datetime(pd.Series(out["Close Date_sid"], index=out.index).where(sid_same_deal), errors="coerce")
+            out["Origination Date"] = cur_dt.where(cur_dt.notna(), src_dt)
         if "Original Loan Maturity Date_sid" in out.columns:
-            out["Maturity Date"] = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out["Original Loan Maturity Date_sid"], errors="coerce"))
+            cur_dt = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+            src_dt = pd.to_datetime(pd.Series(out["Original Loan Maturity Date_sid"], index=out.index).where(sid_same_deal), errors="coerce")
+            out["Maturity Date"] = cur_dt.where(cur_dt.notna(), src_dt)
         if "Next Payment Date_sid" in out.columns:
-            out["Next Payment Date"] = pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").where(pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce").notna(), pd.to_datetime(out["Next Payment Date_sid"], errors="coerce"))
+            cur_dt = pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+            src_dt = pd.to_datetime(pd.Series(out["Next Payment Date_sid"], index=out.index).where(sid_same_deal), errors="coerce")
+            out["Next Payment Date"] = cur_dt.where(cur_dt.notna(), src_dt)
         if "Current Servicer UPB_sid" in out.columns:
-            out[upb_col] = pd.to_numeric(out.get(upb_col, pd.Series([np.nan]*len(out), index=out.index)), errors="coerce").where(pd.to_numeric(out.get(upb_col, pd.Series([np.nan]*len(out), index=out.index)), errors="coerce").gt(0), pd.to_numeric(out["Current Servicer UPB_sid"], errors="coerce"))
+            cur_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+            src_upb = pd.to_numeric(pd.Series(out["Current Servicer UPB_sid"], index=out.index).where(sid_same_deal), errors="coerce")
+            out[upb_col] = cur_upb.where(cur_upb.gt(0), src_upb)
+        out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
 
     if serv_lookup is not None and not serv_lookup.empty and "_sid_key" in serv_lookup.columns:
         s = serv_lookup.dropna(subset=["_sid_key"]).copy().rename(columns={"servicer": "_servicer_file", "upb": "_loan_upb", "next_payment_date": "_serv_next_payment_date", "maturity_date": "_serv_maturity_file", "status": "_serv_status_file"})
         out = out.merge(s[["_sid_key", "_servicer_file", "_loan_upb", "_serv_next_payment_date", "_serv_maturity_file", "_serv_status_file"]], on="_sid_key", how="left")
         out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
-        file_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan]*len(out), index=out.index)), errors="coerce")
-        existing_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan]*len(out), index=out.index)), errors="coerce")
-        out[upb_col] = file_upb.where(file_upb.notna() & file_upb.gt(0), existing_upb)
-        serv_npd = pd.to_datetime(out.get("_serv_next_payment_date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce")
-        cur_npd = pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce")
-        out["Next Payment Date"] = serv_npd.where(serv_npd.notna(), cur_npd)
-        serv_mat = pd.to_datetime(out.get("_serv_maturity_file", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce")
-        cur_mat = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT]*len(out), index=out.index)), errors="coerce")
-        out["Maturity Date"] = serv_mat.where(serv_mat.notna(), cur_mat)
+        file_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        cur_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        out[upb_col] = file_upb.where(file_upb.gt(0), cur_upb)
+
+        file_npd = pd.to_datetime(out.get("_serv_next_payment_date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+        cur_npd = pd.to_datetime(out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+        out["Next Payment Date"] = cur_npd.where(cur_npd.notna(), file_npd)
+
+        file_mat = pd.to_datetime(out.get("_serv_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+        cur_mat = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
+        out["Maturity Date"] = cur_mat.where(cur_mat.notna(), file_mat)
+        out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
 
     out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Do Not Lend (Y/N)"] = _yn_from_bool_series(out.get("Do Not Lend (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)))
@@ -4539,80 +5508,99 @@ def build_term_loan(
                 out = pd.concat([out, prev_force], ignore_index=True, copy=False)
 
     out = out[out["_deal_key"].notna()].copy()
+    out = _clear_duplicate_term_servicer_assignments(out, upb_col, prev_maps=prev_maps)
+    out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
-    out = pd.DataFrame(index=sf_term_asset.index)
+    """Build Term Asset like the completed report: carry-forward spine first.
 
-    for col, label in TERM_ASSET_FROM_TERM_ASSET_REPORT.items():
-        out[col] = sf_term_asset[label] if label in sf_term_asset.columns else pd.NA
+    The completed Active Loan Report does not rebuild Term Asset from the current
+    Property/Valuation pull. It keeps the prior completed Term Asset rows/static
+    values, filters them to the current Term Loan population, appends only brand-new
+    current SF assets, and then recalculates the current UPB allocation.
+    """
+    term_asset_cols = list(TERM_ASSET_FROM_TERM_ASSET_REPORT.keys()) + ["CPP JV", "Special (Y/N)"]
 
-    out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out))))
-    out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out))))
-    out["CPP JV"] = pd.NA
-    out["Special (Y/N)"] = _yn_from_bool_series(sf_term_asset.get("Property Special Asset", pd.Series([pd.NA] * len(out), index=out.index)))
+    tl = _ensure_deal_key(term_loan.copy(), "Deal Number") if term_loan is not None else pd.DataFrame()
+    valid_deals = set(tl.get("_deal_key", pd.Series(dtype="object")).dropna().astype(str).tolist())
 
-    tl = term_loan.copy()
-    tl["_deal_key"] = norm_id_series(tl.get("Deal Number", pd.Series([None] * len(tl))))
+    # Current Salesforce rows are a fallback/add-new source only.
+    current = pd.DataFrame(index=sf_term_asset.index if sf_term_asset is not None else None)
+    if sf_term_asset is not None and not sf_term_asset.empty:
+        for col, label in TERM_ASSET_FROM_TERM_ASSET_REPORT.items():
+            current[col] = sf_term_asset[label] if label in sf_term_asset.columns else pd.NA
+        current["_deal_key"] = norm_id_series(current.get("Deal Number", pd.Series([None] * len(current), index=current.index)))
+        current["_asset_key"] = norm_id_series(current.get("Asset ID", pd.Series([None] * len(current), index=current.index)))
+        current["CPP JV"] = pd.NA
+        current["Special (Y/N)"] = _yn_from_bool_series(
+            sf_term_asset.get("Property Special Asset", pd.Series([pd.NA] * len(current), index=current.index))
+        )
+        if valid_deals:
+            current = current[current["_deal_key"].isin(valid_deals) & current["_asset_key"].notna()].copy()
+        else:
+            current = current[current["_asset_key"].notna()].copy()
+    else:
+        current = pd.DataFrame(columns=term_asset_cols + ["_deal_key", "_asset_key"])
 
-    valid_deals = set(tl["_deal_key"].dropna().tolist())
-    out = out[out["_deal_key"].isin(valid_deals) & out["_asset_key"].notna()].copy()
+    out = pd.DataFrame(columns=term_asset_cols + ["_deal_key", "_asset_key"])
 
+    # Prior completed Term Asset rows are the primary spine/static source.
+    if prev_maps and "term_asset_manual" in prev_maps and isinstance(prev_maps["term_asset_manual"], pd.DataFrame):
+        prev = prev_maps["term_asset_manual"].copy()
+        if not prev.empty and {"_deal_key", "_asset_key"}.issubset(prev.columns):
+            if valid_deals:
+                prev = prev[prev["_deal_key"].astype(str).isin(valid_deals)].copy()
+            prev = prev[prev["_deal_key"].notna() & prev["_asset_key"].notna()].copy()
+            for col in term_asset_cols:
+                if col not in prev.columns:
+                    prev[col] = pd.NA
+            out = prev[term_asset_cols + ["_deal_key", "_asset_key"]].drop_duplicates(["_deal_key", "_asset_key"], keep="last").copy()
+
+    # Append only new SF assets that were not already in the carried-forward sheet.
+    if not current.empty:
+        if out.empty:
+            out = current[term_asset_cols + ["_deal_key", "_asset_key"]].copy()
+        else:
+            present_pairs = set(zip(out["_deal_key"].astype(str), out["_asset_key"].astype(str)))
+            missing_current = current[
+                ~current.apply(lambda r: (str(r["_deal_key"]), str(r["_asset_key"])) in present_pairs, axis=1)
+            ].copy()
+            if not missing_current.empty:
+                for col in term_asset_cols + ["_deal_key", "_asset_key"]:
+                    if col not in missing_current.columns:
+                        missing_current[col] = pd.NA
+                out = pd.concat([out, missing_current[term_asset_cols + ["_deal_key", "_asset_key"]]], ignore_index=True, copy=False)
+
+    if out.empty:
+        return out
+
+    # Refresh only loan-derived flags from the current Term Loan tab.
     if "CPP JV" in tl.columns:
         tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
         out = out.merge(tl_cpp, on="_deal_key", how="left", suffixes=("", "_loan"))
-        out["CPP JV"] = coalesce_keep_nonblank(out.get("CPP JV_loan", pd.Series([pd.NA] * len(out), index=out.index)), out["CPP JV"])
+        out["CPP JV"] = coalesce_keep_nonblank(out.get("CPP JV_loan", pd.Series([pd.NA] * len(out), index=out.index)), out.get("CPP JV", pd.Series([pd.NA] * len(out), index=out.index)))
         out = out.drop(columns=["CPP JV_loan"], errors="ignore")
 
     if "Special Loans List (Y/N)" in tl.columns:
         tl_special = tl[["_deal_key", "Special Loans List (Y/N)"]].drop_duplicates("_deal_key")
         out = out.merge(tl_special, on="_deal_key", how="left")
-        out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Special Loans List (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)))
+        out["Special (Y/N)"] = coalesce_keep_nonblank(
+            out.get("Special Loans List (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
+            out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
+        )
         out = out.drop(columns=["Special Loans List (Y/N)"], errors="ignore")
 
-    if upb_col in tl.columns:
-        tl_upb = tl[["_deal_key", upb_col]].drop_duplicates("_deal_key")
-        out = out.merge(tl_upb, on="_deal_key", how="left")
-
-        ala = pd.to_numeric(out.get("Property ALA", np.nan), errors="coerce")
-        ala_sum = ala.groupby(out["_deal_key"]).transform("sum")
-        out[upb_col] = np.where(ala_sum > 0, out[upb_col] * (ala / ala_sum), out[upb_col])
-
-    if prev_maps and "term_asset_manual" in prev_maps:
-        prev = prev_maps["term_asset_manual"].copy()
-        keep = ["_deal_key", "_asset_key"] + [c for c in [
-            "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "CBSA",
-            "# Units", "Property Type", "Property ALA", "Value Date", "As-Is Value",
-            "Special (Y/N)", "CPP JV",
-        ] if c in prev.columns]
-        prev = prev[keep].drop_duplicates(["_deal_key", "_asset_key"])
-        out = out.merge(prev, on=["_deal_key", "_asset_key"], how="left", suffixes=("", "_prev"))
-        for c in [x for x in keep if x not in {"_deal_key", "_asset_key"}]:
-            if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out.get(c, pd.Series([pd.NA] * len(out), index=out.index)), out[f"{c}_prev"])
-                out = out.drop(columns=[f"{c}_prev"], errors="ignore")
-
-    out["Special (Y/N)"] = coalesce_keep_nonblank(out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)), pd.Series(["N"] * len(out), index=out.index))
-
-    if prev_maps and "term_asset_manual" in prev_maps and not term_loan.empty:
-        prev_full = prev_maps["term_asset_manual"].copy()
-        term_deals = set(norm_id_series(term_loan.get("Deal Number", pd.Series([None] * len(term_loan), index=term_loan.index))).dropna().tolist())
-        present_pairs = set(zip(out["_deal_key"].astype(str), out["_asset_key"].astype(str)))
-        prev_full = prev_full[prev_full["_deal_key"].isin(term_deals)].copy()
-        if not prev_full.empty:
-            missing_prev = prev_full[~prev_full.apply(lambda r: (str(r["_deal_key"]), str(r["_asset_key"])) in present_pairs, axis=1)].copy()
-            if not missing_prev.empty:
-                for col in out.columns:
-                    if col not in missing_prev.columns:
-                        missing_prev[col] = pd.NA
-                missing_prev = missing_prev[out.columns]
-                out = pd.concat([out, missing_prev], ignore_index=True, copy=False)
-                out["_deal_key"] = norm_id_series(out.get("Deal Number", pd.Series([None] * len(out), index=out.index)))
-                out["_asset_key"] = norm_id_series(out.get("Asset ID", pd.Series([None] * len(out), index=out.index)))
+    out["Special (Y/N)"] = coalesce_keep_nonblank(
+        out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
+        pd.Series(["N"] * len(out), index=out.index),
+    )
 
     for c in ["CPP JV"]:
         if c in out.columns:
             out[c] = out[c].replace({"": pd.NA})
+
+    out = _allocate_term_asset_upb_from_loan(out, term_loan, upb_col)
 
     meaningful_mask = (
         out["_deal_key"].notna()
@@ -4627,7 +5615,6 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     out = out.loc[meaningful_mask].copy()
 
     return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
-
 
 def build_bridge_loan(
     bridge_loan_wide: pd.DataFrame,
@@ -4689,8 +5676,8 @@ def build_bridge_loan(
 
     if bridge_asset is not None and not bridge_asset.empty:
         ba = bridge_asset.copy()
-        upd_dt = pd.to_datetime(ba.get("Updated Valuation Date", pd.Series([pd.NaT] * len(ba), index=ba.index)), errors="coerce")
-        org_dt = pd.to_datetime(ba.get("Origination Value Dt", pd.Series([pd.NaT] * len(ba), index=ba.index)), errors="coerce")
+        upd_dt = _to_datetime_series_mixed(ba.get("Updated Valuation Date", pd.Series([pd.NaT] * len(ba), index=ba.index)))
+        org_dt = _to_datetime_series_mixed(ba.get("Origination Value Dt", pd.Series([pd.NaT] * len(ba), index=ba.index)))
         has_updated_appraisal = upd_dt.notna()
         ba["_roll_recent_val_dt"] = upd_dt.where(has_updated_appraisal, org_dt)
         ba["_roll_recent_asis"] = pd.to_numeric(
@@ -4733,9 +5720,8 @@ def build_bridge_loan(
                 "Primary Contact_active": g["Primary Contact"].apply(_first) if "Primary Contact" in ba.columns else pd.Series(dtype="string"),
                 "Last Funding Date_active": g["Last Funding Date"].apply(_max_dt) if "Last Funding Date" in ba.columns else pd.NaT,
                 "Days Past Due_active": pd.to_numeric(g["_bridge_dpd_num"].max(), errors="coerce") if "_bridge_dpd_num" in ba.columns else pd.Series(dtype="float"),
-                "Loan Level Delinquency_active": g["_bridge_dq_bucket"].apply(_worst_bridge_bucket) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
+                "Loan Level Delinquency_active": g.apply(lambda grp: _bridge_loan_rollup_label(grp.get("_bridge_dq_bucket", pd.Series(dtype="object")), grp.get("_bridge_dpd_num", pd.Series(dtype="float")))) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
                 "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
-                "_upb_from_bridge_asset": pd.to_numeric(g[upb_col].sum(min_count=1), errors="coerce") if upb_col in ba.columns else np.nan,
                 "Suspense Balance_active": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
                 "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_max_dt),
                 "Most Recent As-Is Value": pd.to_numeric(g["_roll_recent_asis"].sum(min_count=1), errors="coerce"),
@@ -4802,6 +5788,10 @@ def build_bridge_loan(
         pd.to_numeric(out.get("Most Recent As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
         pd.to_numeric(out.get("Most Recent As-Is Value SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
     )
+    out["Most Recent ARV"] = pd.to_numeric(out.get("Most Recent ARV", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
+        pd.to_numeric(out.get("Most Recent ARV", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
+        pd.to_numeric(out.get("Most Recent ARV SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
+    )
     out["Active Funded Amount"] = pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
         pd.to_numeric(out.get("Active Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
         pd.to_numeric(out.get("Active Funded Amount SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
@@ -4837,10 +5827,19 @@ def build_bridge_loan(
         out["_prev_upb"] = np.nan
 
     stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
-    final_upb = pd.to_numeric(out.get("_upb_from_bridge_asset", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-    final_upb = final_upb.where(final_upb.notna(), pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"))
-    final_upb = final_upb.where(final_upb.notna(), out["Active Asset UPB"])
-    final_upb = final_upb.where(final_upb.notna(), out["SF Current UPB"])
+    loan_upb_raw = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    asset_upb_raw = pd.to_numeric(out.get("Active Asset UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    sf_upb_raw = pd.to_numeric(out.get("SF Current UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+
+    valid_loan_upb = loan_upb_raw.where(loan_upb_raw.gt(0))
+    valid_asset_upb = asset_upb_raw.where(asset_upb_raw.gt(0))
+    valid_sf_upb = sf_upb_raw.where(sf_upb_raw.gt(0))
+    final_upb = valid_loan_upb.where(valid_loan_upb.notna(), valid_asset_upb)
+    final_upb = final_upb.where(final_upb.notna(), valid_sf_upb)
+    # Zero is valid only after every positive source is absent. This prevents a servicer zero from hiding positive asset-level UPB.
+    final_upb = final_upb.where(final_upb.notna(), loan_upb_raw.where(loan_upb_raw.eq(0)))
+    final_upb = final_upb.where(final_upb.notna(), asset_upb_raw.where(asset_upb_raw.eq(0)))
+    final_upb = final_upb.where(final_upb.notna(), sf_upb_raw.where(sf_upb_raw.eq(0)))
 
     late_stage_mask = stage_series.isin(EXPIRED_OR_MATURED_STAGES)
     prev_upb_vals = pd.to_numeric(out.get("_prev_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
@@ -4875,11 +5874,16 @@ def build_bridge_loan(
         index=out.index,
         dtype="object",
     )
-    out["Loan Level Delinquency"] = coalesce_keep_nonblank(out.get("Loan Level Delinquency_active", blank_obj), loan_status_bucket)
+    servicer_report_bucket = pd.Series(
+        [_bridge_bucket_to_report_label(bucket, _guess_days_past_due(npd, run_dt)) for bucket, npd in zip(loan_status_bucket, out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)))],
+        index=out.index,
+        dtype="object",
+    )
+    out["Loan Level Delinquency"] = coalesce_keep_nonblank(out.get("Loan Level Delinquency_active", blank_obj), servicer_report_bucket)
     out["Days Past Due"] = pd.to_numeric(out.get("Days Past Due_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     derived_days = pd.Series(
         [
-            min(_guess_days_past_due(npd, run_dt), 29.0) if has_any_value(bucket) and clean_text(bucket).upper() == "CURRENT" else _guess_days_from_bridge_bucket(bucket)
+            _guess_days_from_bridge_bucket(bucket) if not pd.isna(_guess_days_from_bridge_bucket(bucket)) else _guess_days_past_due(npd, run_dt)
             for bucket, npd in zip(out["Loan Level Delinquency"], out.get("Next Payment Date", pd.Series([pd.NaT] * len(out), index=out.index)))
         ],
         index=out.index,
@@ -4901,6 +5905,12 @@ def build_bridge_loan(
     if "bridge_loan_manual" in prev_maps and not out.empty:
         man = prev_maps["bridge_loan_manual"].copy()
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
+        bridge_loan_carry_forward_first = {
+            "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency",
+            "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value",
+            "Active RM", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
+            "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date",
+        }
         for c in [
             "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency", "Special Focus (Y/N)",
             "AM Commentary", "3/31 NPL", "Needs NPL Value", "Active RM",
@@ -4908,8 +5918,20 @@ def build_bridge_loan(
             "Construction Mgr.", "CM Assigned Date",
         ]:
             if f"{c}_prev" in out.columns:
-                out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
+                if c in bridge_loan_carry_forward_first:
+                    out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
+                else:
+                    out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
+
+    # Hard-reconcile the loan-level math back to the already-built Bridge Asset rows.
+    # This prevents servicer zeroes / wrong rollup fields from breaking loan-level Active Funded Amount or UPB.
+    out = _reconcile_bridge_loan_from_asset_rollup(out, bridge_asset, upb_col)
+
+    most_recent_arv_num = pd.to_numeric(out.get("Most Recent ARV", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    if "Most Recent ARV" in out.columns:
+        out["Most Recent ARV"] = pd.Series(out["Most Recent ARV"], index=out.index, dtype="object")
+        out.loc[most_recent_arv_num.fillna(0).eq(0), "Most Recent ARV"] = "N/A"
 
     out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
@@ -4928,6 +5950,7 @@ def build_bridge_loan(
 
     current_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
     active_asset_count = pd.to_numeric(out.get("Active Asset Count", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0)
+    stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
     is_closed_won = stage_series.eq("Closed Won")
     is_sold = stage_series.eq("Sold")
     is_reo = stage_series.isin(REO_FAMILY_STAGES)
@@ -5245,6 +6268,85 @@ def _is_date_header(sheet_name: str, header: str) -> bool:
     return header in SHEET_DATE_HEADERS.get(sheet_name, set())
 
 
+def _should_preserve_datetime(sheet_name: str, header: str) -> bool:
+    return header in SHEET_DATETIME_HEADERS.get(sheet_name, set())
+
+
+def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start_row: int = 5, sample_limit: int = 120, scan_limit: int = 1000) -> Set[str]:
+    hinted: Set[str] = set()
+    max_row = min(ws.max_row, start_row + scan_limit - 1)
+    for col_idx, header in header_tuples:
+        if not header or header in REPORT_IDENTIFIER_HEADERS.get(ws.title, set()):
+            continue
+        text_like = 0
+        number_like = 0
+        samples = 0
+        for r in range(start_row, max_row + 1):
+            val = ws.cell(r, col_idx).value
+            if not has_any_value(val):
+                continue
+            if isinstance(val, pd.Timestamp):
+                if pd.isna(val):
+                    continue
+                break
+            if isinstance(val, (datetime, date)):
+                break
+            if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(val, bool):
+                number_like += 1
+            else:
+                text_like += 1
+            samples += 1
+            if samples >= sample_limit:
+                break
+        if text_like and not number_like:
+            hinted.add(header)
+    return hinted
+
+
+def _round_report_money_series(series: pd.Series) -> pd.Series:
+    ser = pd.Series(series, copy=False)
+    num = pd.to_numeric(ser, errors="coerce")
+    out = _object_series_like(ser)
+    mask = num.notna()
+    if bool(mask.any()):
+        out.loc[mask] = num.loc[mask].round(2).astype("object")
+    return out
+
+
+def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str, template_text_headers: Optional[Set[str]] = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    out = df.copy()
+
+    for header in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            out[header] = normalize_report_identifier_series(out[header])
+
+    for header in REPORT_INTEGER_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            out[header] = normalize_integer_display_series(out[header])
+
+    text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
+    text_headers = {h for h in text_headers if h not in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())}
+    for header in text_headers:
+        if header in out.columns:
+            out[header] = normalize_text_display_series(out[header])
+
+    for header in REPORT_NA_FILL_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            ser = pd.Series(out[header], index=out.index, dtype="object")
+            out[header] = ser.where(~blankish_mask(ser), "N/A")
+
+    money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
+    if upb_col:
+        money_headers.add(upb_col)
+    for header in money_headers:
+        if header in out.columns:
+            out[header] = _round_report_money_series(out[header])
+
+    return out
+
+
 def _copy_reference_row_style(ws_formula, col_idx: int, target_cell):
     ref_cell = ws_formula.cell(5, col_idx)
     if ref_cell.has_style:
@@ -5318,7 +6420,10 @@ def write_df_to_sheet_preserve_formulas(
         for (c, h), val in zip(write_cols, row):
             safe_val = _excel_safe_value(val)
             if _is_date_header(ws_formula.title, h):
-                safe_val = _coerce_excel_date_value(safe_val)
+                if _should_preserve_datetime(ws_formula.title, h):
+                    safe_val = _excel_safe_value(safe_val)
+                else:
+                    safe_val = _coerce_excel_date_value(safe_val)
             ws_formula.cell(r, c).value = safe_val
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
@@ -5332,10 +6437,14 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
 
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
+    template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
+    df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
 
-    # Preserve formula columns from the template on all report tabs, including Term Asset.
-    # This keeps the workbook construction aligned with completed Active Loan Reports.
+    if sheet_name == "Term Asset":
+        force_write_headers = {upb_col, "Special (Y/N)"}
+        force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
+        fcols = {c for c in fcols if c not in force_write_cols}
 
     formula_seeds = _capture_formula_seeds(ws, fcols, start_row=5)
 
@@ -6191,12 +7300,14 @@ Welcome! This tool builds the **Active Loans** workbook using **Salesforce Bulk 
 
 ### What you’ll do
 1) Log in to **Salesforce**
-2) Upload the **current servicer files** or skip them
-3) (Optional) Upload **last week’s / completed Active Loans report** for carry-forward
+2) Upload the **current external servicer files** or skip them
+3) (Recommended) Upload **last week’s / completed Active Loans report** for layout/carry-forward; not an SF data source
 4) Choose **which sheet to build** or **All**
 
 ### UPB header
-Preview default: **{run_dt.isoformat()}** → **{upb_col}**. During Build, the final UPB/DQ date uses the dominant servicer file as-of date when servicer files are uploaded.
+Before servicer files are parsed, the preview uses today's date (ET): **{run_dt.isoformat()}** → **{upb_col}**. During the build, the final UPB header is reset to the dominant uploaded servicer tape date.
+
+**Salesforce source note:** Bridge, Term, Valuation, AM Assignments, Active RM, and related deal/asset populations are pulled live from the Salesforce API. To replicate the completed Active Loans process, also upload the prior/completed Active Loans workbook so curated fields and Term Asset rows can be carried forward. Upload external servicer files for UPB/status/due-date enrichment.
 """
 )
 
@@ -6213,8 +7324,9 @@ except Exception as e:
     st.caption(str(e))
 
 st.caption(
-    "This merged version uses your repo template as the build base and uses the uploaded completed report only for carry-forward/backfill, "
-    "uses Midland / FCI / Berkadia as the term active-loan spine when available, "
+    "This merged version pulls core report data from Salesforce Bulk API, uses your repo template by default, "
+    "can use the uploaded completed report as the build base/carry-forward source, "
+    "uses uploaded Midland / FCI / Berkadia / Statebridge / other servicer files only for external servicer enrichment, "
     "resolves formula-linked UPB headers, fills formulas down, trims extra blank rows, keeps row-level Salesforce Servicer IDs intact, "
     "runs both dataframe-level and workbook-level blank repair against the uploaded known-good report when you provide one, "
     "and writes QA Summary / QA Exceptions tabs after the build when the post-build audit helper is available."
@@ -6233,12 +7345,12 @@ st.markdown("### Step 2: Upload files")
 col_a, col_b = st.columns([1.3, 1.0])
 with col_a:
     prev_upload = st.file_uploader(
-        "Upload LAST WEEK'S or COMPLETED Active Loans report (.xlsx) for carry-forward (required for blank-free weekly build)",
+        "Upload LAST WEEK'S or COMPLETED Active Loans report (.xlsx) for layout/carry-forward (strongly recommended for production-accurate replication)",
         type=["xlsx"],
     )
 with col_b:
     servicer_uploads = st.file_uploader(
-        "Upload current servicer files (csv/xlsx) (optional if skipped below)",
+        "Upload current EXTERNAL servicer files only (csv/xlsx) — not Salesforce exports (optional if skipped below)",
         type=["csv", "xlsx"],
         accept_multiple_files=True,
     )
@@ -6283,8 +7395,8 @@ if build_btn:
 
     if not use_sf:
         st.error("This version requires Salesforce API to build the report.")
-    elif prev_upload is None:
-        st.error("Upload the prior completed Active Loans workbook. The weekly build now enforces a zero-blank carry-forward repair pass and requires a known-good baseline.")
+    elif prev_upload is None and not _repo_template_available:
+        st.error("No repo template was found. Upload a prior/completed Active Loans workbook as the template base, or commit an Active Loans template to the repo.")
     elif not skip_servicer_files and not servicer_uploads:
         st.error("Upload the servicer files, or check 'Skip servicer files and build Salesforce-only version'.")
     elif not sf_ready:
@@ -6305,16 +7417,17 @@ if build_btn:
             if prev_upload:
                 status.update(label="Reading uploaded completed report for carry-forward...")
                 prev_maps = build_prev_maps(prev_bytes)
+            else:
+                diagnostics.append("No prior/completed Active Loans workbook uploaded: using the repo template only; manual carry-forward/backfill fields will be limited to Salesforce/template logic.")
 
             if skip_servicer_files:
                 serv_join = pd.DataFrame(columns=["source_file", "servicer", "servicer_family", "servicer_id", "upb", "suspense", "next_payment_date", "maturity_date", "status", "as_of", "_sid_key"])
                 detected_run_date = run_dt
-                upb_col = make_upb_header(run_dt)
                 serv_preview = serv_join.copy()
 
                 st.markdown("### Servicer lookup preview")
                 st.caption("Servicer files were skipped. Servicer-driven columns will use Salesforce fallback where available.")
-                st.caption(f"UPB header: **{upb_col}**")
+                st.caption(f"UPB header (build report date): **{upb_col}**")
             else:
                 servicer_phase_started = time.perf_counter()
 
@@ -6330,12 +7443,9 @@ if build_btn:
                     use_cache=False,
                 )
 
-                run_dt = detected_run_date
-                upb_col = make_upb_header(run_dt)
-
                 st.markdown("### Servicer lookup preview")
-                st.caption(f"Detected dominant servicer report as-of date from file contents / report tabs: **{detected_run_date.isoformat()}**")
-                st.caption(f"UPB header: **{upb_col}**")
+                st.caption(f"Detected dominant servicer tape date from uploaded filenames / report tabs: **{detected_run_date.isoformat()}**")
+                st.caption(f"UPB header used for this build: **{upb_col}**")
                 if show_servicer_preview:
                     st.dataframe(serv_preview.head(30), use_container_width=True)
                 else:
@@ -6343,15 +7453,16 @@ if build_btn:
                 serv_preview = pd.DataFrame()
                 gc.collect()
 
-            diagnostics.append(f"Report as-of date used for UPB/DQ labels: {run_dt.isoformat()} ({upb_col})")
+            run_dt = detected_run_date
+            upb_col = make_upb_header(run_dt)
 
-            status.update(label="Loading Excel template...")
+            status.update(label=f"Loading Excel template for report date {run_dt.isoformat()} ({upb_col})...")
             if prev_upload is None and not _repo_template_available:
                 raise FileNotFoundError(
                     "No repo template was found and no completed Active Loans workbook was uploaded. "
                     "Upload the prior completed workbook or add one of the expected template files to the repo."
                 )
-            tmpl_bytes, tmpl_path_used = resolve_build_template_bytes(prev_upload)
+            tmpl_bytes, tmpl_path_used = resolve_template_bytes(prev_upload)
             template_maps = load_template_lookup_maps(tmpl_bytes)
             wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
             mark_workbook_for_recalc(wb)
@@ -6398,6 +7509,10 @@ if build_btn:
                     npl_maps=npl_maps,
                 )
                 bridge_asset_df, bridge_asset_backfill = backfill_df_from_baseline("Bridge Asset", bridge_asset_df, prev_bytes)
+                # Baseline backfill can populate funded component fields; recompute the funded amount immediately after it.
+                bridge_asset_df, bridge_asset_math_diags = repair_bridge_asset_math(bridge_asset_df, upb_col)
+                diagnostics.extend(bridge_asset_math_diags)
+                diagnostics.extend(validate_bridge_math_or_raise(bridge_asset_df, None, upb_col))
                 if bridge_asset_backfill and bridge_asset_backfill.get("fills"):
                     diagnostics.append(f"Bridge Asset baseline backfill cells: {int(bridge_asset_backfill['fills']):,} using {bridge_asset_backfill.get('keys', 'n/a')}")
 
@@ -6425,6 +7540,10 @@ if build_btn:
                         npl_maps=npl_maps,
                     )
                     bridge_loan_df, bridge_loan_backfill = backfill_df_from_baseline("Bridge Loan", bridge_loan_df, prev_bytes)
+                    bridge_loan_df = _reconcile_bridge_loan_from_asset_rollup(bridge_loan_df, bridge_asset_df, upb_col)
+                    bridge_loan_df, bridge_loan_commitment_diags = _repair_bridge_loan_commitment_math(bridge_loan_df, upb_col)
+                    diagnostics.extend(bridge_loan_commitment_diags)
+                    diagnostics.extend(validate_bridge_math_or_raise(bridge_asset_df, bridge_loan_df, upb_col))
                     if bridge_loan_backfill and bridge_loan_backfill.get("fills"):
                         diagnostics.append(f"Bridge Loan baseline backfill cells: {int(bridge_loan_backfill['fills']):,} using {bridge_loan_backfill.get('keys', 'n/a')}")
 
@@ -6464,6 +7583,9 @@ if build_btn:
                     asset_deal_numbers=term_asset_filter_deals,
                 )
                 term_loan_df, term_loan_backfill = backfill_df_from_baseline("Term Loan", term_loan_df, prev_bytes)
+                term_loan_df = _clear_duplicate_term_servicer_assignments(term_loan_df, upb_col, prev_maps=prev_maps)
+                term_loan_df = _guard_term_loan_upb_vs_amount(term_loan_df, upb_col, prev_maps=prev_maps)
+                diagnostics.extend(validate_term_loan_amounts_or_raise(term_loan_df, upb_col))
                 if term_loan_backfill and term_loan_backfill.get("fills"):
                     diagnostics.append(f"Term Loan baseline backfill cells: {int(term_loan_backfill['fills']):,} using {term_loan_backfill.get('keys', 'n/a')}")
 
@@ -6492,6 +7614,9 @@ if build_btn:
                     status.update(label="Building Term Asset...")
                     term_asset_df = build_term_asset(term_asset_source, term_loan_df, upb_col, prev_maps=prev_maps)
                     term_asset_df, term_asset_backfill = backfill_df_from_baseline("Term Asset", term_asset_df, prev_bytes)
+                    # Baseline backfill can populate / repair Property ALA, so allocate UPB after the final asset population exists.
+                    term_asset_df = _allocate_term_asset_upb_from_loan(term_asset_df, term_loan_df, upb_col)
+                    diagnostics.extend(validate_term_math_or_raise(term_loan_df, term_asset_df, upb_col))
                     if term_asset_backfill and term_asset_backfill.get("fills"):
                         diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
 
@@ -6554,6 +7679,12 @@ if build_btn:
                 diagnostics.append("Post-build zero-blank / QA was skipped to save memory for this run.")
             else:
                 diagnostics.append("Post-build QA audit helper not available in this runtime; workbook-level QA tabs were not added.")
+
+            diagnostics.append(
+                "Formula-cache note: generated formula columns are marked for Excel recalculation on open. "
+                "If the workbook is inspected by Python/openpyxl or a previewer before Excel recalculates it, "
+                "formula-result columns can look blank even though formulas are present."
+            )
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
