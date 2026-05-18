@@ -169,8 +169,8 @@ SHEET_DATE_HEADERS = {
         "Origination Date", "First Funding Date", "Last Funding Date", "Next Payment Date",
         "Original Loan Maturity date", "Current Loan Maturity date", "Original Asset Maturity date",
         "Current Asset Maturity Date", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
-        "Special Asset: Resolved Date", "Forbearance Term Date", "FC Sale Date", "Rescheduled FC Sale Date",
-        "REO Date", "Origination Value Dt", "Most Recent Appraisal Order Date", "Updated Valuation Date", "Tax Due Date",
+        "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date", "Origination Value Dt",
+        "Most Recent Appraisal Order Date", "Updated Valuation Date", "Tax Due Date",
         "Servicer Maturity Date", "CV Maturity Date", "Maturity Date", "Most Recent Valuation Date",
     },
     "Bridge Loan": {
@@ -205,7 +205,7 @@ REPORT_NA_FILL_HEADERS = {
         "Additional APNs", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
         "Remedy Plan", "Delinquency Notes", "Maturity Status", "Is Special Asset (Y/N)",
         "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
-        "Special Asset: Resolved Date", "Forbearance Term Date", "FC Sale Date", "Rescheduled FC Sale Date", "REO Date",
+        "Special Asset: Resolved Date", "Forbearance Term Date", "REO Date",
         # Origination Value Dt intentionally becomes N/A when Salesforce has no origination valuation date.
         # Updated valuation fields should remain blank when no updated value exists; do not N/A-fill them.
         "Origination Value Dt",
@@ -338,11 +338,6 @@ BRIDGE_ASSET_FROM_VALUATION = {
     "Updated ARV": "Current Appraised After Repair Value",
 }
 
-BRIDGE_ASSET_FROM_FORECLOSURE = {
-    "FC Sale Date": "FC Sale Date",
-    "Rescheduled FC Sale Date": "Rescheduled FC Sale Date",
-}
-
 TERM_LOAN_FROM_TERM_WIDE = {
     "Deal Number": "Deal Loan Number",
     "SF Yardi ID": "Yardi ID",
@@ -378,27 +373,27 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 
 DRAFT_FORMULA_OVERRIDES = {
     "Bridge Asset": {
-        "SF Funded Amount": "=+$BJ5+$BL5+$BO5",
-        "CV Maturity Date": '=IF(OR($BU5="Credit Line",$BV5="Line of Credit"),$AG5,$AE5)',
-        "Maturity Difference": '=IFERROR($CJ5-$CI5,"N/A")',
-        "Maturity Date": '=IF($CI5<>"N/A",$CI5,$CJ5)',
-        "Days to Maturity": '=+$CL5-$CM$3',
-        "Days Past Due": '=+$CN$3-$AC5',
-        "DQ Status": '=IF($BB5<>"N/A","REO",IF(AND($CN5>0,$CN5<30),"DQ 1-29",IF(AND($CN5>=30,$CN5<60),"DQ 30-59",IF(AND($CN5>=60,$CN5<90),"DQ 60-89",IF($CN5>=90,"DQ 90+","Current")))))',
-        "Most Recent Valuation Date": '=IF($BG5<>"N/A",$BG5,$BC5)',
-        "Most Recent As-Is Value": '=IF($BG5<>"N/A",$BH5,$BD5)',
-        "Most Recent ARV": '=IF($BG5<>"N/A",$BI5,$BE5)',
-        "Needs NPL Value": '=IF(AND($DB5="Y",$CP5<$CS$3),"Y","N")',
-        "Securitized (Y/N)": '=IF($BT5="Securitized Bridge","Y","N")',
+        "SF Funded Amount": "=+$BH5+$BJ5+$BM5",
+        "CV Maturity Date": '=IF(OR($BS5="Credit Line",$BT5="Line of Credit"),$AG5,$AE5)',
+        "Maturity Difference": '=IFERROR($CH5-$CG5,"N/A")',
+        "Maturity Date": '=IF($CG5<>"N/A",$CG5,$CH5)',
+        "Days to Maturity": '=+$CJ5-$CK$3',
+        "Days Past Due": '=+$CL$3-$AC5',
+        "DQ Status": '=IF($AZ5<>"N/A","REO",IF(AND($CL5>0,$CL5<30),"DQ 1-29",IF(AND($CL5>=30,$CL5<60),"DQ 30-59",IF(AND($CL5>=60,$CL5<90),"DQ 60-89",IF($CL5>=90,"DQ 90+","Current")))))',
+        "Most Recent Valuation Date": '=IF(OR($BE5="N/A",$BE5=""),$BA5,$BE5)',
+        "Most Recent As-Is Value": '=IF(OR($BE5="N/A",$BE5=""),$BB5,$BF5)',
+        "Most Recent ARV": '=IF(OR($BE5="N/A",$BE5=""),IF(OR($BC5=0,$BC5=""),"N/A",$BC5),IF(OR($BG5=0,$BG5=""),"N/A",$BG5))',
+        "Needs NPL Value": '=IF(AND($CZ5="Y",$CN5<$CQ$3),"Y","N")',
+        "Securitized (Y/N)": '=IF($BR5="Securitized Bridge","Y","N")',
         "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
-        "CPP JV (Y/N)": '=IF($BT5="CPP JV","Y","N")',
-        "Oaktree JV (Y/N)": '=IF($BT5="Oaktree JV","Y","N")',
-        "Legacy (Y/N)": '=IF($BT5="Legacy","Y","N")',
-        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CM:$CM,$E:$E,$E5)<0,"Y","N")',
-        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CN:$CN,$E:$E,$E5)>=45,"Y","N")',
+        "CPP JV (Y/N)": '=IF($BR5="CPP JV","Y","N")',
+        "Oaktree JV (Y/N)": '=IF($BR5="Oaktree JV","Y","N")',
+        "Legacy (Y/N)": '=IF($BR5="Legacy","Y","N")',
+        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CK:$CK,$E:$E,$E5)<0,"Y","N")',
+        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CL:$CL,$E:$E,$E5)>=45,"Y","N")',
         "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AK5,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
-        "__QEND_NPL_YN__": '=IF(AND($D5<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E5)<$DB$3),"Y","N")',
-        "Special Flag": '=IF(AND($D5<>"Sold",OR($CX5="Y",$CY5="Y",$CZ5="Y",$DA5="Y")),"Y","N")',
+        "3/31 NPL (Y/N)": '=IF(AND($D5<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E5)<$CZ$3),"Y","N")',
+        "Special Flag": '=IF(AND($D5<>"Sold",OR($CV5="Y",$CW5="Y",$CX5="Y",$CY5="Y")),"Y","N")',
     },
     "Bridge Loan": {
         "Days Past Due": '=+$V$3-$U5',
@@ -417,18 +412,18 @@ DRAFT_FORMULA_OVERRIDES = {
 SHEET_BLUEPRINTS = {
     "Bridge Asset": {
         "row1": {
-            34: "CALC", 88: "CALC", 89: "CALC", 90: "CALC", 91: "CALC", 92: "CALC",
-            93: "CALC", 94: "CALC", 95: "CALC", 96: "CALC", 97: "CALC", 98: "CALC",
-            99: "CALC", 100: "CALC", 101: "CALC", 103: "CALC", 104: "CALC", 105: "CALC",
-            106: "CALC", 107: "CALC",
+            34: "CALC", 86: "CALC", 87: "CALC", 88: "CALC", 89: "CALC", 90: "CALC",
+            91: "CALC", 92: "CALC", 93: "CALC", 94: "CALC", 95: "CALC", 96: "CALC",
+            97: "CALC", 98: "CALC", 99: "CALC", 101: "CALC", 102: "CALC", 103: "CALC",
+            104: "CALC", 105: "CALC",
         },
-        "row2": {2: "Bridge Asset Data", 106: "__QEND__"},
+        "row2": {2: "Bridge Asset Data", 104: "__QEND__"},
         "row3": {
             35: "__SUBTOTAL__",
-            91: "__RUN_DT__",
-            92: "=+$CM$3",
-            97: "=EDATE(DB2,-6)",
-            106: "=+$DB$2-90",
+            89: "__RUN_DT__",
+            90: "=+$CK$3",
+            95: "=EDATE(CZ2,-6)",
+            104: "=+$CZ$2-90",
         },
         "row4": {
             2: "Portfolio",
@@ -481,62 +476,60 @@ SHEET_BLUEPRINTS = {
             49: "Special Asset: Special Asset Status",
             50: "Special Asset: Resolved Date",
             51: "Forbearance Term Date",
-            52: "FC Sale Date",
-            53: "Rescheduled FC Sale Date",
-            54: "REO Date",
-            55: "Origination Value Dt",
-            56: "Origination As-Is Value",
-            57: "Origination ARV",
-            58: "Most Recent Appraisal Order Date",
-            59: "Updated Valuation Date",
-            60: "Updated As-Is Value",
-            61: "Updated ARV",
-            62: "Initial Disbursement Funded",
-            63: "Renovation Holdback",
-            64: "Renovation Holdback Funded",
-            65: "Renovation Holdback Remaining",
-            66: "Interest Allocation",
-            67: "Interest Allocation Funded",
-            68: "Title Company",
-            69: "Tax Due Date",
-            70: "Tax Frequency",
-            71: "Tax Commentary",
-            72: "Segment",
-            73: "Product Type",
-            74: "Product Sub-Type",
-            75: "Transaction Type",
-            76: "Project Strategy",
-            77: "Strategy Grouping",
-            78: "Property Type",
-            79: "Originator",
-            80: "Active RM",
-            81: "Deal Intro Sub-Source",
-            82: "Referral Source Account",
-            83: "Referral Source Contact",
-            84: "Loan Stage",
-            85: "Property Status",
-            86: "Servicer Status",
-            87: "Servicer Maturity Date",
-            88: "CV Maturity Date",
-            89: "Maturity Difference",
-            90: "Maturity Date",
-            91: "Days to Maturity",
-            92: "Days Past Due",
-            93: "DQ Status",
-            94: "Most Recent Valuation Date",
-            95: "Most Recent As-Is Value",
-            96: "Most Recent ARV",
-            97: "Needs NPL Value",
-            98: "Securitized (Y/N)",
-        "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
-            100: "CPP JV (Y/N)",
-            101: "Oaktree JV (Y/N)",
-            102: "Legacy (Y/N)",
-            103: "Matured Loan (YN)",
-            104: "DQ 45+ Loan (Y/N)",
-        "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AK5,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
-            106: "__QEND_NPL_YN__",
-            107: "Special Flag",
+            52: "REO Date",
+            53: "Origination Value Dt",
+            54: "Origination As-Is Value",
+            55: "Origination ARV",
+            56: "Most Recent Appraisal Order Date",
+            57: "Updated Valuation Date",
+            58: "Updated As-Is Value",
+            59: "Updated ARV",
+            60: "Initial Disbursement Funded",
+            61: "Renovation Holdback",
+            62: "Renovation Holdback Funded",
+            63: "Renovation Holdback Remaining",
+            64: "Interest Allocation",
+            65: "Interest Allocation Funded",
+            66: "Title Company",
+            67: "Tax Due Date",
+            68: "Tax Frequency",
+            69: "Tax Commentary",
+            70: "Segment",
+            71: "Product Type",
+            72: "Product Sub-Type",
+            73: "Transaction Type",
+            74: "Project Strategy",
+            75: "Strategy Grouping",
+            76: "Property Type",
+            77: "Originator",
+            78: "Active RM",
+            79: "Deal Intro Sub-Source",
+            80: "Referral Source Account",
+            81: "Referral Source Contact",
+            82: "Loan Stage",
+            83: "Property Status",
+            84: "Servicer Status",
+            85: "Servicer Maturity Date",
+            86: "CV Maturity Date",
+            87: "Maturity Difference",
+            88: "Maturity Date",
+            89: "Days to Maturity",
+            90: "Days Past Due",
+            91: "DQ Status",
+            92: "Most Recent Valuation Date",
+            93: "Most Recent As-Is Value",
+            94: "Most Recent ARV",
+            95: "Needs NPL Value",
+            96: "Securitized (Y/N)",
+            97: "SSP JV (Y/N)",
+            98: "CPP JV (Y/N)",
+            99: "Oaktree JV (Y/N)",
+            100: "Legacy (Y/N)",
+            101: "Matured Loan (YN)",
+            102: "DQ 45+ Loan (Y/N)",
+            103: "SA Loan (Y/N)",
+            104: "3/31 NPL (Y/N)",
+            105: "Special Flag",
         },
         "subtotal_col": 35,
     },
@@ -593,7 +586,7 @@ SHEET_BLUEPRINTS = {
             47: "Deal Intro Sub-Source",
             48: "Referral Source Account",
             49: "Referral Source Contact",
-            50: "__QEND_NPL__",
+            50: "3/31 NPL",
             51: "Needs NPL Value",
             52: "Special Focus (Y/N)",
             53: "Asset Manager 1",
@@ -2330,112 +2323,6 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
     df = df.drop_duplicates(["_asset_key"], keep="last")
     df = df.drop(columns=["_asset_key", "_property_id_key", "_is_sub_unit", "_nonnull_score", "_mod_dt", "_created_dt"], errors="ignore")
     return downcast_numeric_frame(df)
-
-
-def _build_foreclosure_like(asset_ids=None) -> pd.DataFrame:
-    """Pull current foreclosure sale dates by Bridge Asset ID.
-
-    New Bridge Asset columns added in the 5/18 report:
-    - FC Sale Date <- Foreclosure__c.Sale_Date__c
-    - Rescheduled FC Sale Date <- Foreclosure__c.Reschedule_Sale_Date__c
-    """
-    asset_ids = _nonblank_unique(asset_ids or [])
-    try:
-        field_map = _field_map_by_name("Foreclosure__c")
-    except Exception as exc:
-        try:
-            st.warning(f"Foreclosure__c was not available in Salesforce for this session: {exc}")
-        except Exception:
-            pass
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-
-    if "Sale_Date__c" not in field_map and "Reschedule_Sale_Date__c" not in field_map:
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-
-    property_field = first_existing_field_name(
-        "Foreclosure__c",
-        ["Property__c", "Subject_Property__c", "Collateral_Property__c", "Asset__c", "Property_Asset__c"],
-    )
-    direct_asset_field = first_existing_field_name(
-        "Foreclosure__c",
-        ["Asset_ID__c", "Property_Asset_ID__c", "Property_Asset_Id__c", "Asset_Id__c"],
-    )
-
-    select_pairs = []
-    where_asset_expr = None
-    if property_field:
-        try:
-            prop_rel = relationship_name_for("Foreclosure__c", property_field)
-            select_pairs.append(("Asset ID", f"{prop_rel}.Asset_ID__c"))
-            select_pairs.append(("Property ID", property_field))
-            where_asset_expr = f"{prop_rel}.Asset_ID__c"
-        except Exception:
-            select_pairs.append(("Property ID", property_field))
-    if direct_asset_field:
-        select_pairs.append(("Asset ID Direct", direct_asset_field))
-        if where_asset_expr is None:
-            where_asset_expr = direct_asset_field
-
-    if not any(label in {"Asset ID", "Asset ID Direct"} for label, _expr in select_pairs):
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-
-    if "Sale_Date__c" in field_map:
-        select_pairs.append(("FC Sale Date", "Sale_Date__c"))
-    if "Reschedule_Sale_Date__c" in field_map:
-        select_pairs.append(("Rescheduled FC Sale Date", "Reschedule_Sale_Date__c"))
-    if "LastModifiedDate" in field_map:
-        select_pairs.append(("Foreclosure Last Modified Date", "LastModifiedDate"))
-    if "CreatedDate" in field_map:
-        select_pairs.append(("Foreclosure Created Date", "CreatedDate"))
-    if "Status__c" in field_map:
-        select_pairs.append(("Foreclosure Status", "Status__c"))
-    if "Name" in field_map:
-        select_pairs.append(("Foreclosure Name", "Name"))
-
-    rename_map = {expr: label for label, expr in select_pairs}
-    base_where = [f"{where_asset_expr} != NULL"] if where_asset_expr else ["Id != NULL"]
-
-    soqls = []
-    if asset_ids and where_asset_expr:
-        for chunk in _chunked(asset_ids, size=200):
-            where_parts = base_where + [_soql_in(where_asset_expr, chunk)]
-            soqls.append("SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Foreclosure__c WHERE " + " AND ".join(where_parts))
-    else:
-        soqls.append("SELECT " + ", ".join(expr for _label, expr in select_pairs) + " FROM Foreclosure__c WHERE " + " AND ".join(base_where))
-
-    try:
-        df = _run_bulk_union(soqls, rename_map=rename_map)
-    except Exception as exc:
-        try:
-            st.warning(f"Foreclosure__c pull failed; FC sale date columns will be N/A: {exc}")
-        except Exception:
-            pass
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-
-    if df.empty:
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-
-    if "Asset ID" not in df.columns and "Asset ID Direct" in df.columns:
-        df["Asset ID"] = df["Asset ID Direct"]
-    elif "Asset ID" in df.columns and "Asset ID Direct" in df.columns:
-        df["Asset ID"] = coalesce_keep_nonblank(df["Asset ID"], df["Asset ID Direct"])
-
-    df["FC Sale Date"] = _to_datetime_series_mixed(df.get("FC Sale Date", pd.Series([pd.NaT] * len(df), index=df.index)))
-    df["Rescheduled FC Sale Date"] = _to_datetime_series_mixed(df.get("Rescheduled FC Sale Date", pd.Series([pd.NaT] * len(df), index=df.index)))
-    df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([pd.NA] * len(df), index=df.index)))
-    df["_fc_sale_dt"] = _to_datetime_series_mixed(df["FC Sale Date"])
-    df["_fc_resched_dt"] = _to_datetime_series_mixed(df["Rescheduled FC Sale Date"])
-    df["_mod_dt"] = _to_datetime_series_mixed(df.get("Foreclosure Last Modified Date", pd.Series([pd.NaT] * len(df), index=df.index)))
-    df["_created_dt"] = _to_datetime_series_mixed(df.get("Foreclosure Created Date", pd.Series([pd.NaT] * len(df), index=df.index)))
-    df["_nonnull_score"] = df["_fc_sale_dt"].notna().astype("int8") + df["_fc_resched_dt"].notna().astype("int8")
-    df["_sort_dt"] = pd.concat([df["_fc_resched_dt"], df["_fc_sale_dt"], df["_mod_dt"], df["_created_dt"]], axis=1).max(axis=1)
-    df = df[df["_asset_key"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame(columns=["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"])
-    df = df.sort_values(["_asset_key", "_sort_dt", "_mod_dt", "_created_dt", "_nonnull_score"], ascending=[True, True, True, True, True])
-    df = df.drop_duplicates("_asset_key", keep="last")
-    keep = ["Asset ID", "FC Sale Date", "Rescheduled FC Sale Date"]
-    return downcast_numeric_frame(df[keep + ["_asset_key"]].drop_duplicates("_asset_key"))
 
 
 def _build_am_assignments_like() -> pd.DataFrame:
@@ -4846,7 +4733,6 @@ def build_bridge_asset(
     sf_spine: pd.DataFrame,
     sf_dnl: pd.DataFrame,
     sf_val: pd.DataFrame,
-    sf_foreclosure: pd.DataFrame,
     sf_am: pd.DataFrame,
     sf_active_rm: pd.DataFrame,
     serv_lookup: pd.DataFrame,
@@ -4926,25 +4812,6 @@ def build_bridge_asset(
                     out[tmpcol],
                 )
                 out = out.drop(columns=[tmpcol], errors="ignore")
-
-    if not sf_foreclosure.empty and "Asset ID" in sf_foreclosure.columns:
-        fc = sf_foreclosure.copy()
-        fc["_asset_key"] = norm_id_series(fc["Asset ID"])
-        rename_map = {
-            vlabel: f"__fc__{tcol}"
-            for tcol, vlabel in BRIDGE_ASSET_FROM_FORECLOSURE.items()
-            if vlabel in fc.columns
-        }
-        keep = ["_asset_key"] + list(rename_map.keys())
-        fc = fc[keep].rename(columns=rename_map).drop_duplicates("_asset_key")
-        out = out.merge(fc, on="_asset_key", how="left")
-        for tcol in BRIDGE_ASSET_FROM_FORECLOSURE.keys():
-            tmpcol = f"__fc__{tcol}"
-            if tmpcol in out.columns:
-                out[tcol] = coalesce_keep_nonblank(out[tmpcol], out.get(tcol, pd.Series([pd.NA] * len(out), index=out.index)))
-                out = out.drop(columns=[tmpcol], errors="ignore")
-            if tcol in out.columns:
-                out[tcol] = coalesce_keep_nonblank(out[tcol], pd.Series(["N/A"] * len(out), index=out.index))
 
     if not sf_am.empty and "Deal Loan Number" in sf_am.columns:
         am = sf_am.copy()
@@ -6194,49 +6061,6 @@ def _set_scaffold_cell(ws, row_idx: int, col_idx: int, value):
         cell.number_format = DATE_NUMBER_FORMAT
 
 
-def _qend_npl_header(q_end: date, suffix: str = "") -> str:
-    base = f"{q_end.month}/{q_end.day} NPL"
-    return f"{base} {suffix}".strip()
-
-
-def _resolve_scaffold_token(value, run_dt: date, q_end: date, upb_header: str):
-    if value == "__UPB__":
-        return upb_header
-    if value == "__QEND__":
-        return q_end
-    if value == "__QEND_NPL__":
-        return _qend_npl_header(q_end)
-    if value == "__QEND_NPL_YN__":
-        return _qend_npl_header(q_end, "(Y/N)")
-    if value == "__RUN_DT__":
-        return run_dt
-    return value
-
-
-def _ensure_bridge_asset_fc_columns(ws):
-    """Insert the two new Bridge Asset foreclosure columns when an older template is used."""
-    if ws.title != "Bridge Asset":
-        return
-    cur_az = clean_text(ws.cell(4, 52).value)
-    cur_ba = clean_text(ws.cell(4, 53).value)
-    if cur_az == "FC Sale Date" and cur_ba == "Rescheduled FC Sale Date":
-        return
-    if cur_az != "REO Date":
-        return
-
-    ws.insert_cols(52, 2)
-    max_row = max(ws.max_row, 5)
-    for row_idx in range(1, max_row + 1):
-        source = ws.cell(row_idx, 54)
-        for col_idx in (52, 53):
-            target = ws.cell(row_idx, col_idx)
-            if source.has_style:
-                target._style = copy(source._style)
-            target.number_format = source.number_format
-            target.alignment = copy(source.alignment)
-            target.font = copy(source.font)
-
-
 def refresh_summary_labels(wb, run_dt: date, upb_header: str):
     if "Summary" not in wb.sheetnames:
         return
@@ -6269,13 +6093,11 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
             continue
         ws = wb[sheet_name]
 
-        _ensure_bridge_asset_fc_columns(ws)
-
         for col_idx, val in blueprint.get("row1", {}).items():
-            _set_scaffold_cell(ws, 1, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+            _set_scaffold_cell(ws, 1, col_idx, q_end if val == "__QEND__" else val)
 
         for col_idx, val in blueprint.get("row2", {}).items():
-            _set_scaffold_cell(ws, 2, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+            _set_scaffold_cell(ws, 2, col_idx, q_end if val == "__QEND__" else val)
 
         subtotal_col = blueprint.get("subtotal_col")
         for col_idx, val in blueprint.get("row3", {}).items():
@@ -6285,10 +6107,10 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
                 col_letter = get_column_letter(subtotal_col)
                 ws.cell(3, col_idx).value = f"=SUBTOTAL(9,{col_letter}5:{col_letter}{max(5, ws.max_row)})"
             else:
-                ws.cell(3, col_idx).value = _resolve_scaffold_token(val, run_dt, q_end, upb_header)
+                ws.cell(3, col_idx).value = val
 
         for col_idx, val in blueprint.get("row4", {}).items():
-            ws.cell(4, col_idx).value = _resolve_scaffold_token(val, run_dt, q_end, upb_header)
+            ws.cell(4, col_idx).value = upb_header if val == "__UPB__" else val
 
     refresh_summary_labels(wb, run_dt, upb_header)
 
@@ -6660,14 +6482,7 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
 
     for col_idx in sorted(formula_seeds):
         header = header_by_col.get(col_idx, "")
-        if header == upb_header:
-            override_key = "__UPB__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", str(header), flags=re.I):
-            override_key = "__QEND_NPL_YN__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(header), flags=re.I):
-            override_key = "__QEND_NPL__"
-        else:
-            override_key = header
+        override_key = "__UPB__" if header == upb_header else header
         origin_formula = overrides.get(override_key, formula_seeds[col_idx]["formula"])
         origin_row = start_row
         origin_ref = f"{get_column_letter(col_idx)}{origin_row}"
@@ -6728,13 +6543,6 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
 
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
-    for _col_idx, _header in hdr:
-        if _header in df.columns:
-            continue
-        if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", str(_header), flags=re.I) and "3/31 NPL (Y/N)" in df.columns:
-            df[_header] = df["3/31 NPL (Y/N)"]
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(_header), flags=re.I) and "3/31 NPL" in df.columns:
-            df[_header] = df["3/31 NPL"]
     template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
@@ -6925,7 +6733,7 @@ EMBEDDED_AUDIT_PROTECTED_HEADERS = {
     "Bridge Asset": {
         "Deal Number", "Servicer ID", "SF Yardi ID", "Asset ID", "Deal Name", "Address",
         "City", "State", "Zip", "County", "CBSA", "APN", "# of Units", "Year Built",
-        "Square Feet", "Origination Date", "FC Sale Date", "Rescheduled FC Sale Date", "Origination Value Dt", "Origination As-Is Value",
+        "Square Feet", "Origination Date", "Origination Value Dt", "Origination As-Is Value",
         "Origination ARV", "Most Recent Appraisal Order Date", "Updated Valuation Date",
         "Updated As-Is Value", "Updated ARV", "Initial Disbursement Funded", "Renovation Holdback",
         "Interest Allocation",
@@ -7793,15 +7601,11 @@ if build_btn:
                 status.update(label="Pulling valuation data from Salesforce...")
                 bridge_val = _build_valuation_like(asset_ids=bridge_asset_ids)
 
-                status.update(label="Pulling foreclosure sale dates from Salesforce...")
-                bridge_foreclosure = _build_foreclosure_like(asset_ids=bridge_asset_ids)
-
                 status.update(label="Building Bridge Asset...")
                 bridge_asset_df = build_bridge_asset(
                     bridge_spine,
                     bridge_dnl,
                     bridge_val,
-                    bridge_foreclosure,
                     sf_am,
                     sf_active_rm,
                     serv_join,
@@ -7860,7 +7664,7 @@ if build_btn:
                     write_output_sheet(wb, "Bridge Loan", bridge_loan_df, upb_col)
                     del bridge_loan_df
 
-                del bridge_spine, bridge_loan_wide, bridge_property_rollup, bridge_dnl, bridge_asset_ids, bridge_val, bridge_foreclosure, bridge_asset_df
+                del bridge_spine, bridge_loan_wide, bridge_property_rollup, bridge_dnl, bridge_asset_ids, bridge_val, bridge_asset_df
                 gc.collect()
 
             if need_term:
