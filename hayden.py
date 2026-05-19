@@ -10,7 +10,7 @@ import urllib.parse
 import warnings
 from copy import copy
 from dataclasses import dataclass
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, timedelta, time as datetime_time
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -46,9 +46,11 @@ except Exception as _audit_import_exc:
 
 PRIMARY_USER_NAME = "Hayden"
 TEMPLATE_FILENAMES = (
-    "20260330 Active Loans vDRAFT.xlsx",
     "Active Loan Template.xlsx",
     "Active Loan Report Template.xlsx",
+    "Active Loan Template - 20260518 Clean.xlsx",
+    "20260518 Active Loans.xlsx",
+    "20260330 Active Loans vDRAFT.xlsx",
 )
 API_VERSION = "v66.0"
 BULK_PAGE_SIZE = 5000
@@ -67,6 +69,10 @@ BRIDGE_OVER_COMMITMENT_WARN_TOLERANCE_DOLLARS = 2500.00
 BRIDGE_OVER_COMMITMENT_WARN_RATIO = 0.0005
 BRIDGE_EXCEPTION_STAGES_ALLOW_OVER_COMMITMENT = {"Expired", "Matured", "Sold", "REO", "REO-Sold"}
 UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
+# Preserve formula columns from the completed-report template. Set False only for
+# mismatch debugging where formula cached values are unavailable before Excel recalculates.
+PRESERVE_TERM_ASSET_FORMULA_COLUMNS = True
+
 
 VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
 BRIDGE_ACTIVE_STAGES = VALID_STAGES.copy()
@@ -179,7 +185,7 @@ SHEET_DATE_HEADERS = {
         "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
     },
     "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
-    "Term Asset": set(),
+    "Term Asset": {"Date", "Value Date"},
 }
 
 SHEET_DATETIME_HEADERS = {
@@ -363,6 +369,11 @@ TERM_LOAN_FROM_TERM_WIDE = {
 TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "Deal Number": "Deal Loan Number",
     "Asset ID": "Asset ID",
+    # 5/18 official report columns. These are prior-completed-report first.
+    # Current Salesforce term-asset pulls may not supply Portfolio; build_term_asset
+    # carries it from the prior report or current Term Loan by Deal Number.
+    "Portfolio": "Portfolio",
+    "Date": "Date",
     "Address": "Address",
     "City": "City",
     "State": "State",
@@ -409,7 +420,9 @@ DRAFT_FORMULA_OVERRIDES = {
         "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
     },
     "Term Asset": {
-        "__UPB__": "=($K5/SUMIFS($K:$K,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
+        # 5/18 Term Asset layout: Property ALA moved to column M and UPB moved to N
+        # after Portfolio and Date were added at D/E.
+        "__UPB__": "=($M5/SUMIFS($M:$M,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
         "Special (Y/N)": "=_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$AD:$AD)",
     },
 }
@@ -528,13 +541,13 @@ SHEET_BLUEPRINTS = {
             96: "Most Recent ARV",
             97: "Needs NPL Value",
             98: "Securitized (Y/N)",
-        "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
+            99: "SSP JV (Y/N)",
             100: "CPP JV (Y/N)",
             101: "Oaktree JV (Y/N)",
             102: "Legacy (Y/N)",
             103: "Matured Loan (YN)",
             104: "DQ 45+ Loan (Y/N)",
-        "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AK5,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
+            105: "SA Loan (Y/N)",
             106: "__QEND_NPL_YN__",
             107: "Special Flag",
         },
@@ -646,24 +659,26 @@ SHEET_BLUEPRINTS = {
     "Term Asset": {
         "row1": {},
         "row2": {},
-        "row3": {12: "__SUBTOTAL__"},
+        "row3": {14: "__SUBTOTAL__"},
         "row4": {
             2: "Deal Number",
             3: "Asset ID",
-            4: "Address",
-            5: "City",
-            6: "State",
-            7: "Zip",
-            8: "CBSA",
-            9: "# Units",
-            10: "Property Type",
-            11: "Property ALA",
-            12: "__UPB__",
-            13: "Special (Y/N)",
-            14: "Value Date",
-            15: "As-Is Value",
+            4: "Portfolio",
+            5: "Date",
+            6: "Address",
+            7: "City",
+            8: "State",
+            9: "Zip",
+            10: "CBSA",
+            11: "# Units",
+            12: "Property Type",
+            13: "Property ALA",
+            14: "__UPB__",
+            15: "Special (Y/N)",
+            16: "Value Date",
+            17: "As-Is Value",
         },
-        "subtotal_col": 12,
+        "subtotal_col": 14,
     },
 }
 
@@ -2692,6 +2707,7 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
 
     generic_value_date_field = first_existing_field_name("Property__c", ["Value_Date__c", "Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"])
     generic_value_field = first_existing_field_name("Property__c", ["Value__c", "Appraised_Value_Amount__c"])
+    term_asset_date_field = first_existing_field_name("Property__c", ["Acquisition_Date__c", "Close_Date__c", "Purchase_Date__c"])
 
     select_pairs = [
         ("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c"),
@@ -2715,6 +2731,8 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         ("Property Created Date", "CreatedDate"),
         ("Property Last Modified Date", "LastModifiedDate"),
     ]
+    if term_asset_date_field:
+        select_pairs.append(("Date", term_asset_date_field))
     if generic_value_date_field and generic_value_date_field not in {"Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"}:
         select_pairs.append(("Generic Value Date", generic_value_date_field))
     if generic_value_field and generic_value_field != "Appraised_Value_Amount__c":
@@ -3926,7 +3944,7 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
         if "Deal Number" in ta.columns and "Asset ID" in ta.columns:
             keep = [
                 c for c in [
-                    "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "CBSA",
+                    "Deal Number", "Asset ID", "Portfolio", "Date", "Address", "City", "State", "Zip", "CBSA",
                     "# Units", "Property Type", "Property ALA", "Value Date", "As-Is Value",
                     "Special (Y/N)", "CPP JV",
                 ] if c in ta.columns
@@ -5779,7 +5797,17 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     if out.empty:
         return out
 
-    # Refresh only loan-derived flags from the current Term Loan tab.
+    # Refresh only loan-derived fields from the current Term Loan tab. Prior Term Asset
+    # values remain first; current Term Loan fills blanks, especially for appended new assets.
+    if "Portfolio" in tl.columns:
+        tl_portfolio = tl[["_deal_key", "Portfolio"]].drop_duplicates("_deal_key")
+        out = out.merge(tl_portfolio, on="_deal_key", how="left", suffixes=("", "_loan"))
+        out["Portfolio"] = coalesce_report_display_first(
+            out.get("Portfolio", pd.Series([pd.NA] * len(out), index=out.index)),
+            out.get("Portfolio_loan", pd.Series([pd.NA] * len(out), index=out.index)),
+        )
+        out = out.drop(columns=["Portfolio_loan"], errors="ignore")
+
     if "CPP JV" in tl.columns:
         tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
         out = out.merge(tl_cpp, on="_deal_key", how="left", suffixes=("", "_loan"))
@@ -6382,6 +6410,122 @@ def header_tuples_from_ws(ws, header_row: int = 4, wb=None, upb_header: Optional
     return out
 
 
+
+
+def _validate_sheet_blueprints_or_raise():
+    """Fail fast when a sheet blueprint contains invalid Excel columns or formula headers.
+
+    This catches the exact class of regression that caused the 5/18 drift: formula
+    strings accidentally placed as row-4 header keys, missing numeric column keys,
+    or row-4 formula values where static report headers are expected.
+    """
+    errors: List[str] = []
+    for sheet_name, blueprint in SHEET_BLUEPRINTS.items():
+        for row_name in ("row1", "row2", "row3", "row4"):
+            for col_idx, value in blueprint.get(row_name, {}).items():
+                try:
+                    _scaffold_col_index(col_idx)
+                except Exception as exc:
+                    errors.append(f"{sheet_name}.{row_name}: invalid column key {col_idx!r}: {exc}")
+                if row_name == "row4" and isinstance(value, str) and value.strip().startswith("="):
+                    errors.append(
+                        f"{sheet_name}.row4 column {col_idx!r}: header value is a formula. "
+                        "Move formulas to DRAFT_FORMULA_OVERRIDES and keep row4 as static/dynamic header text."
+                    )
+    if errors:
+        raise ValueError("Invalid Active Loan Report sheet blueprint:\n" + "\n".join(f"- {e}" for e in errors))
+
+
+def _expected_header_matches(actual_header: str, expected_header: str, upb_header: str) -> bool:
+    actual = clean_text(actual_header)
+    expected = clean_text(expected_header)
+    if expected == "__UPB__":
+        return actual == clean_text(upb_header)
+    if expected == "__QEND_NPL__":
+        return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", actual, flags=re.I))
+    if expected == "__QEND_NPL_YN__":
+        return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", actual, flags=re.I))
+    return actual == expected
+
+
+def _formula_override_key_for_header(header: str, upb_header: str) -> str:
+    header = clean_text(header)
+    if header == clean_text(upb_header):
+        return "__UPB__"
+    if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", header, flags=re.I):
+        return "__QEND_NPL_YN__"
+    if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", header, flags=re.I):
+        return "__QEND_NPL__"
+    return header
+
+
+def validate_sheet_schema_or_raise(wb, sheet_name: str, upb_header: str) -> None:
+    """Validate row-4 report schema before values are written.
+
+    This guard prevents a high mismatch count caused by missing columns from being
+    mistaken for a source-mapping failure.
+    """
+    _validate_sheet_blueprints_or_raise()
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Required sheet missing from workbook: {sheet_name}")
+    blueprint = SHEET_BLUEPRINTS.get(sheet_name, {})
+    expected = blueprint.get("row4", {})
+    if not expected:
+        return
+
+    ws = wb[sheet_name]
+    actual_by_col = {col_idx: header for col_idx, header in header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)}
+    errors: List[str] = []
+
+    seen: Dict[str, int] = {}
+    for _col_idx, header in actual_by_col.items():
+        if not clean_text(header):
+            continue
+        seen[header] = seen.get(header, 0) + 1
+    duplicates = sorted([h for h, count in seen.items() if count > 1 and not UPB_HEADER_RE.search(h)])
+    if duplicates:
+        errors.append(f"duplicate row-4 header(s): {', '.join(duplicates)}")
+
+    for raw_col_idx, expected_header in expected.items():
+        col_idx = _scaffold_col_index(raw_col_idx)
+        actual_header = actual_by_col.get(col_idx, "")
+        if not _expected_header_matches(actual_header, str(expected_header), upb_header):
+            expected_display = upb_header if expected_header == "__UPB__" else str(expected_header)
+            errors.append(
+                f"column {get_column_letter(col_idx)} expected {expected_display!r} but found {actual_header!r}"
+            )
+
+    overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
+    if overrides:
+        formula_cols = formula_col_indices(ws, start_row=5, header_row=4, scan_rows=50)
+        allowed_keys = set(overrides.keys())
+        for col_idx in sorted(formula_cols):
+            header = actual_by_col.get(col_idx, "")
+            formula_key = _formula_override_key_for_header(header, upb_header)
+            if formula_key not in allowed_keys:
+                errors.append(
+                    f"column {get_column_letter(col_idx)} has a row-5 formula seed under non-formula header {header!r}"
+                )
+        for col_idx, header in actual_by_col.items():
+            formula_key = _formula_override_key_for_header(header, upb_header)
+            if formula_key in allowed_keys and col_idx not in formula_cols:
+                errors.append(
+                    f"column {get_column_letter(col_idx)} header {header!r} is expected to have a row-5 formula seed"
+                )
+
+    if errors:
+        raise ValueError(
+            f"{sheet_name} template/schema validation failed before writing data.\n"
+            + "\n".join(f"- {e}" for e in errors)
+        )
+
+
+def validate_workbook_schema_or_raise(wb, upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> None:
+    targets = list(sheet_names) if sheet_names else ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
+    for sheet_name in targets:
+        validate_sheet_schema_or_raise(wb, sheet_name, upb_header)
+
+
 def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4, scan_rows: int = 50) -> Set[int]:
     fcols: Set[int] = set()
     max_scan_row = min(ws_formula.max_row, start_row + scan_rows - 1)
@@ -6526,6 +6670,21 @@ def _coerce_excel_date_value(val):
         return _excel_strip_timezone(val).date()
     if isinstance(val, date):
         return val
+    if isinstance(val, np.generic):
+        val = val.item()
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        try:
+            if np.isnan(float(val)):
+                return None
+        except Exception:
+            pass
+        # pandas interprets bare numbers as nanoseconds. In Excel date columns,
+        # numeric values from prior workbooks are Excel serial dates.
+        if 1 <= float(val) <= 100000:
+            try:
+                return (datetime(1899, 12, 30) + timedelta(days=float(val))).date()
+            except Exception:
+                return val
     try:
         parsed = pd.to_datetime(val, errors="coerce")
         if pd.isna(parsed):
@@ -6712,6 +6871,7 @@ def _refresh_subtotal_formula(ws_formula, row_count: int, subtotal_row: int = 3,
     subtotal_col = blueprint.get("subtotal_col")
     if not subtotal_col:
         return
+    subtotal_col = _scaffold_col_index(subtotal_col)
     col_letter = get_column_letter(subtotal_col)
     end_row = max(start_row, start_row + row_count - 1)
     ws_formula.cell(subtotal_row, subtotal_col).value = f"=SUBTOTAL(9,{col_letter}{start_row}:{col_letter}{end_row})"
@@ -6754,6 +6914,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
 
     ws = wb[sheet_name]
     hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
+    validate_sheet_schema_or_raise(wb, sheet_name, upb_col)
     for _col_idx, _header in hdr:
         if _header in df.columns:
             continue
@@ -6765,7 +6926,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
 
-    if sheet_name == "Term Asset":
+    if sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
         force_write_headers = {upb_col, "Special (Y/N)"}
         force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
         fcols = {c for c in fcols if c not in force_write_cols}
@@ -6965,8 +7126,8 @@ EMBEDDED_AUDIT_PROTECTED_HEADERS = {
         "Deal Number", "Servicer ID", "SF Yardi ID", "Loan Amount", "Origination Date", "Maturity Date",
     },
     "Term Asset": {
-        "Deal Number", "Asset ID", "Address", "City", "State", "Zip", "Value Date",
-        "Property ALA", "As-Is Value",
+        "Deal Number", "Asset ID", "Portfolio", "Date", "Address", "City", "State", "Zip",
+        "CBSA", "# Units", "Property Type", "Value Date", "Property ALA", "As-Is Value",
     },
 }
 
@@ -7966,6 +8127,9 @@ if build_btn:
                 for sheet_name in ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
                 if build_target in (sheet_name, "All")
             ]
+            validate_workbook_schema_or_raise(wb, upb_col, sheet_names=selected_sheet_names)
+            diagnostics.append("Schema guardrail passed: selected report tabs have expected row-4 headers before save.")
+
             audit_summary = []
             audit_exceptions = []
             if run_postbuild_qa and ENFORCE_ZERO_FILLABLE_BLANKS:
