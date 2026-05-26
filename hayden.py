@@ -8,6 +8,7 @@ import secrets
 import time
 import urllib.parse
 import warnings
+import zipfile
 from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, time as datetime_time
@@ -15,6 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -45,6 +47,11 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
+APP_BUILD_VERSION = "ALR_FIX_2026_05_26_V9_WORKBOOK_POLICY_FORCED_QA"
+APP_BUILD_NOTES = (
+    "Forces post-build QA, applies workbook-level blank/N/A/zero policy after all writes/backfills, "
+    "and preserves formula columns while injecting known cached formula results for mismatch testing."
+)
 TEMPLATE_FILENAMES = (
     "Active Loan Template.xlsx",
     "Active Loan Report Template.xlsx",
@@ -72,6 +79,10 @@ UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 # Preserve formula columns from the completed-report template. Set False only for
 # mismatch debugging where formula cached values are unavailable before Excel recalculates.
 PRESERVE_TERM_ASSET_FORMULA_COLUMNS = True
+# Current official 5/26 Active Loan Report uses the 15-column Term Asset layout
+# without Portfolio / Date. A stale 5/18 template with those two columns caused
+# 54k+ fake mismatches. Keep this explicit until the official report schema changes again.
+TERM_ASSET_SCHEMA_MODE = "legacy_15"
 
 
 VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
@@ -94,7 +105,9 @@ VALUATION_PROPERTY_STATUSES = ["Active", "REO"]
 
 EXPIRED_OR_MATURED_STAGES = ["Expired", "Matured"]
 REO_FAMILY_STAGES = ["REO"]
-TERM_ACTIVE_STAGES = VALID_STAGES.copy()
+# Term report population can include newly boarded/purchased deals before they have a servicer ID.
+# Keep this term-specific; Bridge population is intentionally more restrictive.
+TERM_ACTIVE_STAGES = VALID_STAGES.copy() + ["Purchased", "Approved by Committee"]
 TERM_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 TERM_RECORDTYPE_NAMES = {"term loan", "dscr"}
 BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single asset bridge loan"}
@@ -206,39 +219,92 @@ DEFAULT_TEXT_HEADERS = {
 # The completed report intentionally uses "N/A" in several formula-driver and manual-review
 # fields. Leaving these as true Excel blanks can break downstream formulas (for example,
 # Bridge Asset DQ Status treats a blank REO Date as if the asset were REO).
+# Final display policy for fields that should show N/A when the source/carry-forward value is missing.
+# This is intentionally column-specific. The active report mixes true blanks, N/A placeholders, and zeroes.
+# Do not use one global default.
 REPORT_NA_FILL_HEADERS = {
     "Bridge Asset": {
-        "Additional APNs", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
-        "Remedy Plan", "Delinquency Notes", "Maturity Status", "Is Special Asset (Y/N)",
-        "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
-        "Special Asset: Resolved Date", "Forbearance Term Date", "FC Sale Date", "Rescheduled FC Sale Date", "REO Date",
-        # Origination Value Dt intentionally becomes N/A when Salesforce has no origination valuation date.
-        # Updated valuation fields should remain blank when no updated value exists; do not N/A-fill them.
-        "Origination Value Dt",
+        "Loan Buyer", "Financing", "Servicer ID", "Servicer", "SF Yardi ID",
+        "Borrower Entity", "Primary Contact", "County", "CBSA", "APN",
+        "Additional APNs", "# of Units", "Year Built", "Square Feet",
+        "First Funding Date", "Last Funding Date",
+        "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+        "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
+        "Maturity Status", "Is Special Asset (Y/N)", "Special Asset Status", "Special Asset Reason",
+        "Special Asset: Special Asset Status", "Special Asset: Resolved Date", "Forbearance Term Date",
+        "FC Sale Date", "Rescheduled FC Sale Date", "REO Date",
+        "Origination Value Dt", "Origination As-Is Value", "Origination ARV",
+        "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
         "Title Company", "Tax Due Date", "Tax Frequency", "Tax Commentary",
+        "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         "Servicer Status", "Servicer Maturity Date", "CV Maturity Date",
-        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
     },
     "Bridge Loan": {
-        "Next Advance Maturity Date", "Next Payment Date", "AM 1 Assigned Date",
-        "AM 2 Assigned Date", "CM Assigned Date", "AM Commentary",
+        "Loan Buyer", "Financing", "Servicer ID", "Servicer", "Borrower Name", "Primary Contact",
+        "Next Advance Maturity Date", "Next Payment Date", "Most Recent Valuation Date",
+        "Most Recent As-Is Value", "Most Recent ARV", "Transaction Type",
+        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
+        "Construction Mgr.", "CM Assigned Date", "AM Commentary",
     },
-    "Term Loan": {"REO Date", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary"},
+    "Term Loan": {
+        "Servicer ID", "Servicer", "Financing", "Loan Buyer", "REO Date", "Asset Manager",
+        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary",
+    },
+    "Term Asset": {"CBSA", "# Units"},
+}
+
+
+# Columns that must stay truly blank when source/carry-forward is blank or N/A.
+# Term Asset valuation fields are the main case: the current report leaves blanks there.
+REPORT_FORCE_BLANK_HEADERS = {
+    "Bridge Asset": set(),
+    "Bridge Loan": set(),
+    "Term Loan": set(),
+    "Term Asset": {"Value Date", "As-Is Value"},
+}
+
+
+# Numeric columns where a missing source value should become a true zero in the report.
+# These were audited against the 5/26 active report: funding / holdback / suspense / commitment
+# columns show zeroes rather than blanks, while valuation columns stay blank or N/A.
+REPORT_ZERO_FILL_HEADERS = {
+    "Bridge Asset": {
+        "Initial Disbursement Funded", "Renovation Holdback", "Renovation Holdback Funded",
+        "Renovation Holdback Remaining", "Interest Allocation", "Interest Allocation Funded",
+        "Suspense Balance",
+    },
+    "Bridge Loan": {
+        "Loan Commitment", "Active Funded Amount", "Suspense Balance", "Remaining Commitment",
+        "Initial Disbursement Funded", "Renovation Holdback", "Renovation HB Funded",
+        "Renovation HB Remaining", "Interest Allocation", "Interest Allocation Funded",
+    },
+    "Term Loan": set(),
     "Term Asset": set(),
 }
 
 
-# Columns that must stay truly blank when source/carry-forward is blank.
-# This prevents the QA/default pass from turning intentionally blank report fields
-# into N/A, especially Term Asset and updated valuation fields.
-REPORT_FORCE_BLANK_HEADERS = {
+
+# Non-formula cells in these columns should be repaired from the uploaded completed/prior workbook
+# when the generated value is blank OR an artificial zero while the baseline has a real value.
+# This is intentionally narrower than REPORT_ZERO_FILL_HEADERS: it prevents the app from
+# converting missing source values into fake zeroes for carry-forward/manual fields.
+REPORT_BASELINE_ZERO_REPAIR_HEADERS = {
     "Bridge Asset": {
-        "Most Recent Appraisal Order Date", "Updated Valuation Date",
-        "Updated As-Is Value", "Updated ARV",
+        "Suspense Balance", "Initial Disbursement Funded", "Renovation Holdback",
+        "Renovation Holdback Funded", "Renovation Holdback Remaining",
+        "Interest Allocation", "Interest Allocation Funded",
+        "Origination As-Is Value", "Origination ARV", "Updated As-Is Value", "Updated ARV",
+        "Most Recent As-Is Value", "Most Recent ARV",
     },
-    "Bridge Loan": set(),
+    "Bridge Loan": {
+        "Suspense Balance", "Initial Disbursement Funded", "Renovation Holdback",
+        "Renovation HB Funded", "Renovation HB Remaining",
+        "Interest Allocation", "Interest Allocation Funded",
+        "Most Recent As-Is Value", "Most Recent ARV",
+    },
     "Term Loan": set(),
-    "Term Asset": {"Value Date"},
+    "Term Asset": {"# Units", "Property ALA", "As-Is Value"},
 }
 
 REPORT_INTEGER_HEADERS = {
@@ -420,9 +486,11 @@ DRAFT_FORMULA_OVERRIDES = {
         "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
     },
     "Term Asset": {
-        # 5/18 Term Asset layout: Property ALA moved to column M and UPB moved to N
-        # after Portfolio and Date were added at D/E.
-        "__UPB__": "=($M5/SUMIFS($M:$M,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
+        # Fallback only. _term_asset_formula_override_for_layout() rewrites this
+        # dynamically based on the actual template layout: legacy/current reports
+        # use Property ALA in K and UPB in L; the temporary 5/18-style layout used
+        # Property ALA in M and UPB in N.
+        "__UPB__": "=($K5/SUMIFS($K:$K,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
         "Special (Y/N)": "=_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$AD:$AD)",
     },
 }
@@ -681,6 +749,97 @@ SHEET_BLUEPRINTS = {
         "subtotal_col": 14,
     },
 }
+
+
+# Term Asset has changed shape across completed reports. Do not force one hardcoded
+# layout over the workbook template. The current 5/26 official report uses the
+# legacy 15-column Term Asset layout without Portfolio/Date; one temporary 5/18
+# path used a 17-column layout with Portfolio/Date. The app now detects the layout
+# already present in the uploaded/completed report template and writes to that.
+TERM_ASSET_LEGACY_BLUEPRINT = {
+    "row1": {},
+    "row2": {},
+    "row3": {12: "__SUBTOTAL__"},
+    "row4": {
+        2: "Deal Number",
+        3: "Asset ID",
+        4: "Address",
+        5: "City",
+        6: "State",
+        7: "Zip",
+        8: "CBSA",
+        9: "# Units",
+        10: "Property Type",
+        11: "Property ALA",
+        12: "__UPB__",
+        13: "Special (Y/N)",
+        14: "Value Date",
+        15: "As-Is Value",
+    },
+    "subtotal_col": 12,
+}
+
+TERM_ASSET_PORTFOLIO_DATE_BLUEPRINT = SHEET_BLUEPRINTS["Term Asset"]
+
+
+def _template_header_at(ws, col_idx: int) -> str:
+    try:
+        return clean_text(ws.cell(4, col_idx).value)
+    except Exception:
+        return ""
+
+
+def _term_asset_uses_portfolio_date_layout(ws) -> bool:
+    return _template_header_at(ws, 4) == "Portfolio" and _template_header_at(ws, 5) == "Date"
+
+
+def _term_asset_uses_legacy_layout(ws) -> bool:
+    return _template_header_at(ws, 4) == "Address" and _template_header_at(ws, 11) == "Property ALA"
+
+
+def _ensure_term_asset_schema_mode(ws):
+    """Normalize Term Asset to the current official schema before scaffold/write.
+
+    The repo/uploaded template can lag the real report. For 5/26, the official
+    Term Asset tab does not include Portfolio/Date. If a stale 17-column template
+    is used, delete those two columns before headers/formulas are restored.
+    """
+    if ws.title != "Term Asset":
+        return
+    if TERM_ASSET_SCHEMA_MODE == "legacy_15" and _term_asset_uses_portfolio_date_layout(ws):
+        ws.delete_cols(4, 2)
+
+
+def _sheet_blueprint_for_ws(sheet_name: str, ws=None) -> dict:
+    if sheet_name == "Term Asset" and ws is not None:
+        if TERM_ASSET_SCHEMA_MODE == "legacy_15":
+            return TERM_ASSET_LEGACY_BLUEPRINT
+        if TERM_ASSET_SCHEMA_MODE == "portfolio_date_17":
+            return TERM_ASSET_PORTFOLIO_DATE_BLUEPRINT
+        if _term_asset_uses_legacy_layout(ws):
+            return TERM_ASSET_LEGACY_BLUEPRINT
+        if _term_asset_uses_portfolio_date_layout(ws):
+            return TERM_ASSET_PORTFOLIO_DATE_BLUEPRINT
+        return TERM_ASSET_LEGACY_BLUEPRINT
+    return SHEET_BLUEPRINTS.get(sheet_name, {})
+
+
+def _term_asset_formula_override_for_layout(ws_formula, override_key: str, header_by_col: Dict[int, str]) -> Optional[str]:
+    if ws_formula.title != "Term Asset":
+        return None
+    if override_key == "__UPB__":
+        property_ala_col = None
+        for col_idx, header in header_by_col.items():
+            if clean_text(header) == "Property ALA":
+                property_ala_col = col_idx
+                break
+        if not property_ala_col:
+            return None
+        ala_letter = get_column_letter(property_ala_col)
+        return f"=(${ala_letter}5/SUMIFS(${ala_letter}:${ala_letter},$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)"
+    if override_key == "Special (Y/N)":
+        return "=_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$AD:$AD)"
+    return None
 
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
@@ -2623,6 +2782,7 @@ def _build_term_wide_like() -> pd.DataFrame:
     servicer_name_field = first_existing_field_name("Opportunity", TERM_SERVICER_NAME_FIELD_CANDIDATES)
     servicer_commitment_field = first_existing_field_name("Opportunity", TERM_SERVICER_FALLBACK_FIELD_CANDIDATES)
     term_servicer_fields = existing_field_names("Opportunity", TERM_SERVICER_PRIMARY_FIELD_CANDIDATES)
+    payoff_date_field = first_existing_field_name("Opportunity", ["Payoff_Date__c", "Paid_Off_Date__c", "Actual_Payoff_Date__c", "Loan_Payoff_Date__c"])
 
     select_pairs = [
         ("Deal Loan Number", "Deal_Loan_Number__c"),
@@ -2654,6 +2814,8 @@ def _build_term_wide_like() -> pd.DataFrame:
         select_pairs.insert(0, ("Servicer Name", servicer_name_field))
     if servicer_commitment_field:
         select_pairs.insert(1, ("Servicer Commitment Id", servicer_commitment_field))
+    if payoff_date_field:
+        select_pairs.append(("Payoff Date", payoff_date_field))
     for idx, field_api in enumerate(term_servicer_fields, start=1):
         select_pairs.insert(2 + idx, (f"Term Servicer Key {idx}", field_api))
 
@@ -3165,17 +3327,39 @@ def _term_report_keep_mask(
     extra_reo_mask: Optional[pd.Series] = None,
 ) -> pd.Series:
     stage = pd.Series(stage_series, copy=False).astype("string").str.strip().fillna("")
-    current_upb = pd.to_numeric(pd.Series(current_upb_series, index=stage.index, copy=False), errors="coerce").fillna(0)
+    current_upb_raw = pd.to_numeric(pd.Series(current_upb_series, index=stage.index, copy=False), errors="coerce")
+    current_upb = current_upb_raw.fillna(0)
     sold_retained = _term_effective_sold_retained_mask(sold_servicing_status, fallback_prev_mask=fallback_prev_retained_mask)
     is_paid_off = stage.eq("Paid Off")
     is_reo_sold = stage.eq("REO-Sold")
     is_reo = stage.isin(REO_FAMILY_STAGES)
     if extra_reo_mask is not None:
+        # A carried REO Date can drive formulas, but it should not keep a current
+        # zero-UPB REO loan in the active population by itself.
         is_reo = is_reo | pd.Series(extra_reo_mask, index=stage.index, copy=False).fillna(False).astype(bool)
     is_sold = stage.eq("Sold")
+
+    # Current report population rule: a REO/Paid-Off/REO-Sold loan with current SF
+    # UPB of zero should not be resurrected by prior workbook carry-forward or an
+    # old servicer match. This directly protects against extras like 20747/37638.
+    terminal_zero_upb = stage.isin(["Paid Off", "REO", "REO-Sold"]) & current_upb_raw.notna() & current_upb.le(0)
     positive_upb_keep = current_upb.gt(0) & ~is_sold
-    keep = (is_reo | sold_retained | positive_upb_keep) & ~is_paid_off & ~is_reo_sold
+    keep = (sold_retained | positive_upb_keep) & ~is_paid_off & ~is_reo_sold & ~terminal_zero_upb
     return keep.fillna(False)
+
+
+def _term_current_terminal_zero_upb_keys(sf_term: pd.DataFrame) -> Set[str]:
+    if sf_term is None or sf_term.empty or "Deal Loan Number" not in sf_term.columns:
+        return set()
+    stage = sf_term.get("Stage", pd.Series([pd.NA] * len(sf_term), index=sf_term.index)).astype("string").str.strip()
+    upb_raw = pd.to_numeric(sf_term.get("Current Servicer UPB", pd.Series([np.nan] * len(sf_term), index=sf_term.index)), errors="coerce")
+    payoff_dt = pd.to_datetime(sf_term.get("Payoff Date", pd.Series([pd.NaT] * len(sf_term), index=sf_term.index)), errors="coerce")
+    terminal_stage = stage.isin(["Paid Off", "REO", "REO-Sold"])
+    zero_upb = upb_raw.notna() & upb_raw.le(0)
+    payoff_zero = payoff_dt.notna() & zero_upb
+    mask = (terminal_stage & zero_upb) | payoff_zero
+    keys = norm_id_series(sf_term.loc[mask, "Deal Loan Number"]).dropna().astype("string").tolist()
+    return {clean_text(k) for k in keys if clean_text(k)}
 
 
 def _term_segment_is_sold_servicing_retained(segment_series: pd.Series) -> pd.Series:
@@ -3392,8 +3576,10 @@ def _filter_term_population(
         fallback_prev_retained_mask=in_prev_sold_retained,
     )
     stage = out.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
-    carry_forward_active = in_prev_positive & (~stage.isin(["Paid Off", "REO-Sold"]))
-    keep_mask = keep_mask | carry_forward_active
+    current_upb = pd.to_numeric(out.get("Current Servicer UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    current_terminal_zero = stage.isin(["Paid Off", "REO", "REO-Sold"]) & current_upb.notna() & current_upb.le(0)
+    carry_forward_active = in_prev_positive & current_upb.gt(0) & (~stage.isin(["Paid Off", "REO-Sold"]))
+    keep_mask = (keep_mask | carry_forward_active) & ~current_terminal_zero
     return out.loc[keep_mask].copy()
 
 
@@ -4936,13 +5122,23 @@ def build_bridge_asset(
         keep = ["_asset_key"] + list(rename_map.keys())
         v = v[keep].rename(columns=rename_map).drop_duplicates("_asset_key")
         out = out.merge(v, on="_asset_key", how="left")
+        carry_forward_only_valuation = {
+            "Most Recent Appraisal Order Date",
+            "Updated Valuation Date",
+            "Updated As-Is Value",
+            "Updated ARV",
+        }
         for tcol in BRIDGE_ASSET_FROM_VALUATION.keys():
             tmpcol = f"__val__{tcol}"
             if tmpcol in out.columns:
-                out[tcol] = coalesce_keep_nonblank(
-                    out.get(tcol, pd.Series([pd.NA] * len(out), index=out.index)),
-                    out[tmpcol],
-                )
+                # Do not broadly refresh updated/current valuation fields from the
+                # live Property/Appraisal pull. The completed report carries these
+                # values forward unless a manually verified update is adopted.
+                if tcol not in carry_forward_only_valuation:
+                    out[tcol] = coalesce_keep_nonblank(
+                        out.get(tcol, pd.Series([pd.NA] * len(out), index=out.index)),
+                        out[tmpcol],
+                    )
                 out = out.drop(columns=[tmpcol], errors="ignore")
 
     if not sf_foreclosure.empty and "Asset ID" in sf_foreclosure.columns:
@@ -5091,7 +5287,11 @@ def build_bridge_asset(
     sid_count = out.groupby(["_deal_key", "_sid_key"], dropna=False)["_sid_key"].transform("size") if "_sid_key" in out.columns else pd.Series([np.nan] * len(out), index=out.index)
     safe_servicer_asset_upb = servicer_file_upb.where(out["_asset_count_in_deal"].le(1) | sid_count.eq(1))
 
-    asset_level_upb = _coalesce_positive_then_any_numeric(sf_current_upb, safe_servicer_asset_upb, prev_asset_upb_vals, index=out.index)
+    active_asset_upb = _coalesce_positive_then_any_numeric(sf_current_upb, safe_servicer_asset_upb, prev_asset_upb_vals, index=out.index)
+    prior_first_asset_upb = _coalesce_positive_then_any_numeric(prev_asset_upb_vals, sf_current_upb, safe_servicer_asset_upb, index=out.index)
+    stage_for_upb = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
+    carry_forward_upb_stage = stage_for_upb.isin(EXPIRED_OR_MATURED_STAGES + ["Sold", "REO", "REO-Sold"])
+    asset_level_upb = active_asset_upb.where(~carry_forward_upb_stage, prior_first_asset_upb)
 
     # Last-resort only: if no asset-level balance exists, allocate the deal-level
     # UPB so that the report can still roll Bridge Loan UPB. This path should be
@@ -5131,12 +5331,12 @@ def build_bridge_asset(
     out["Suspense Balance"] = serv_suspense.where(serv_suspense.notna(), sf_suspense_once)
     out["Suspense Balance"] = pd.to_numeric(out["Suspense Balance"], errors="coerce").fillna(0.0)
 
-    # The 5/11 report used the Salesforce property/opportunity next-payment date
-    # for Bridge Asset whenever Salesforce had it. Servicer next-payment date is
-    # only a fallback for blank Salesforce dates.
+    # The 5/26 completed report aligns Bridge Asset Next Payment Date to the
+    # current servicer/tape date when available. Salesforce property/opportunity
+    # dates are fallback only; using them first created thousands of mismatches.
     sf_next_payment = pd.to_datetime(sf_next_payment, errors="coerce")
     serv_next_payment = pd.to_datetime(out.get("_serv_next_payment_date"), errors="coerce")
-    out["Next Payment Date"] = sf_next_payment.where(sf_next_payment.notna(), serv_next_payment)
+    out["Next Payment Date"] = serv_next_payment.where(serv_next_payment.notna(), sf_next_payment)
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
@@ -5151,10 +5351,13 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
-            # Updated valuation fields are strict source fields now and are intentionally
-            # not carried forward here. If Salesforce has no updated value, they stay blank.
+            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         ] if c in man.columns]
+        if "_asset_key" in man.columns:
+            man = man.copy()
+            man["_has_prev_bridge_asset_manual"] = True
+            keep_cols = keep_cols + ["_has_prev_bridge_asset_manual"]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
         bridge_asset_carry_forward_first = {
             "Portfolio", "Segment", "Strategy Grouping", "REO Date", "Active RM",
@@ -5164,13 +5367,23 @@ def build_bridge_asset(
             "Maturity Status", "Title Company",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         }
-        for c in [x for x in keep_cols if x != "_asset_key"]:
+        bridge_asset_prior_exact_fields = {
+            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+        }
+        has_prev_asset_row = out.get("_has_prev_bridge_asset_manual", pd.Series([False] * len(out), index=out.index)).fillna(False).astype(bool)
+        for c in [x for x in keep_cols if x not in {"_asset_key", "_has_prev_bridge_asset_manual"}]:
             if f"{c}_prev" in out.columns:
-                if c in bridge_asset_carry_forward_first:
+                if c in bridge_asset_prior_exact_fields:
+                    # If the prior completed report had the row, use its value exactly,
+                    # including intentional blanks. Do not let current SF valuation
+                    # pulls repopulate fields the completed report left blank.
+                    out[c] = out[f"{c}_prev"].where(has_prev_asset_row, out.get(c, blank_obj))
+                elif c in bridge_asset_carry_forward_first:
                     out[c] = coalesce_keep_nonblank(out[f"{c}_prev"], out.get(c, blank_obj))
                 else:
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
+        out = out.drop(columns=["_has_prev_bridge_asset_manual"], errors="ignore")
 
     status_bucket = pd.Series(
         [
@@ -5722,6 +5935,13 @@ def build_term_loan(
     # Final display guard: the completed report displays Salesforce Servicer
     # Commitment Id by Deal Number. Servicer-file/alternate keys can enrich UPB,
     # but should not replace the visible report ID.
+    terminal_zero_keys = _term_current_terminal_zero_upb_keys(sf_term)
+    if terminal_zero_keys and "_deal_key" in out.columns:
+        before_terminal_filter = len(out)
+        out = out[~out["_deal_key"].astype("string").isin(terminal_zero_keys)].copy()
+        if before_terminal_filter != len(out):
+            blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
+
     if (sf_term_active is not None and not sf_term_active.empty
             and {"Deal Loan Number", "Servicer Commitment Id"}.issubset(sf_term_active.columns)):
         sf_commit = sf_term_active[["Deal Loan Number", "Servicer Commitment Id"]].copy()
@@ -6315,12 +6535,14 @@ def refresh_summary_labels(wb, run_dt: date, upb_header: str):
 def restore_template_scaffold(wb, run_dt: date, upb_header: str):
     q_end = quarter_end_for_run(run_dt)
 
-    for sheet_name, blueprint in SHEET_BLUEPRINTS.items():
+    for sheet_name, base_blueprint in SHEET_BLUEPRINTS.items():
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
 
         _ensure_bridge_asset_fc_columns(ws)
+        _ensure_term_asset_schema_mode(ws)
+        blueprint = _sheet_blueprint_for_ws(sheet_name, ws)
 
         for col_idx, val in blueprint.get("row1", {}).items():
             _set_scaffold_cell(ws, 1, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
@@ -6468,12 +6690,12 @@ def validate_sheet_schema_or_raise(wb, sheet_name: str, upb_header: str) -> None
     _validate_sheet_blueprints_or_raise()
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Required sheet missing from workbook: {sheet_name}")
-    blueprint = SHEET_BLUEPRINTS.get(sheet_name, {})
+    ws = wb[sheet_name]
+    blueprint = _sheet_blueprint_for_ws(sheet_name, ws)
     expected = blueprint.get("row4", {})
     if not expected:
         return
 
-    ws = wb[sheet_name]
     actual_by_col = {col_idx: header for col_idx, header in header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)}
     errors: List[str] = []
 
@@ -6763,16 +6985,21 @@ def _apply_report_blank_na_policy(df: pd.DataFrame, sheet_name: str) -> pd.DataF
         return pd.DataFrame() if df is None else df.copy()
     out = df.copy()
 
-    # Force blank-preserve columns first. These columns should not be filled with N/A.
+    # Force blank-preserve columns first. Treat literal N/A as blank here too; this prevents
+    # columns like Term Asset Value Date / As-Is Value from carrying an N/A placeholder forward.
     for header in REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set()):
         if header in out.columns:
             ser = pd.Series(out[header], index=out.index, dtype="object")
-            out[header] = ser.where(~blankish_mask(ser), pd.NA)
+            explicit_na = ser.astype("string").str.strip().str.upper().eq("N/A")
+            out[header] = ser.where(~(blankish_mask(ser) | explicit_na), pd.NA)
 
-    # Origination valuation date is intentionally N/A when not found in SF.
-    if sheet_name == "Bridge Asset" and "Origination Value Dt" in out.columns:
-        ser = pd.Series(out["Origination Value Dt"], index=out.index, dtype="object")
-        out["Origination Value Dt"] = ser.where(~blankish_mask(ser), "N/A")
+    # Zero-fill only columns that the completed report actually displays as zero when missing.
+    for header in REPORT_ZERO_FILL_HEADERS.get(sheet_name, set()):
+        if header in out.columns and header not in REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set()):
+            ser = pd.Series(out[header], index=out.index, dtype="object")
+            explicit_na = ser.astype("string").str.strip().str.upper().eq("N/A")
+            num = pd.to_numeric(ser, errors="coerce")
+            out[header] = num.where(~(blankish_mask(ser) | explicit_na), 0.0)
 
     return out
 
@@ -6799,8 +7026,9 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
     out = _apply_report_blank_na_policy(out, sheet_name)
 
     force_blank_headers = REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set())
+    zero_fill_headers = REPORT_ZERO_FILL_HEADERS.get(sheet_name, set())
     for header in REPORT_NA_FILL_HEADERS.get(sheet_name, set()):
-        if header in force_blank_headers:
+        if header in force_blank_headers or header in zero_fill_headers:
             continue
         if header in out.columns:
             ser = pd.Series(out[header], index=out.index, dtype="object")
@@ -6853,7 +7081,8 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
             override_key = "__QEND_NPL__"
         else:
             override_key = header
-        origin_formula = overrides.get(override_key, formula_seeds[col_idx]["formula"])
+        dynamic_formula = _term_asset_formula_override_for_layout(ws_formula, override_key, header_by_col)
+        origin_formula = dynamic_formula or overrides.get(override_key, formula_seeds[col_idx]["formula"])
         origin_row = start_row
         origin_ref = f"{get_column_letter(col_idx)}{origin_row}"
 
@@ -6867,7 +7096,7 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
 
 
 def _refresh_subtotal_formula(ws_formula, row_count: int, subtotal_row: int = 3, start_row: int = 5):
-    blueprint = SHEET_BLUEPRINTS.get(ws_formula.title, {})
+    blueprint = _sheet_blueprint_for_ws(ws_formula.title, ws_formula)
     subtotal_col = blueprint.get("subtotal_col")
     if not subtotal_col:
         return
@@ -6905,6 +7134,56 @@ def write_df_to_sheet_preserve_formulas(
             _apply_display_style(ws_formula, r, c, h, upb_header)
 
 
+
+def _formula_override_columns_from_headers(sheet_name: str, header_tuples: List[Tuple[int, str]], upb_header: str) -> Set[int]:
+    """Return columns that should be formula-driven even if the template seed is missing.
+
+    The template is allowed to provide formula seeds in row 5, but the code should not
+    silently treat a calculated report column as a data column just because a seed was
+    deleted. This prevents blanks / value overwrites in obvious formula columns such as
+    Bridge Asset SF Funded Amount.
+    """
+    overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
+    if not overrides:
+        return set()
+    forced: Set[int] = set()
+    for col_idx, header in header_tuples:
+        formula_key = _formula_override_key_for_header(header, upb_header)
+        if formula_key in overrides:
+            forced.add(col_idx)
+    return forced
+
+
+def _ensure_formula_seeds_from_overrides(
+    ws_formula,
+    formula_seeds: dict,
+    formula_cols: Set[int],
+    header_tuples: List[Tuple[int, str]],
+    upb_header: str,
+    start_row: int = 5,
+) -> dict:
+    """Guarantee formula seeds for override-backed formula columns.
+
+    openpyxl cannot create cached formula results, but it can preserve/write the formula.
+    This function makes formula preservation deterministic: if the template row-5 formula
+    is missing, use DRAFT_FORMULA_OVERRIDES instead of treating the column as writable data.
+    """
+    out = dict(formula_seeds or {})
+    overrides = DRAFT_FORMULA_OVERRIDES.get(ws_formula.title, {})
+    if not overrides:
+        return out
+    header_by_col = {col_idx: header for col_idx, header in header_tuples}
+    for col_idx in sorted(formula_cols):
+        if col_idx in out:
+            continue
+        header = header_by_col.get(col_idx, "")
+        formula_key = _formula_override_key_for_header(header, upb_header)
+        formula = overrides.get(formula_key)
+        if formula:
+            out[col_idx] = {"origin_row": start_row, "formula": formula}
+    return out
+
+
 def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     if sheet_name not in wb.sheetnames:
         return
@@ -6925,6 +7204,11 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    # Do not depend only on row-5 template formulas. If a formula seed is missing,
+    # DRAFT_FORMULA_OVERRIDES is the source of truth for known calculated columns.
+    # This protects columns like Bridge Asset SF Funded Amount from being treated as
+    # blank data columns when a template row is cleaned too aggressively.
+    fcols = set(fcols) | _formula_override_columns_from_headers(sheet_name, hdr, upb_col)
 
     if sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
         force_write_headers = {upb_col, "Special (Y/N)"}
@@ -6932,6 +7216,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
         fcols = {c for c in fcols if c not in force_write_cols}
 
     formula_seeds = _capture_formula_seeds(ws, fcols, start_row=5)
+    formula_seeds = _ensure_formula_seeds_from_overrides(ws, formula_seeds, fcols, hdr, upb_col, start_row=5)
 
     used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=4, start_row=5)
     _clear_sheet_body(ws, used_cols, start_row=5)
@@ -7027,6 +7312,39 @@ def _available_sheet_key_matches(wb, out_ws, base_wb, base_ws, sheet_name: str, 
             yield list(candidate), out_rows_try, base_rows_try, out_header_try, base_header_try
 
 
+
+
+def _numeric_zeroish(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip().upper() in {"", "N/A", "NA", "NONE", "NAN", "<NA>", "NAT"}:
+        return False
+    try:
+        num = float(str(value).replace(",", "").replace("$", "").strip())
+    except Exception:
+        return False
+    return abs(num) < 0.0000001
+
+
+def _numeric_nonzeroish(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value.strip().upper() in {"", "N/A", "NA", "NONE", "NAN", "<NA>", "NAT"}:
+        return False
+    try:
+        num = float(str(value).replace(",", "").replace("$", "").strip())
+    except Exception:
+        return False
+    return abs(num) >= 0.0000001
+
+
+def _is_repairable_zero_from_baseline(sheet_name: str, header: str, built_value, baseline_value) -> bool:
+    if header not in REPORT_BASELINE_ZERO_REPAIR_HEADERS.get(sheet_name, set()):
+        return False
+    if header in REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set()):
+        return False
+    return _numeric_zeroish(built_value) and _numeric_nonzeroish(baseline_value)
+
 def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> List[dict]:
     if not baseline_bytes:
         return []
@@ -7072,7 +7390,9 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
                             continue
                         out_cell = out_ws.cell(out_row, out_col)
                         base_cell = base_ws.cell(base_row, base_header_idx[header])
-                        if clean_text(out_cell.value) == "" and clean_text(base_cell.value) != "":
+                        should_fill_blank = clean_text(out_cell.value) == "" and clean_text(base_cell.value) != ""
+                        should_fill_zero = _is_repairable_zero_from_baseline(sheet_name, header, out_cell.value, base_cell.value)
+                        if should_fill_blank or should_fill_zero:
                             out_cell.value = base_cell.value
                             fills += 1
 
@@ -7727,6 +8047,613 @@ def enforce_zero_fillable_blanks(
 
 
 
+
+
+# -----------------------------------------------------------------------------
+# Formula cache injection
+# -----------------------------------------------------------------------------
+# openpyxl writes formulas but does not calculate and save cached formula results.
+# The active report comparison reads cached values, so formula columns looked blank even
+# when formulas were present. These helpers calculate the formula-output values we know
+# how to reproduce and inject them into the XLSX XML while keeping the formulas intact.
+
+_EXCEL_EPOCH = date(1899, 12, 30)
+
+
+def _excel_serial_from_date(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        value = _excel_strip_timezone(value).date()
+    elif isinstance(value, datetime):
+        value = _excel_strip_timezone(value).date()
+    elif isinstance(value, np.datetime64):
+        try:
+            value = pd.Timestamp(value).date()
+        except Exception:
+            return None
+    elif not isinstance(value, date):
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        value = parsed.date()
+    return float((value - _EXCEL_EPOCH).days)
+
+
+def _formula_cache_xml_value(value):
+    if value is None or value is pd.NA:
+        return None, None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None, None
+        serial = _excel_serial_from_date(value)
+        return None, serial
+    if isinstance(value, datetime):
+        serial = _excel_serial_from_date(value)
+        return None, serial
+    if isinstance(value, date):
+        serial = _excel_serial_from_date(value)
+        return None, serial
+    if isinstance(value, np.generic):
+        value = value.item()
+    try:
+        if pd.isna(value):
+            return None, None
+    except Exception:
+        pass
+    if isinstance(value, bool):
+        return "b", "1" if value else "0"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            num = float(value)
+            if np.isnan(num):
+                return None, None
+            if num.is_integer():
+                return None, str(int(num))
+            return None, repr(num)
+        except Exception:
+            pass
+    txt = clean_text(value)
+    if txt == "":
+        return None, None
+    return "str", txt
+
+
+def _cache_coord(sheet_name: str, row_idx: int, col_idx: int) -> Tuple[str, str]:
+    return sheet_name, f"{get_column_letter(col_idx)}{row_idx}"
+
+
+def _cached_or_cell(cache_values: Dict[str, Dict[str, object]], ws, row_idx: int, col_idx: int):
+    coord = f"{get_column_letter(col_idx)}{row_idx}"
+    val = cache_values.get(ws.title, {}).get(coord, None)
+    if val is not None:
+        return val
+    raw = ws.cell(row_idx, col_idx).value
+    if isinstance(raw, str) and raw.startswith("="):
+        return None
+    return raw
+
+
+def _num_or_zero(value) -> float:
+    num = money_to_float(value)
+    if pd.isna(num):
+        return 0.0
+    return float(num)
+
+
+def _num_or_none(value):
+    num = money_to_float(value)
+    if pd.isna(num):
+        return None
+    return float(num)
+
+
+def _date_or_none(value):
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _date_serial_or_none(value):
+    return _excel_serial_from_date(value)
+
+
+def _is_na_text(value) -> bool:
+    txt = clean_text(value).upper()
+    return txt in {"", "N/A", "NA", "NONE", "NAN", "<NA>", "NAT"}
+
+
+def _add_days(d1, d2) -> Optional[float]:
+    serial1 = _date_serial_or_none(d1)
+    serial2 = _date_serial_or_none(d2)
+    if serial1 is None or serial2 is None:
+        return None
+    return float(serial1 - serial2)
+
+
+def _dq_label_from_days(days, reo_value=None) -> str:
+    if not _is_na_text(reo_value):
+        return "REO"
+    try:
+        d = float(days)
+    except Exception:
+        return "Current"
+    if d > 0 and d < 30:
+        return "DQ 1-29"
+    if d >= 30 and d < 60:
+        return "DQ 30-59"
+    if d >= 60 and d < 90:
+        return "DQ 60-89"
+    if d >= 90:
+        return "DQ 90+"
+    return "Current"
+
+
+def _term_special_flag(portfolio, next_payment_date, days_past_due, dq_status, qend_cutoff) -> str:
+    port = clean_text(portfolio)
+    qdt = _date_or_none(qend_cutoff)
+    npd = _date_or_none(next_payment_date)
+    try:
+        dpd = float(days_past_due)
+    except Exception:
+        dpd = 0.0
+    active_term_or_dscr = port in {"Active Term", "DSCR"}
+    qend_trigger = bool(active_term_or_dscr and qdt is not None and npd is not None and npd < qdt)
+    reo_trigger = clean_text(dq_status) == "REO"
+    dpd_trigger = bool(active_term_or_dscr and dpd >= 45)
+    return "Y" if (qend_trigger or reo_trigger or dpd_trigger) else "N"
+
+
+def _build_lookup_set_from_column(ws, col_idx: int, start_row: int = 1) -> Set[str]:
+    vals = set()
+    for r in range(start_row, ws.max_row + 1):
+        txt = clean_text(ws.cell(r, col_idx).value)
+        if txt:
+            vals.add(txt)
+    return vals
+
+
+def _build_strategy_sa_map(wb) -> Dict[str, str]:
+    if "Strategy Groupings" not in wb.sheetnames:
+        return {}
+    ws = wb["Strategy Groupings"]
+    out: Dict[str, str] = {}
+    for r in range(1, ws.max_row + 1):
+        key = clean_text(ws.cell(r, 6).value)
+        val = clean_text(ws.cell(r, 7).value)
+        if key:
+            out[key] = val or "N"
+    return out
+
+
+def _sheet_has_data_row(ws, row_idx: int, header_cols: Sequence[int]) -> bool:
+    for col_idx in header_cols:
+        if clean_text(ws.cell(row_idx, col_idx).value) != "":
+            return True
+    return False
+
+
+def _first_header_col(header_idx: Dict[str, int], *headers: str) -> Optional[int]:
+    for h in headers:
+        if h in header_idx:
+            return header_idx[h]
+    return None
+
+
+def _formula_cols_by_header(wb, ws, upb_header: str) -> Dict[int, str]:
+    hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)
+    header_by_col = {col: header for col, header in hdr}
+    overrides = DRAFT_FORMULA_OVERRIDES.get(ws.title, {})
+    fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    out: Dict[int, str] = {}
+    for col_idx, header in header_by_col.items():
+        key = _formula_override_key_for_header(header, upb_header)
+        if col_idx in fcols or key in overrides or (ws.title == "Term Asset" and key in {"__UPB__", "Special (Y/N)"}):
+            out[col_idx] = key
+    return out
+
+
+def _compute_bridge_asset_cache(wb, ws, upb_header: str, cache_values: Dict[str, Dict[str, object]]) -> None:
+    hdr = _sheet_header_index(wb, ws, upb_header)
+    header_cols = list(hdr.values())
+    formula_cols = _formula_cols_by_header(wb, ws, upb_header)
+    ssp_deals = _build_lookup_set_from_column(wb["SSP Loans"], 2, start_row=1) if "SSP Loans" in wb.sheetnames else set()
+    strategy_sa = _build_strategy_sa_map(wb)
+    data_rows = [r for r in range(5, ws.max_row + 1) if _sheet_has_data_row(ws, r, header_cols)]
+
+    deal_col = _first_header_col(hdr, "Deal Number")
+    next_payment_col = _first_header_col(hdr, "Next Payment Date")
+    days_maturity_col = _first_header_col(hdr, "Days to Maturity")
+    days_past_due_col = _first_header_col(hdr, "Days Past Due")
+    row_by_deal: Dict[str, List[int]] = {}
+    for r in data_rows:
+        deal = clean_text(ws.cell(r, deal_col).value) if deal_col else ""
+        if deal:
+            row_by_deal.setdefault(deal, []).append(r)
+
+    def get(r, header):
+        c = hdr.get(header)
+        return _cached_or_cell(cache_values, ws, r, c) if c else None
+
+    for r in data_rows:
+        for col_idx in sorted(formula_cols):
+            key = formula_cols[col_idx]
+            val = None
+            if key == "SF Funded Amount":
+                val = _num_or_zero(get(r, "Initial Disbursement Funded")) + _num_or_zero(get(r, "Renovation Holdback Funded")) + _num_or_zero(get(r, "Interest Allocation Funded"))
+            elif key == "CV Maturity Date":
+                product_type = clean_text(get(r, "Product Type"))
+                product_subtype = clean_text(get(r, "Product Sub-Type"))
+                val = get(r, "Current Asset Maturity Date") if (product_type == "Credit Line" or product_subtype == "Line of Credit") else get(r, "Current Loan Maturity date")
+            elif key == "Maturity Difference":
+                diff = _add_days(get(r, "Maturity Date"), get(r, "Servicer Maturity Date"))
+                val = diff if diff is not None else "N/A"
+            elif key == "Maturity Date":
+                val = get(r, "Servicer Maturity Date") if not _is_na_text(get(r, "Servicer Maturity Date")) else get(r, "CV Maturity Date")
+            elif key == "Days to Maturity":
+                diff = _add_days(get(r, "Maturity Date"), ws.cell(3, hdr.get("Days to Maturity", col_idx)).value)
+                val = diff if diff is not None else None
+            elif key == "Days Past Due":
+                diff = _add_days(ws.cell(3, hdr.get("Days Past Due", col_idx)).value, get(r, "Next Payment Date"))
+                val = diff if diff is not None else None
+            elif key == "DQ Status":
+                val = _dq_label_from_days(get(r, "Days Past Due"), get(r, "REO Date"))
+            elif key == "Most Recent Valuation Date":
+                val = get(r, "Updated Valuation Date") if not _is_na_text(get(r, "Updated Valuation Date")) else get(r, "Origination Value Dt")
+            elif key == "Most Recent As-Is Value":
+                val = get(r, "Updated As-Is Value") if not _is_na_text(get(r, "Updated Valuation Date")) else get(r, "Origination As-Is Value")
+            elif key == "Most Recent ARV":
+                val = get(r, "Updated ARV") if not _is_na_text(get(r, "Updated Valuation Date")) else get(r, "Origination ARV")
+            elif key == "Needs NPL Value":
+                recent = _date_or_none(get(r, "Most Recent Valuation Date"))
+                threshold = _date_or_none(ws.cell(3, hdr.get("Needs NPL Value", col_idx)).value)
+                val = "Y" if clean_text(get(r, "6/30 NPL (Y/N)")) == "Y" and recent is not None and threshold is not None and recent < threshold else "N"
+            elif key == "Securitized (Y/N)":
+                val = "Y" if clean_text(get(r, "Segment")) == "Securitized Bridge" else "N"
+            elif key == "SSP JV (Y/N)":
+                val = "Y" if clean_text(get(r, "Deal Number")) in ssp_deals else "N"
+            elif key == "CPP JV (Y/N)":
+                val = "Y" if clean_text(get(r, "Segment")) == "CPP JV" else "N"
+            elif key == "Oaktree JV (Y/N)":
+                val = "Y" if clean_text(get(r, "Segment")) == "Oaktree JV" else "N"
+            elif key == "Legacy (Y/N)":
+                val = "Y" if clean_text(get(r, "Segment")) == "Legacy" else "N"
+            elif key == "SA Loan (Y/N)":
+                val = strategy_sa.get(clean_text(get(r, "Strategy Grouping")), "N")
+            elif key == "__QEND_NPL_YN__":
+                deal = clean_text(get(r, "Deal Number"))
+                dates = [_date_or_none(ws.cell(rr, next_payment_col).value) for rr in row_by_deal.get(deal, [])] if next_payment_col else []
+                dates = [d for d in dates if d is not None]
+                cutoff = _date_or_none(ws.cell(3, col_idx).value)
+                val = "Y" if clean_text(get(r, "Financing")) != "Sold" and dates and cutoff is not None and min(dates) < cutoff else "N"
+            elif key == "Matured Loan (YN)":
+                deal = clean_text(get(r, "Deal Number"))
+                vals = [_num_or_none(_cached_or_cell(cache_values, ws, rr, days_maturity_col)) for rr in row_by_deal.get(deal, [])] if days_maturity_col else []
+                vals = [x for x in vals if x is not None]
+                val = "Y" if vals and min(vals) < 0 else "N"
+            elif key == "DQ 45+ Loan (Y/N)":
+                deal = clean_text(get(r, "Deal Number"))
+                vals = [_num_or_none(_cached_or_cell(cache_values, ws, rr, days_past_due_col)) for rr in row_by_deal.get(deal, [])] if days_past_due_col else []
+                vals = [x for x in vals if x is not None]
+                val = "Y" if vals and max(vals) >= 45 else "N"
+            elif key == "Special Flag":
+                val = "Y" if clean_text(get(r, "Financing")) != "Sold" and any(clean_text(get(r, h)) == "Y" for h in ["Legacy (Y/N)", "Matured Loan (YN)", "DQ 45+ Loan (Y/N)", "SA Loan (Y/N)"]) else "N"
+            if val is not None:
+                cache_values.setdefault(ws.title, {})[f"{get_column_letter(col_idx)}{r}"] = val
+
+
+def _compute_bridge_loan_cache(wb, ws, upb_header: str, cache_values: Dict[str, Dict[str, object]]) -> None:
+    hdr = _sheet_header_index(wb, ws, upb_header)
+    col = hdr.get("Days Past Due")
+    npd_col = hdr.get("Next Payment Date")
+    if not col or not npd_col:
+        return
+    header_cols = list(hdr.values())
+    run_value = ws.cell(3, col).value
+    for r in range(5, ws.max_row + 1):
+        if not _sheet_has_data_row(ws, r, header_cols):
+            continue
+        val = _add_days(run_value, ws.cell(r, npd_col).value)
+        if val is not None:
+            cache_values.setdefault(ws.title, {})[f"{get_column_letter(col)}{r}"] = val
+
+
+def _compute_term_loan_cache(wb, ws, upb_header: str, cache_values: Dict[str, Dict[str, object]]) -> None:
+    hdr = _sheet_header_index(wb, ws, upb_header)
+    header_cols = list(hdr.values())
+    days_col = hdr.get("Days Past Due")
+    dq_col = hdr.get("DQ Status")
+    special_col = hdr.get("Special Loans List (Y/N)")
+    npd_col = hdr.get("Next Payment Date")
+    reo_col = hdr.get("REO Date")
+    portfolio_col = hdr.get("Portfolio")
+    qend_cutoff = ws.cell(3, special_col).value if special_col else None
+    run_value = ws.cell(3, days_col).value if days_col else None
+    for r in range(5, ws.max_row + 1):
+        if not _sheet_has_data_row(ws, r, header_cols):
+            continue
+        if days_col and npd_col:
+            days = _add_days(run_value, ws.cell(r, npd_col).value)
+            if days is not None:
+                cache_values.setdefault(ws.title, {})[f"{get_column_letter(days_col)}{r}"] = days
+        days_val = _cached_or_cell(cache_values, ws, r, days_col) if days_col else None
+        if dq_col:
+            dq = _dq_label_from_days(days_val, ws.cell(r, reo_col).value if reo_col else None)
+            cache_values.setdefault(ws.title, {})[f"{get_column_letter(dq_col)}{r}"] = dq
+        if special_col:
+            dq_val = _cached_or_cell(cache_values, ws, r, dq_col) if dq_col else None
+            special = _term_special_flag(ws.cell(r, portfolio_col).value if portfolio_col else None, ws.cell(r, npd_col).value if npd_col else None, days_val, dq_val, qend_cutoff)
+            cache_values.setdefault(ws.title, {})[f"{get_column_letter(special_col)}{r}"] = special
+
+
+def _compute_term_asset_cache(wb, ws, upb_header: str, cache_values: Dict[str, Dict[str, object]]) -> None:
+    if "Term Loan" not in wb.sheetnames:
+        return
+    hdr = _sheet_header_index(wb, ws, upb_header)
+    tl_ws = wb["Term Loan"]
+    tl_hdr = _sheet_header_index(wb, tl_ws, upb_header)
+    deal_col = hdr.get("Deal Number")
+    ala_col = hdr.get("Property ALA")
+    upb_col_idx = hdr.get(upb_header)
+    special_col = hdr.get("Special (Y/N)")
+    if not deal_col:
+        return
+    tl_deal_col = tl_hdr.get("Deal Number")
+    tl_upb_col = tl_hdr.get(upb_header)
+    tl_special_col = tl_hdr.get("Special Loans List (Y/N)")
+    loan_upb_by_deal: Dict[str, float] = {}
+    special_by_deal: Dict[str, str] = {}
+    if tl_deal_col:
+        for r in range(5, tl_ws.max_row + 1):
+            deal = clean_text(tl_ws.cell(r, tl_deal_col).value)
+            if not deal:
+                continue
+            if tl_upb_col:
+                val = _num_or_none(tl_ws.cell(r, tl_upb_col).value)
+                if val is not None:
+                    loan_upb_by_deal[deal] = val
+            if tl_special_col:
+                sp = clean_text(_cached_or_cell(cache_values, tl_ws, r, tl_special_col)) or clean_text(tl_ws.cell(r, tl_special_col).value)
+                if sp:
+                    special_by_deal[deal] = sp
+    header_cols = list(hdr.values())
+    rows_by_deal: Dict[str, List[int]] = {}
+    for r in range(5, ws.max_row + 1):
+        if not _sheet_has_data_row(ws, r, header_cols):
+            continue
+        deal = clean_text(ws.cell(r, deal_col).value)
+        if deal:
+            rows_by_deal.setdefault(deal, []).append(r)
+    ala_sum: Dict[str, float] = {}
+    for deal, rows in rows_by_deal.items():
+        total = 0.0
+        if ala_col:
+            for r in rows:
+                total += max(_num_or_zero(ws.cell(r, ala_col).value), 0.0)
+        ala_sum[deal] = total
+    for deal, rows in rows_by_deal.items():
+        loan_upb = loan_upb_by_deal.get(deal)
+        total_ala = ala_sum.get(deal, 0.0)
+        for idx, r in enumerate(rows):
+            if upb_col_idx and loan_upb is not None:
+                if total_ala > 0 and ala_col:
+                    val = loan_upb * max(_num_or_zero(ws.cell(r, ala_col).value), 0.0) / total_ala
+                else:
+                    val = loan_upb / max(len(rows), 1)
+                if idx == len(rows) - 1:
+                    prev_sum = sum(cache_values.setdefault(ws.title, {}).get(f"{get_column_letter(upb_col_idx)}{rr}", 0) or 0 for rr in rows[:-1])
+                    val = loan_upb - float(prev_sum)
+                cache_values.setdefault(ws.title, {})[f"{get_column_letter(upb_col_idx)}{r}"] = val
+            if special_col:
+                cache_values.setdefault(ws.title, {})[f"{get_column_letter(special_col)}{r}"] = special_by_deal.get(deal, "N")
+
+
+def build_formula_cache_values(wb, upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> Dict[str, Dict[str, object]]:
+    targets = list(sheet_names) if sheet_names else ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
+    cache_values: Dict[str, Dict[str, object]] = {}
+    if "Bridge Asset" in targets and "Bridge Asset" in wb.sheetnames:
+        _compute_bridge_asset_cache(wb, wb["Bridge Asset"], upb_header, cache_values)
+    if "Bridge Loan" in targets and "Bridge Loan" in wb.sheetnames:
+        _compute_bridge_loan_cache(wb, wb["Bridge Loan"], upb_header, cache_values)
+    if "Term Loan" in targets and "Term Loan" in wb.sheetnames:
+        _compute_term_loan_cache(wb, wb["Term Loan"], upb_header, cache_values)
+    if "Term Asset" in targets and "Term Asset" in wb.sheetnames:
+        _compute_term_asset_cache(wb, wb["Term Asset"], upb_header, cache_values)
+    return cache_values
+
+
+def _worksheet_xml_targets(xlsx_bytes: bytes) -> Dict[str, str]:
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(BytesIO(xlsx_bytes), "r") as zin:
+        wb_xml = ET.fromstring(zin.read("xl/workbook.xml"))
+        rels_xml = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+    rel_map = {}
+    for rel in rels_xml.findall(f"{{{pkg_rel_ns}}}Relationship"):
+        rid = rel.attrib.get("Id")
+        target = rel.attrib.get("Target", "")
+        if rid and target:
+            if not target.startswith("/"):
+                target = "xl/" + target.lstrip("/")
+            else:
+                target = target.lstrip("/")
+            rel_map[rid] = target
+    out = {}
+    for sheet in wb_xml.findall(f"{{{main_ns}}}sheets/{{{main_ns}}}sheet"):
+        name = sheet.attrib.get("name")
+        rid = sheet.attrib.get(f"{{{rel_ns}}}id")
+        if name and rid and rid in rel_map:
+            out[name] = rel_map[rid]
+    return out
+
+
+def inject_formula_cached_values_into_xlsx(xlsx_bytes: bytes, cache_values: Dict[str, Dict[str, object]]) -> bytes:
+    if not cache_values:
+        return xlsx_bytes
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ET.register_namespace("", main_ns)
+    sheet_targets = _worksheet_xml_targets(xlsx_bytes)
+    replacements: Dict[str, bytes] = {}
+    with zipfile.ZipFile(BytesIO(xlsx_bytes), "r") as zin:
+        for sheet_name, values_by_coord in cache_values.items():
+            target = sheet_targets.get(sheet_name)
+            if not target or target not in zin.namelist() or not values_by_coord:
+                continue
+            root = ET.fromstring(zin.read(target))
+            cells_by_ref = {c.attrib.get("r"): c for c in root.iter(f"{{{main_ns}}}c") if c.attrib.get("r")}
+            changed = False
+            for coord, value in values_by_coord.items():
+                cell = cells_by_ref.get(coord)
+                if cell is None:
+                    continue
+                # Only inject caches for formula cells. Non-formula values are already written normally.
+                if cell.find(f"{{{main_ns}}}f") is None:
+                    continue
+                cell_type, xml_value = _formula_cache_xml_value(value)
+                v_el = cell.find(f"{{{main_ns}}}v")
+                if xml_value is None:
+                    if v_el is not None:
+                        cell.remove(v_el)
+                        changed = True
+                    continue
+                if cell_type:
+                    cell.set("t", cell_type)
+                else:
+                    cell.attrib.pop("t", None)
+                if v_el is None:
+                    v_el = ET.SubElement(cell, f"{{{main_ns}}}v")
+                v_el.text = str(xml_value)
+                changed = True
+            if changed:
+                replacements[target] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    if not replacements:
+        return xlsx_bytes
+    out = BytesIO()
+    with zipfile.ZipFile(BytesIO(xlsx_bytes), "r") as zin, zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = replacements.get(item.filename)
+            if data is None:
+                data = zin.read(item.filename)
+            zout.writestr(item, data)
+    return out.getvalue()
+
+
+def _cell_is_formula(cell) -> bool:
+    return isinstance(cell.value, str) and cell.value.startswith("=")
+
+
+def _cell_blankish_value(value) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "nan", "none", "<na>", "nat"}
+    return False
+
+
+def _cell_force_blank_value(value) -> bool:
+    if _cell_blankish_value(value):
+        return True
+    if isinstance(value, str) and value.strip().upper() in {"N/A", "NA", "#N/A"}:
+        return True
+    return False
+
+
+def _apply_cell_display_format(ws, cell, header: str, upb_header: str) -> None:
+    try:
+        cell.font = copy(BASE_FONT)
+        cell.alignment = copy(BASE_ALIGNMENT)
+        if _is_date_header(ws.title, header):
+            cell.number_format = DATE_NUMBER_FORMAT
+        else:
+            fmt = _money_format_for_header(ws.title, header, upb_header)
+            if fmt:
+                cell.number_format = fmt
+    except Exception:
+        pass
+
+
+def apply_final_workbook_blank_zero_policy(wb, upb_header: str, sheet_names: Optional[Sequence[str]] = None) -> List[str]:
+    """Apply the report's blank / N/A / true-zero rules directly to workbook cells.
+
+    This runs after dataframe writes and baseline repairs. It is intentionally separate
+    from dataframe normalization because prior-template repair and formula copy-down can
+    reintroduce blanks/zeros after the dataframe policy has already run.
+
+    Formula cells are never overwritten here. Known formula caches are handled later by
+    build_formula_cache_values() / inject_formula_cached_values_into_xlsx().
+    """
+    targets = list(sheet_names) if sheet_names else ["Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset"]
+    diagnostics: List[str] = []
+
+    for sheet_name in targets:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        hdr = _sheet_header_index(wb, ws, upb_header)
+        if not hdr:
+            diagnostics.append(f"Workbook blank/zero policy skipped {sheet_name}: no row-4 headers found.")
+            continue
+
+        header_items = list(hdr.items())
+        scan_cols = list(hdr.values())
+        force_blank_headers = REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set())
+        na_headers = REPORT_NA_FILL_HEADERS.get(sheet_name, set())
+        zero_headers = REPORT_ZERO_FILL_HEADERS.get(sheet_name, set())
+        changed_blank = changed_na = changed_zero = 0
+
+        for row_idx in range(5, ws.max_row + 1):
+            # Avoid touching empty tail rows.
+            has_any = False
+            for col_idx in scan_cols:
+                if clean_text(ws.cell(row_idx, col_idx).value) != "":
+                    has_any = True
+                    break
+            if not has_any:
+                continue
+
+            for header, col_idx in header_items:
+                cell = ws.cell(row_idx, col_idx)
+                if _cell_is_formula(cell):
+                    continue
+
+                if header in force_blank_headers:
+                    if _cell_force_blank_value(cell.value):
+                        if cell.value is not None:
+                            changed_blank += 1
+                        cell.value = None
+                        _apply_cell_display_format(ws, cell, header, upb_header)
+                    continue
+
+                if header in zero_headers:
+                    if _cell_blankish_value(cell.value):
+                        cell.value = 0
+                        changed_zero += 1
+                        _apply_cell_display_format(ws, cell, header, upb_header)
+                    continue
+
+                if header in na_headers:
+                    if _cell_blankish_value(cell.value):
+                        cell.value = "N/A"
+                        changed_na += 1
+                        _apply_cell_display_format(ws, cell, header, upb_header)
+                    continue
+
+        if changed_blank or changed_na or changed_zero:
+            diagnostics.append(
+                f"Workbook blank/zero policy {sheet_name}: force_blank={changed_blank:,}, N/A_fill={changed_na:,}, zero_fill={changed_zero:,}."
+            )
+
+    return diagnostics
+
 def sanitize_summary_formulas(wb):
     if "Summary" not in wb.sheetnames:
         return
@@ -7774,6 +8701,7 @@ def reset_build_state():
 st.set_page_config(page_title="Active Loans Builder", layout="wide")
 st.title("Active Loans Report Builder")
 st.subheader(hey())
+st.caption(f"Code build: {APP_BUILD_VERSION} — QA is forced on; workbook-level blank/zero policy is applied after all writes.")
 
 run_dt = today_et()
 upb_col = make_upb_header(run_dt)
@@ -7859,11 +8787,8 @@ show_servicer_preview = st.checkbox(
     help="Leave this off to save memory during testing.",
 )
 
-run_postbuild_qa = st.checkbox(
-    "Run zero-blank repair / QA after build",
-    value=False,
-    help="Turn this on only for final validation runs. It uses more memory and takes longer.",
-)
+st.info("Zero-blank repair / QA will run automatically on every build. This is no longer optional because blank/zero drift has repeatedly hidden real source issues.")
+run_postbuild_qa = True
 
 if st.button("Clear cached Salesforce metadata", type="secondary"):
     st.session_state.sobject_describe_cache = {}
@@ -8172,22 +9097,47 @@ if build_btn:
             else:
                 diagnostics.append("Post-build QA audit helper not available in this runtime; workbook-level QA tabs were not added.")
 
+            # Final workbook-level blank/N/A/zero normalization runs after all writes/backfills/QA repairs.
+            # This is the last line of defense against elementary mismatch rows like blank vs N/A or blank vs 0.
+            final_policy_diags = apply_final_workbook_blank_zero_policy(wb, upb_col, sheet_names=selected_sheet_names)
+            diagnostics.extend(final_policy_diags)
+
+            # Re-run the workbook audit after final policy so QA tabs reflect the workbook that is actually saved.
+            if run_postbuild_qa and POSTBUILD_AUDIT_AVAILABLE and audit_openpyxl_workbook is not None and write_audit_sheets is not None:
+                try:
+                    audit_summary, audit_exceptions = audit_openpyxl_workbook(
+                        wb,
+                        baseline_bytes=prev_bytes,
+                        upb_header=upb_col,
+                        sheet_names=selected_sheet_names,
+                    )
+                    write_audit_sheets(wb, audit_summary, audit_exceptions)
+                    if audit_diagnostic_lines is not None:
+                        diagnostics.extend(["Final post-policy " + line for line in audit_diagnostic_lines(audit_summary)])
+                except Exception as _final_audit_exc:
+                    diagnostics.append(f"Final post-policy QA rerun failed: {_final_audit_exc}")
+
             diagnostics.append(
                 "Formula-cache note: generated formula columns are marked for Excel recalculation on open. "
-                "If the workbook is inspected by Python/openpyxl or a previewer before Excel recalculates it, "
-                "formula-result columns can look blank even though formulas are present."
+                "If the workbook is compared by Python/openpyxl before Excel recalculates and saves it, "
+                "formula-result columns such as Bridge Asset SF Funded Amount can look blank even when the formulas are present. "
+                "Use Excel open/save or a formula-aware mismatch comparison before treating those blanks as source mismatches."
             )
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
             sanitize_summary_formulas(wb)
             _strip_timezones_from_workbook(wb)
+            # Calculate cached values for known formula columns before saving. The formulas remain in the workbook;
+            # the injected caches stop mismatch details from showing formula columns as blank before Excel opens it.
+            formula_cache_values = build_formula_cache_values(wb, upb_col, sheet_names=selected_sheet_names)
             mark_workbook_for_recalc(wb)
             wb.save(out_bytes)
             out_bytes.seek(0)
+            output_bytes = inject_formula_cached_values_into_xlsx(out_bytes.getvalue(), formula_cache_values)
             wb.close()
 
-            st.session_state.built_workbook_bytes = out_bytes.getvalue()
+            st.session_state.built_workbook_bytes = output_bytes
             st.session_state.built_workbook_name = OUTPUT_TEST_FILENAME
             st.session_state.built_template_path = tmpl_path_used
             st.session_state.show_download_prompt = True
