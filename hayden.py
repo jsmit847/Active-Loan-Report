@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_05_27_V12_CURRENT_MATURITY_FIRST"
+APP_BUILD_VERSION = "ALR_FIX_2026_05_27_V13_MATERIALIZED_FORMULA_VALUES"
 QA_HARD_STOP_ON_FAIL = True
 BRIDGE_ASSET_UPB_TINY_VS_FUNDED_RATIO = 0.50
 BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1 = True
@@ -76,6 +76,11 @@ UPB_HEADER_RE = re.compile(r"\b\d{1,2}/\d{1,2}\s*UPB\b", re.I)
 # Preserve formula columns from the completed-report template. Set False only for
 # mismatch debugging where formula cached values are unavailable before Excel recalculates.
 PRESERVE_TERM_ASSET_FORMULA_COLUMNS = True
+# The generated workbook is consumed by Python/openpyxl mismatch checks before Excel
+# has a chance to recalculate formula caches. If formulas are left in place, those
+# tools see blank cached values. Default to writing the report formula outputs as
+# materialized values so the workbook is testable immediately after build.
+MATERIALIZE_FORMULA_RESULT_COLUMNS = True
 
 
 VALID_STAGES = ["Active", "Closed Won", "Expired", "Matured", "Sold", "REO"]
@@ -263,6 +268,7 @@ REPORT_FORCE_BLANK_HEADERS = {
 REPORT_INTEGER_HEADERS = {
     "Bridge Asset": {"# of Units", "Days to Maturity", "Days Past Due"},
     "Bridge Loan": {"Number of Assets", "# of Units", "Days Past Due"},
+    "Term Loan": {"Days Past Due"},
     "Term Asset": {"# Units"},
 }
 
@@ -6757,7 +6763,7 @@ def validate_sheet_schema_or_raise(wb, sheet_name: str, upb_header: str) -> None
             )
 
     overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
-    if overrides:
+    if overrides and not MATERIALIZE_FORMULA_RESULT_COLUMNS:
         formula_cols = formula_col_indices(ws, start_row=5, header_row=4, scan_rows=50)
         allowed_keys = set(overrides.keys())
         for col_idx in sorted(formula_cols):
@@ -7014,6 +7020,215 @@ def _round_report_money_series(series: pd.Series) -> pd.Series:
     return out
 
 
+
+def _report_date_series_from_col(df: pd.DataFrame, col: str) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="datetime64[ns]")
+    if col not in df.columns:
+        return pd.Series([pd.NaT] * len(df), index=df.index)
+    ser = pd.Series(df[col], index=df.index, dtype="object")
+    coerced = ser.map(_coerce_excel_date_value)
+    return pd.to_datetime(coerced, errors="coerce")
+
+
+def _report_numeric_series_from_col(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+    if col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index, dtype="float64")
+    return pd.to_numeric(pd.Series(df[col], index=df.index), errors="coerce")
+
+
+def _report_text_series_from_col(df: pd.DataFrame, col: str, default="") -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype="string")
+    if col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index, dtype="object")
+    return pd.Series(df[col], index=df.index, dtype="object").astype("string").str.strip()
+
+
+def _report_is_blank_or_na(series_like) -> pd.Series:
+    ser = pd.Series(series_like, copy=False, dtype="object")
+    txt = ser.astype("string").str.strip().str.lower()
+    return ser.isna() | txt.isin(["", "nan", "none", "<na>", "nat", "n/a", "na"])
+
+
+def _report_yn(mask: pd.Series, index) -> pd.Series:
+    return pd.Series(np.where(pd.Series(mask, index=index).fillna(False).astype(bool), "Y", "N"), index=index, dtype="object")
+
+
+def _days_between(later, earlier: pd.Series) -> pd.Series:
+    later_ts = pd.Timestamp(later)
+    earlier_ts = pd.to_datetime(earlier, errors="coerce")
+    return pd.Series((later_ts - earlier_ts).dt.days, index=earlier_ts.index, dtype="float64")
+
+
+def _days_until(target: pd.Series, from_date) -> pd.Series:
+    from_ts = pd.Timestamp(from_date)
+    target_ts = pd.to_datetime(target, errors="coerce")
+    return pd.Series((target_ts - from_ts).dt.days, index=target_ts.index, dtype="float64")
+
+
+def _dq_status_from_days(days_series: pd.Series, reo_mask: pd.Series) -> pd.Series:
+    days = pd.to_numeric(days_series, errors="coerce")
+    out = pd.Series(["Current"] * len(days), index=days.index, dtype="object")
+    out.loc[days.gt(0) & days.lt(30)] = "DQ 1-29"
+    out.loc[days.ge(30) & days.lt(60)] = "DQ 30-59"
+    out.loc[days.ge(60) & days.lt(90)] = "DQ 60-89"
+    out.loc[days.ge(90)] = "DQ 90+"
+    out.loc[pd.Series(reo_mask, index=days.index).fillna(False).astype(bool)] = "REO"
+    return out
+
+
+def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    out = _recompute_bridge_asset_funded_amount(df)
+    idx = out.index
+    q_end = quarter_end_for_run(run_dt)
+    qend_npl_header = _qend_npl_header(q_end, "(Y/N)")
+
+    product_type = _report_text_series_from_col(out, "Product Type")
+    product_sub_type = _report_text_series_from_col(out, "Product Sub-Type")
+    current_loan_maturity = _report_date_series_from_col(out, "Current Loan Maturity date")
+    current_asset_maturity = _report_date_series_from_col(out, "Current Asset Maturity Date")
+    servicer_maturity = _report_date_series_from_col(out, "Servicer Maturity Date")
+    cv_maturity = current_asset_maturity.where(
+        product_type.eq("Credit Line") | product_sub_type.eq("Line of Credit"),
+        current_loan_maturity,
+    )
+    out["CV Maturity Date"] = cv_maturity
+    maturity_diff = (cv_maturity - servicer_maturity).dt.days
+    out["Maturity Difference"] = pd.Series(maturity_diff, index=idx, dtype="object").where(
+        cv_maturity.notna() & servicer_maturity.notna(),
+        "N/A",
+    )
+    out["Maturity Date"] = servicer_maturity.where(servicer_maturity.notna(), cv_maturity)
+    out["Days to Maturity"] = _days_until(out["Maturity Date"], run_dt)
+
+    next_payment = _report_date_series_from_col(out, "Next Payment Date")
+    out["Days Past Due"] = _days_between(run_dt, next_payment)
+
+    reo_date_raw = pd.Series(out.get("REO Date", pd.Series([pd.NA] * len(out), index=idx)), index=idx, dtype="object")
+    reo_date = _report_date_series_from_col(out, "REO Date")
+    reo_mask = reo_date.notna() | (~_report_is_blank_or_na(reo_date_raw))
+    out["DQ Status"] = _dq_status_from_days(out["Days Past Due"], reo_mask)
+
+    updated_val_date_raw = pd.Series(out.get("Updated Valuation Date", pd.Series([pd.NA] * len(out), index=idx)), index=idx, dtype="object")
+    has_updated_val = ~_report_is_blank_or_na(updated_val_date_raw)
+    updated_val_date = _report_date_series_from_col(out, "Updated Valuation Date")
+    orig_val_date = _report_date_series_from_col(out, "Origination Value Dt")
+    out["Most Recent Valuation Date"] = updated_val_date.where(has_updated_val & updated_val_date.notna(), orig_val_date)
+    out["Most Recent As-Is Value"] = _report_numeric_series_from_col(out, "Updated As-Is Value").where(
+        has_updated_val,
+        _report_numeric_series_from_col(out, "Origination As-Is Value"),
+    )
+    out["Most Recent ARV"] = _report_numeric_series_from_col(out, "Updated ARV").where(
+        has_updated_val,
+        _report_numeric_series_from_col(out, "Origination ARV"),
+    )
+
+    if qend_npl_header not in out.columns:
+        if "3/31 NPL (Y/N)" in out.columns:
+            out[qend_npl_header] = out["3/31 NPL (Y/N)"]
+        else:
+            out[qend_npl_header] = "N"
+    npl_flag = _report_text_series_from_col(out, qend_npl_header).str.upper().eq("Y")
+    stale_threshold = pd.Timestamp(q_end) - pd.DateOffset(months=6)
+    most_recent_val = pd.to_datetime(out["Most Recent Valuation Date"], errors="coerce")
+    out["Needs NPL Value"] = _report_yn(npl_flag & most_recent_val.notna() & most_recent_val.lt(stale_threshold), idx)
+
+    segment = _report_text_series_from_col(out, "Segment")
+    out["Securitized (Y/N)"] = _report_yn(segment.eq("Securitized Bridge"), idx)
+    out["SSP JV (Y/N)"] = _report_yn(segment.eq("SSP"), idx)
+    out["CPP JV (Y/N)"] = _report_yn(segment.eq("CPP JV"), idx)
+    out["Oaktree JV (Y/N)"] = _report_yn(segment.eq("Oaktree JV"), idx)
+    out["Legacy (Y/N)"] = _report_yn(segment.eq("Legacy"), idx)
+
+    deal_key = norm_id_series(out.get("Deal Number", pd.Series([pd.NA] * len(out), index=idx)))
+    days_to_mat = pd.to_numeric(out["Days to Maturity"], errors="coerce")
+    days_past_due = pd.to_numeric(out["Days Past Due"], errors="coerce")
+    if bool(deal_key.notna().any()):
+        min_days_to_mat = days_to_mat.groupby(deal_key).transform("min")
+        max_days_past_due = days_past_due.groupby(deal_key).transform("max")
+    else:
+        min_days_to_mat = pd.Series([np.nan] * len(out), index=idx)
+        max_days_past_due = pd.Series([np.nan] * len(out), index=idx)
+    out["Matured Loan (YN)"] = _report_yn(min_days_to_mat.lt(0), idx)
+    out["DQ 45+ Loan (Y/N)"] = _report_yn(max_days_past_due.ge(45), idx)
+    out["SA Loan (Y/N)"] = coalesce_keep_nonblank(
+        out.get("SA Loan (Y/N)", pd.Series([pd.NA] * len(out), index=idx)),
+        pd.Series(["N"] * len(out), index=idx),
+    )
+
+    financing = _report_text_series_from_col(out, "Financing")
+    special_any = (
+        _report_text_series_from_col(out, "Legacy (Y/N)").str.upper().eq("Y")
+        | _report_text_series_from_col(out, "Matured Loan (YN)").str.upper().eq("Y")
+        | _report_text_series_from_col(out, "DQ 45+ Loan (Y/N)").str.upper().eq("Y")
+        | _report_text_series_from_col(out, "SA Loan (Y/N)").str.upper().eq("Y")
+    )
+    out["Special Flag"] = _report_yn(financing.ne("Sold") & special_any, idx)
+    return out
+
+
+def _materialize_bridge_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    out["Days Past Due"] = _days_between(run_dt, _report_date_series_from_col(out, "Next Payment Date"))
+    return out
+
+
+def _materialize_term_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    idx = out.index
+    out["Days Past Due"] = _days_between(run_dt, _report_date_series_from_col(out, "Next Payment Date"))
+    reo_date_raw = pd.Series(out.get("REO Date", pd.Series([pd.NA] * len(out), index=idx)), index=idx, dtype="object")
+    reo_date = _report_date_series_from_col(out, "REO Date")
+    reo_mask = reo_date.notna() | (~_report_is_blank_or_na(reo_date_raw))
+    out["DQ Status"] = _dq_status_from_days(out["Days Past Due"], reo_mask)
+    q_end = quarter_end_for_run(run_dt)
+    special_threshold = pd.Timestamp(q_end) - pd.Timedelta(days=90)
+    portfolio = _report_text_series_from_col(out, "Portfolio")
+    next_payment = _report_date_series_from_col(out, "Next Payment Date")
+    days_past_due = pd.to_numeric(out["Days Past Due"], errors="coerce")
+    active_term_or_dscr = portfolio.isin(["Active Term", "DSCR"])
+    special = (
+        (active_term_or_dscr & next_payment.notna() & next_payment.lt(special_threshold))
+        | _report_text_series_from_col(out, "DQ Status").eq("REO")
+        | (active_term_or_dscr & days_past_due.ge(45))
+    )
+    out["Special Loans List (Y/N)"] = _report_yn(special, idx)
+    return out
+
+
+def _materialize_term_asset_formula_columns(df: pd.DataFrame, upb_col: str) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if upb_col not in out.columns:
+        out[upb_col] = np.nan
+    out["Special (Y/N)"] = coalesce_keep_nonblank(
+        out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
+        pd.Series(["N"] * len(out), index=out.index),
+    )
+    return out
+
+
+def _materialize_report_formula_columns(df: pd.DataFrame, sheet_name: str, upb_col: str) -> pd.DataFrame:
+    if df is None or df.empty or not MATERIALIZE_FORMULA_RESULT_COLUMNS:
+        return pd.DataFrame() if df is None else df.copy()
+    if sheet_name == "Bridge Asset":
+        return _materialize_bridge_asset_formula_columns(df, upb_col)
+    if sheet_name == "Bridge Loan":
+        return _materialize_bridge_loan_formula_columns(df, upb_col)
+    if sheet_name == "Term Loan":
+        return _materialize_term_loan_formula_columns(df, upb_col)
+    if sheet_name == "Term Asset":
+        return _materialize_term_asset_formula_columns(df, upb_col)
+    return df.copy()
+
 def _apply_report_blank_na_policy(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     """Apply final report-specific blank vs N/A rules before writing Excel.
 
@@ -7183,11 +7398,14 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
             df[_header] = df["3/31 NPL (Y/N)"]
         elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(_header), flags=re.I) and "3/31 NPL" in df.columns:
             df[_header] = df["3/31 NPL"]
+    df = _materialize_report_formula_columns(df, sheet_name, upb_col)
     template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=5, header_row=4)
 
-    if sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
+    if MATERIALIZE_FORMULA_RESULT_COLUMNS:
+        fcols = set()
+    elif sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
         force_write_headers = {upb_col, "Special (Y/N)"}
         force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
         fcols = {c for c in fcols if c not in force_write_cols}
@@ -7575,7 +7793,7 @@ def _embedded_possible_shift_header(sheet_name: str, header: str, base_values: D
     if header not in protected:
         return ""
     target = base_values.get(header, "")
-    if not target:
+    if not target or str(target).strip().upper() in {"N/A", "NA", "NONE", "NAN"}:
         return ""
     for other_header in protected:
         if other_header == header:
@@ -8446,11 +8664,16 @@ if build_btn:
             else:
                 diagnostics.append("Post-build QA audit helper not available in this runtime; workbook-level QA tabs were not added.")
 
-            diagnostics.append(
-                "Formula-cache note: generated formula columns are marked for Excel recalculation on open. "
-                "If the workbook is inspected by Python/openpyxl or a previewer before Excel recalculates it, "
-                "formula-result columns can look blank even though formulas are present."
-            )
+            if MATERIALIZE_FORMULA_RESULT_COLUMNS:
+                diagnostics.append(
+                    "Formula-output note: report formula columns were materialized as values so Python/openpyxl mismatch checks see populated results immediately after build."
+                )
+            else:
+                diagnostics.append(
+                    "Formula-cache note: generated formula columns are marked for Excel recalculation on open. "
+                    "If the workbook is inspected by Python/openpyxl or a previewer before Excel recalculates it, "
+                    "formula-result columns can look blank even though formulas are present."
+                )
 
             status.update(label="Saving workbook...")
             out_bytes = BytesIO()
