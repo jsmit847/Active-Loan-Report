@@ -1589,7 +1589,7 @@ def normalize_term_financing(financing) -> str:
     f = clean_text(financing)
     if not f:
         return f
-    return re.sub(r"^CAF\s*", "", f, flags=re.I).strip()
+    return re.sub(r"^CAF(?=\s|\d)\s*", "", f, flags=re.I).strip()
 
 
 def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number, template_maps: dict, sold_servicing_status=None):
@@ -5172,9 +5172,12 @@ def build_bridge_asset(
     )
     sf_asset_upb_usable = sf_current_upb.where(~tiny_vs_funded)
 
-    # Active bridge assets often use funded/servicer allocation when Salesforce Current UPB is a stale tiny value.
+    # Active bridge assets: the servicer file carries the correct per-asset UPB keyed
+    # by the asset's own servicer Loan Number, so prefer it over the (often stale,
+    # loan-level) Salesforce Current UPB. Fall back to SF Current UPB, then funded
+    # amount, then prior asset UPB.
     # Late-stage rows keep prior completed asset UPB first.
-    active_asset_upb = _coalesce_positive_then_any_numeric(sf_asset_upb_usable, safe_servicer_asset_upb, funded_amount_for_upb, prev_asset_upb_vals, index=out.index)
+    active_asset_upb = _coalesce_positive_then_any_numeric(safe_servicer_asset_upb, sf_asset_upb_usable, funded_amount_for_upb, prev_asset_upb_vals, index=out.index)
     late_asset_upb = _coalesce_positive_then_any_numeric(prev_asset_upb_vals, safe_servicer_asset_upb, funded_amount_for_upb, sf_asset_upb_usable, index=out.index)
     asset_level_upb = active_asset_upb.where(~late_stage_for_upb, late_asset_upb)
 
