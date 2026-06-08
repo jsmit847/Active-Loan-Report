@@ -45,7 +45,10 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_05_27_V13_MATERIALIZED_FORMULA_VALUES"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_08_V14_ROW5_LAYOUT"
+# New official report layout: headers on row 5, data starts row 6.
+HEADER_ROW = 5
+DATA_START_ROW = 6
 QA_HARD_STOP_ON_FAIL = True
 BRIDGE_ASSET_UPB_TINY_VS_FUNDED_RATIO = 0.50
 BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1 = True
@@ -209,7 +212,7 @@ SHEET_DATE_HEADERS = {
         "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
     },
     "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
-    "Term Asset": {"Date", "Value Date"},
+    "Term Asset": {"Origination Date", "Origination Value Date", "Updated Value Date"},
 }
 
 SHEET_DATETIME_HEADERS = {
@@ -262,7 +265,7 @@ REPORT_FORCE_BLANK_HEADERS = {
     },
     "Bridge Loan": set(),
     "Term Loan": set(),
-    "Term Asset": {"Value Date"},
+    "Term Asset": {"Updated Value Date", "Updated As-Is Value", "Updated Value Type"},
 }
 
 REPORT_INTEGER_HEADERS = {
@@ -274,13 +277,14 @@ REPORT_INTEGER_HEADERS = {
 
 SHEET_MONEY2_HEADERS = {
     "Bridge Asset": {
+        "Asset Commitment",
         "SF Funded Amount", "Suspense Balance", "Origination As-Is Value", "Origination ARV",
         "Updated As-Is Value", "Updated ARV", "Initial Disbursement Funded", "Renovation Holdback",
         "Renovation Holdback Funded", "Renovation Holdback Remaining", "Interest Allocation",
         "Interest Allocation Funded", "Most Recent As-Is Value", "Most Recent ARV", "Needs NPL Value",
         "Property ALA", "As-Is Value",
     },
-    "Term Asset": {"Property ALA", "As-Is Value"},
+    "Term Asset": {"Property ALA", "Origination Value", "Updated As-Is Value"},
 }
 
 SHEET_MONEY0_HEADERS = {
@@ -290,7 +294,7 @@ SHEET_MONEY0_HEADERS = {
         "Renovation Holdback", "Renovation HB Funded", "Renovation HB Remaining",
         "Interest Allocation", "Interest Allocation Funded",
     },
-    "Term Loan": {"Loan Amount"},
+    "Term Loan": {"Loan Amount", "SFR Allocation", "MF Allocation"},
 }
 
 BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
@@ -357,6 +361,7 @@ BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Referral Source Contact": "Referral Source Contact: Full Name",
     "Loan Stage": "Stage",
     "Property Status": "Status",
+    "Asset Commitment": "Loan Commitment",
 }
 
 BRIDGE_ASSET_FROM_VALUATION = {
@@ -394,11 +399,10 @@ TERM_LOAN_FROM_TERM_WIDE = {
 TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "Deal Number": "Deal Loan Number",
     "Asset ID": "Asset ID",
-    # 5/18 official report columns. These are prior-completed-report first.
-    # Current Salesforce term-asset pulls may not supply Portfolio; build_term_asset
-    # carries it from the prior report or current Term Loan by Deal Number.
     "Portfolio": "Portfolio",
-    "Date": "Date",
+    "Segment": "Segment",
+    "Financing": "Financing",
+    "Origination Date": "Origination Date",
     "Address": "Address",
     "City": "City",
     "State": "State",
@@ -406,304 +410,166 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
     "CBSA": "CBSA",
     "# Units": "# of Units",
     "Property Type": "Property Type",
+    "Grouping": "Grouping",
+    "Origination Value Date": "Origination Value Date",
+    "Origination Value": "Origination Value",
+    "Origination Value Type": "Origination Value Type",
     "Property ALA": "ALA",
-    "Value Date": "Value Date",
-    "As-Is Value": "As-Is Value",
+    "Updated Value Date": "Updated Value Date",
+    "Updated As-Is Value": "Updated As-Is Value",
+    "Updated Value Type": "Updated Value Type",
 }
 
 
 DRAFT_FORMULA_OVERRIDES = {
     "Bridge Asset": {
-        "SF Funded Amount": "=+$BJ5+$BL5+$BO5",
-        "CV Maturity Date": '=IF(OR($BU5="Credit Line",$BV5="Line of Credit"),$AG5,$AE5)',
-        "Maturity Difference": '=IFERROR($CJ5-$CI5,"N/A")',
-        "Maturity Date": '=IF($CI5<>"N/A",$CI5,$CJ5)',
-        "Days to Maturity": '=+$CL5-$CM$3',
-        "Days Past Due": '=+$CN$3-$AC5',
-        "DQ Status": '=IF($BB5<>"N/A","REO",IF(AND($CN5>0,$CN5<30),"DQ 1-29",IF(AND($CN5>=30,$CN5<60),"DQ 30-59",IF(AND($CN5>=60,$CN5<90),"DQ 60-89",IF($CN5>=90,"DQ 90+","Current")))))',
-        "Most Recent Valuation Date": '=IF($BG5<>"N/A",$BG5,$BC5)',
-        "Most Recent As-Is Value": '=IF($BG5<>"N/A",$BH5,$BD5)',
-        "Most Recent ARV": '=IF($BG5<>"N/A",$BI5,$BE5)',
-        "Needs NPL Value": '=IF(AND($DB5="Y",$CP5<$CS$3),"Y","N")',
-        "Securitized (Y/N)": '=IF($BT5="Securitized Bridge","Y","N")',
-        "SSP JV (Y/N)": "=IF(COUNTIFS('SSP Loans'!$B:$B,'Bridge Asset'!$E5)>0,\"Y\",\"N\")",
-        "CPP JV (Y/N)": '=IF($BT5="CPP JV","Y","N")',
-        "Oaktree JV (Y/N)": '=IF($BT5="Oaktree JV","Y","N")',
-        "Legacy (Y/N)": '=IF($BT5="Legacy","Y","N")',
-        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CM:$CM,$E:$E,$E5)<0,"Y","N")',
-        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CN:$CN,$E:$E,$E5)>=45,"Y","N")',
-        "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AK5,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
-        "__QEND_NPL_YN__": '=IF(AND($D5<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E5)<$DB$3),"Y","N")',
-        "Special Flag": '=IF(AND($D5<>"Sold",OR($CX5="Y",$CY5="Y",$CZ5="Y",$DA5="Y")),"Y","N")',
+        "SF Funded Amount": "=+$BK6+$BM6+$BP6",
+        "Loan Type": '=IF($B6="5A","5A Bridge",IF($B6="TPO","Purchased Bridge",IF($B6="RB","Single Asset Bridge",$BV6)))',
+        "CV Maturity Date": '=IF(OR($BV6="Credit Line",$BW6="Line of Credit"),$AG6,$AE6)',
+        "Maturity Difference": '=IFERROR($CM6-$CJ6,"N/A")',
+        "Maturity Date": '=IF($CJ6<>"N/A",$CJ6,$CM6)',
+        "Days to Maturity": "=+$CO6-$CP$4",
+        "Days Past Due": "=+$CQ$4-$AC6",
+        "DQ Status": '=IF($BC6<>"N/A","REO",IF(AND($CQ6>0,$CQ6<30),"DQ 1-29",IF(AND($CQ6>=30,$CQ6<60),"DQ 30-59",IF(AND($CQ6>=60,$CQ6<90),"DQ 60-89",IF($CQ6>=90,"DQ 90+","Current")))))',
+        "Most Recent Valuation Date": '=IF($BH6<>"N/A",$BH6,$BD6)',
+        "Most Recent As-Is Value": '=IF($BH6<>"N/A",$BI6,$BE6)',
+        "Most Recent ARV": '=IF($BH6<>"N/A",$BJ6,$BF6)',
+        "Needs NPL Value": '=IF(AND($DE6="Y",$CS6<$CV$4),"Y","N")',
+        "Securitized (Y/N)": '=IF(OR($BU6="Securitized Bridge",AND($D6="CAFL 2026-R1 CV",$BU6="Legacy")),"Y","N")',
+        "SSP JV (Y/N)": '=IF($BU6="SSP","Y","N")',
+        "CPP JV (Y/N)": '=IF($BU6="CPP JV","Y","N")',
+        "Oaktree JV (Y/N)": '=IF($BU6="Oaktree JV","Y","N")',
+        "Legacy (Y/N)": '=IF($BU6="Legacy","Y","N")',
+        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CP:$CP,$E:$E,$E6)<0,"Y","N")',
+        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CQ:$CQ,$E:$E,$E6)>=45,"Y","N")',
+        "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AL6,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
+        "__QEND_NPL_YN__": '=IF(AND($D6<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E6)<$DE$4),"Y","N")',
+        "__SPECIAL_LIST__": '=IF(AND($D6<>"Sold",OR($DA6="Y",$DB6="Y",$DC6="Y",$DD6="Y")),"Y","N")',
     },
     "Bridge Loan": {
-        "Days Past Due": '=+$V$3-$U5',
+        "Days Past Due": "=+$V$4-$U6",
     },
     "Term Loan": {
-        "Days Past Due": '=+$U$3-$S5',
-        "DQ Status": '=IF($T5<>"N/A","REO",IF(AND($U5>0,$U5<30),"DQ 1-29",IF(AND($U5>=30,$U5<60),"DQ 30-59",IF(AND($U5>=60,$U5<90),"DQ 60-89",IF($U5>=90,"DQ 90+","Current")))))',
-        "Special Loans List (Y/N)": '=IF(OR(AND(OR($J5="Active Term",$J5="DSCR"),$S5<$AD$3),$V5="REO",AND(OR($J5="Active Term",$J5="DSCR"),$U5>=45)),"Y","N")',
+        "Days Past Due": "=+$U$4-$S6",
+        "DQ Status": '=IF($T6<>"N/A","REO",IF(AND($U6>0,$U6<30),"DQ 1-29",IF(AND($U6>=30,$U6<60),"DQ 30-59",IF(AND($U6>=60,$U6<90),"DQ 60-89",IF($U6>=90,"DQ 90+","Current")))))',
+        "__SPECIAL_LIST__": '=IF(AND(OR($J6="Active Term",$J6="DSCR"),$S6<=$AE$4,$V6<>"REO"),"Q2 NPL",IF(AND(OR($J6="Active Term",$J6="DSCR"),$V6="REO"),"Term REO",IF(AND($J6="Securitized Term",$V6="REO"),"CAFL REO",IF(AND(OR($J6="Active Term",$J6="DSCR"),$U6>=45,$V6<>"REO"),"DQ 45+","N/A"))))',
+        "SFR Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AF$4)",
+        "MF Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AG$4)",
+        "Strategy Grouping": '=IF($AF6>$AG6,"Single Family Rental","Multifamily")',
     },
     "Term Asset": {
-        # 5/18 Term Asset layout: Property ALA moved to column M and UPB moved to N
-        # after Portfolio and Date were added at D/E.
-        "__UPB__": "=($M5/SUMIFS($M:$M,$B:$B,$B5))*_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$P:$P)",
-        "Special (Y/N)": "=_xlfn.XLOOKUP($B5,'Term Loan'!$B:$B,'Term Loan'!$AD:$AD)",
+        "__UPB__": "=+(S6/SUMIFS(S:S,B:B,B6))*_xlfn.XLOOKUP(B6,'Term Loan'!B:B,'Term Loan'!P:P)",
+        "__SPECIAL_LIST__": "=_xlfn.XLOOKUP($B6,'Term Loan'!$B:$B,'Term Loan'!$AE:$AE)",
     },
 }
 
 SHEET_BLUEPRINTS = {
     "Bridge Asset": {
-        "row1": {
-            34: "CALC", 88: "CALC", 89: "CALC", 90: "CALC", 91: "CALC", 92: "CALC",
-            93: "CALC", 94: "CALC", 95: "CALC", 96: "CALC", 97: "CALC", 98: "CALC",
-            99: "CALC", 100: "CALC", 101: "CALC", 103: "CALC", 104: "CALC", 105: "CALC",
-            106: "CALC", 107: "CALC",
-        },
-        "row2": {2: "Bridge Asset Data", 106: "__QEND__"},
-        "row3": {
-            35: "__SUBTOTAL__",
-            91: "__RUN_DT__",
-            92: "=+$CM$3",
-            97: "=EDATE(DB2,-6)",
-            106: "=+$DB$2-90",
-        },
+        "row1": {c: "CALC" for c in [35] + list(range(90, 111))},
+        "row2": {2: "Bridge Asset Level Data"},
+        "row3": {109: "__QEND__"},
         "row4": {
-            2: "Portfolio",
-            3: "Loan Buyer",
-            4: "Financing",
-            5: "Deal Number",
-            6: "Servicer ID",
-            7: "Servicer",
-            8: "SF Yardi ID",
-            9: "Asset ID",
-            10: "Deal Name",
-            11: "Borrower Entity",
-            12: "Account Name",
-            13: "Do Not Lend (Y/N)",
-            14: "Primary Contact",
-            15: "Address",
-            16: "City",
-            17: "State",
-            18: "Zip",
-            19: "County",
-            20: "CBSA",
-            21: "APN",
-            22: "Additional APNs",
-            23: "# of Units",
-            24: "Year Built",
-            25: "Square Feet",
-            26: "Origination Date",
-            27: "First Funding Date",
-            28: "Last Funding Date",
-            29: "Next Payment Date",
-            30: "Original Loan Maturity date",
-            31: "Current Loan Maturity date",
-            32: "Original Asset Maturity date",
-            33: "Current Asset Maturity Date",
-            34: "SF Funded Amount",
-            35: "__UPB__",
-            36: "Suspense Balance",
-            37: "Asset Manager 1",
-            38: "AM 1 Assigned Date",
-            39: "Asset Manager 2",
-            40: "AM 2 Assigned Date",
-            41: "Construction Mgr.",
-            42: "CM Assigned Date",
-            43: "Remedy Plan",
-            44: "Delinquency Notes",
-            45: "Maturity Status",
-            46: "Is Special Asset (Y/N)",
-            47: "Special Asset Status",
-            48: "Special Asset Reason",
-            49: "Special Asset: Special Asset Status",
-            50: "Special Asset: Resolved Date",
-            51: "Forbearance Term Date",
-            52: "FC Sale Date",
-            53: "Rescheduled FC Sale Date",
-            54: "REO Date",
-            55: "Origination Value Dt",
-            56: "Origination As-Is Value",
-            57: "Origination ARV",
-            58: "Most Recent Appraisal Order Date",
-            59: "Updated Valuation Date",
-            60: "Updated As-Is Value",
-            61: "Updated ARV",
-            62: "Initial Disbursement Funded",
-            63: "Renovation Holdback",
-            64: "Renovation Holdback Funded",
-            65: "Renovation Holdback Remaining",
-            66: "Interest Allocation",
-            67: "Interest Allocation Funded",
-            68: "Title Company",
-            69: "Tax Due Date",
-            70: "Tax Frequency",
-            71: "Tax Commentary",
-            72: "Segment",
-            73: "Product Type",
-            74: "Product Sub-Type",
-            75: "Transaction Type",
-            76: "Project Strategy",
-            77: "Strategy Grouping",
-            78: "Property Type",
-            79: "Originator",
-            80: "Active RM",
-            81: "Deal Intro Sub-Source",
-            82: "Referral Source Account",
-            83: "Referral Source Contact",
-            84: "Loan Stage",
-            85: "Property Status",
-            86: "Servicer Status",
-            87: "Servicer Maturity Date",
-            88: "CV Maturity Date",
-            89: "Maturity Difference",
-            90: "Maturity Date",
-            91: "Days to Maturity",
-            92: "Days Past Due",
-            93: "DQ Status",
-            94: "Most Recent Valuation Date",
-            95: "Most Recent As-Is Value",
-            96: "Most Recent ARV",
-            97: "Needs NPL Value",
-            98: "Securitized (Y/N)",
-            99: "SSP JV (Y/N)",
-            100: "CPP JV (Y/N)",
-            101: "Oaktree JV (Y/N)",
-            102: "Legacy (Y/N)",
-            103: "Matured Loan (YN)",
-            104: "DQ 45+ Loan (Y/N)",
-            105: "SA Loan (Y/N)",
-            106: "__QEND_NPL_YN__",
-            107: "Special Flag",
+            36: "__SUBTOTAL__",
+            94: "__RUN_DT__",
+            95: "=+$CP$4",
+            100: "=EDATE(DE3,-6)",
+            109: "=+$DE$3-90",
         },
-        "subtotal_col": 35,
+        "row5": {
+            2: "Portfolio", 3: "Loan Buyer", 4: "Financing", 5: "Deal Number",
+            6: "Servicer ID", 7: "Servicer", 8: "SF Yardi ID", 9: "Asset ID",
+            10: "Deal Name", 11: "Borrower Entity", 12: "Account Name", 13: "Do Not Lend (Y/N)",
+            14: "Primary Contact", 15: "Address", 16: "City", 17: "State", 18: "Zip",
+            19: "County", 20: "CBSA", 21: "APN", 22: "Additional APNs", 23: "# of Units",
+            24: "Year Built", 25: "Square Feet", 26: "Origination Date", 27: "First Funding Date",
+            28: "Last Funding Date", 29: "Next Payment Date", 30: "Original Loan Maturity date",
+            31: "Current Loan Maturity date", 32: "Original Asset Maturity date",
+            33: "Current Asset Maturity Date", 34: "Asset Commitment", 35: "SF Funded Amount",
+            36: "__UPB__", 37: "Suspense Balance", 38: "Asset Manager 1", 39: "AM 1 Assigned Date",
+            40: "Asset Manager 2", 41: "AM 2 Assigned Date", 42: "Construction Mgr.",
+            43: "CM Assigned Date", 44: "Remedy Plan", 45: "Delinquency Notes", 46: "Maturity Status",
+            47: "Is Special Asset (Y/N)", 48: "Special Asset Status", 49: "Special Asset Reason",
+            50: "Special Asset: Special Asset Status", 51: "Special Asset: Resolved Date",
+            52: "Forbearance Term Date", 53: "FC Sale Date", 54: "Rescheduled FC Sale Date",
+            55: "REO Date", 56: "Origination Value Dt", 57: "Origination As-Is Value",
+            58: "Origination ARV", 59: "Most Recent Appraisal Order Date", 60: "Updated Valuation Date",
+            61: "Updated As-Is Value", 62: "Updated ARV", 63: "Initial Disbursement Funded",
+            64: "Renovation Holdback", 65: "Renovation Holdback Funded", 66: "Renovation Holdback Remaining",
+            67: "Interest Allocation", 68: "Interest Allocation Funded", 69: "Title Company",
+            70: "Tax Due Date", 71: "Tax Frequency", 72: "Tax Commentary", 73: "Segment",
+            74: "Product Type", 75: "Product Sub-Type", 76: "Transaction Type", 77: "Project Strategy",
+            78: "Strategy Grouping", 79: "Property Type", 80: "Originator", 81: "Active RM",
+            82: "Deal Intro Sub-Source", 83: "Referral Source Account", 84: "Referral Source Contact",
+            85: "Loan Stage", 86: "Property Status", 87: "Servicer Status", 88: "Servicer Maturity Date",
+            90: "Loan Type", 91: "CV Maturity Date", 92: "Maturity Difference", 93: "Maturity Date",
+            94: "Days to Maturity", 95: "Days Past Due", 96: "DQ Status", 97: "Most Recent Valuation Date",
+            98: "Most Recent As-Is Value", 99: "Most Recent ARV", 100: "Needs NPL Value",
+            101: "Securitized (Y/N)", 102: "SSP JV (Y/N)", 103: "CPP JV (Y/N)", 104: "Oaktree JV (Y/N)",
+            105: "Legacy (Y/N)", 106: "Matured Loan (YN)", 107: "DQ 45+ Loan (Y/N)", 108: "SA Loan (Y/N)",
+            109: "__QEND_NPL_YN__", 110: "__SPECIAL_LIST__",
+        },
+        "subtotal_col": 36,
     },
     "Bridge Loan": {
-        "row1": {},
-        "row2": {},
-        "row3": {22: "=+'Bridge Asset'!$CK$3", 26: "__SUBTOTAL__"},
-        "row4": {
-            2: "Portfolio",
-            3: "Loan Buyer",
-            4: "Financing",
-            5: "Deal Number",
-            6: "Servicer ID",
-            7: "Servicer",
-            8: "Deal Name",
-            9: "Borrower Name",
-            10: "Account",
-            11: "Do Not Lend (Y/N)",
-            12: "Primary Contact",
-            13: "Number of Assets",
-            14: "# of Units",
-            15: "State(s)",
-            16: "Origination Date",
-            17: "Last Funding Date",
-            18: "Original Maturity Date",
-            19: "Current Maturity Date",
-            20: "Next Advance Maturity Date",
-            21: "Next Payment Date",
-            22: "Days Past Due",
-            23: "Loan Level Delinquency",
-            24: "Loan Commitment",
-            25: "Active Funded Amount",
-            26: "__UPB__",
-            27: "Suspense Balance",
-            28: "Remaining Commitment",
-            29: "Most Recent Valuation Date",
-            30: "Most Recent As-Is Value",
-            31: "Most Recent ARV",
-            32: "Initial Disbursement Funded",
-            33: "Renovation Holdback",
-            34: "Renovation HB Funded",
-            35: "Renovation HB Remaining",
-            36: "Interest Allocation",
-            37: "Interest Allocation Funded",
-            38: "Loan Stage",
-            39: "Segment",
-            40: "Product Type",
-            41: "Product Sub Type",
-            42: "Transaction Type",
-            43: "Project Strategy",
-            44: "Strategy Grouping",
-            45: "CV Originator",
-            46: "Active RM",
-            47: "Deal Intro Sub-Source",
-            48: "Referral Source Account",
-            49: "Referral Source Contact",
-            50: "__QEND_NPL__",
-            51: "Needs NPL Value",
-            52: "Special Focus (Y/N)",
-            53: "Asset Manager 1",
-            54: "AM 1 Assigned Date",
-            55: "Asset Manager 2",
-            56: "AM 2 Assigned Date",
-            57: "Construction Mgr.",
-            58: "CM Assigned Date",
-            59: "AM Commentary",
+        "row1": {22: "CALC"},
+        "row2": {2: "Bridge Loan Level Data"},
+        "row3": {},
+        "row4": {22: "=+'Bridge Asset'!$CP$4", 26: "__SUBTOTAL__"},
+        "row5": {
+            2: "Portfolio", 3: "Loan Buyer", 4: "Financing", 5: "Deal Number", 6: "Servicer ID",
+            7: "Servicer", 8: "Deal Name", 9: "Borrower Name", 10: "Account", 11: "Do Not Lend (Y/N)",
+            12: "Primary Contact", 13: "Number of Assets", 14: "# of Units", 15: "State(s)",
+            16: "Origination Date", 17: "Last Funding Date", 18: "Original Maturity Date",
+            19: "Current Maturity Date", 20: "Next Advance Maturity Date", 21: "Next Payment Date",
+            22: "Days Past Due", 23: "Loan Level Delinquency", 24: "Loan Commitment",
+            25: "Active Funded Amount", 26: "__UPB__", 27: "Suspense Balance", 28: "Remaining Commitment",
+            29: "Most Recent Valuation Date", 30: "Most Recent As-Is Value", 31: "Most Recent ARV",
+            32: "Initial Disbursement Funded", 33: "Renovation Holdback", 34: "Renovation HB Funded",
+            35: "Renovation HB Remaining", 36: "Interest Allocation", 37: "Interest Allocation Funded",
+            38: "Loan Stage", 39: "Segment", 40: "Loan Type", 41: "Product Type", 42: "Product Sub Type",
+            43: "Transaction Type", 44: "Project Strategy", 45: "Strategy Grouping", 46: "CV Originator",
+            47: "Active RM", 48: "Deal Intro Sub-Source", 49: "Referral Source Account",
+            50: "Referral Source Contact", 51: "__QEND_NPL__", 52: "Needs NPL Value",
+            53: "Special Focus (Y/N)", 54: "Asset Manager 1", 55: "AM 1 Assigned Date",
+            56: "Asset Manager 2", 57: "AM 2 Assigned Date", 58: "Construction Mgr.",
+            59: "CM Assigned Date", 60: "AM Commentary",
         },
         "subtotal_col": 26,
     },
     "Term Loan": {
-        "row1": {30: "__QEND__"},
-        "row2": {2: "Term Loan Data"},
-        "row3": {16: "__SUBTOTAL__", 21: "__RUN_DT__", 30: "=+$AD$1-90"},
+        "row1": {21: "CALC", 22: "CALC", 31: "CALC"},
+        "row2": {2: "Term Loan Level Data", 31: "__QEND__"},
+        "row3": {},
         "row4": {
-            2: "Deal Number",
-            3: "Servicer ID",
-            4: "Servicer",
-            5: "SF Yardi ID",
-            6: "Deal Name",
-            7: "Borrower Entity",
-            8: "Account Name",
-            9: "Do Not Lend (Y/N)",
-            10: "Portfolio",
-            11: "Segment",
-            12: "Financing",
-            13: "CPP JV",
-            14: "Loan Buyer",
-            15: "Loan Amount",
-            16: "__UPB__",
-            17: "Origination Date",
-            18: "Maturity Date",
-            19: "Next Payment Date",
-            20: "REO Date",
-            21: "Days Past Due",
-            22: "DQ Status",
-            23: "Asset Manager",
-            24: "Originator",
-            25: "Active RM",
-            26: "Deal Intro Sub-Source",
-            27: "Referral Source Account",
-            28: "Referral Source Contact",
-            29: "AM Commentary",
-            30: "Special Loans List (Y/N)",
+            16: "__SUBTOTAL__", 21: "__RUN_DT__", 31: "=+$AE$2-90",
+            32: "Single Family Rental", 33: "Multifamily",
+        },
+        "row5": {
+            2: "Deal Number", 3: "Servicer ID", 4: "Servicer", 5: "SF Yardi ID", 6: "Deal Name",
+            7: "Borrower Entity", 8: "Account Name", 9: "Do Not Lend (Y/N)", 10: "Portfolio",
+            11: "Segment", 12: "Financing", 13: "CPP JV", 14: "Loan Buyer", 15: "Loan Amount",
+            16: "__UPB__", 17: "Origination Date", 18: "Maturity Date", 19: "Next Payment Date",
+            20: "REO Date", 21: "Days Past Due", 22: "DQ Status", 23: "Asset Manager", 24: "Originator",
+            25: "Active RM", 26: "Deal Intro Sub-Source", 27: "Referral Source Account",
+            28: "Referral Source Contact", 29: "AM Commentary", 31: "__SPECIAL_LIST__",
+            32: "SFR Allocation", 33: "MF Allocation", 34: "Strategy Grouping",
         },
         "subtotal_col": 16,
     },
     "Term Asset": {
-        "row1": {},
-        "row2": {},
-        "row3": {14: "__SUBTOTAL__"},
-        "row4": {
-            2: "Deal Number",
-            3: "Asset ID",
-            4: "Portfolio",
-            5: "Date",
-            6: "Address",
-            7: "City",
-            8: "State",
-            9: "Zip",
-            10: "CBSA",
-            11: "# Units",
-            12: "Property Type",
-            13: "Property ALA",
-            14: "__UPB__",
-            15: "Special (Y/N)",
-            16: "Value Date",
-            17: "As-Is Value",
+        "row1": {20: "CALC", 22: "CALC"},
+        "row2": {2: "Term Asset Level Data"},
+        "row3": {},
+        "row4": {20: "__SUBTOTAL__"},
+        "row5": {
+            2: "Deal Number", 3: "Asset ID", 4: "Portfolio", 5: "Segment", 6: "Financing",
+            7: "Origination Date", 8: "Address", 9: "City", 10: "State", 11: "Zip", 12: "CBSA",
+            13: "# Units", 14: "Property Type", 15: "Grouping", 16: "Origination Value Date",
+            17: "Origination Value", 18: "Origination Value Type", 19: "Property ALA", 20: "__UPB__",
+            22: "__SPECIAL_LIST__", 23: "Updated Value Date", 24: "Updated As-Is Value",
+            25: "Updated Value Type",
         },
-        "subtotal_col": 14,
+        "subtotal_col": 20,
     },
 }
 
@@ -5066,6 +4932,9 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
+    # NEW column: Asset Commitment surfaces the Opportunity Loan Commitment value.
+    out["Asset Commitment"] = out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=out.index))
+
     out["Portfolio"] = pd.NA
     out["Segment"] = pd.NA
     out["Strategy Grouping"] = pd.NA
@@ -6005,7 +5874,7 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     values, filters them to the current Term Loan population, appends only brand-new
     current SF assets, and then recalculates the current UPB allocation.
     """
-    term_asset_cols = list(TERM_ASSET_FROM_TERM_ASSET_REPORT.keys()) + ["CPP JV", "Special (Y/N)"]
+    term_asset_cols = list(TERM_ASSET_FROM_TERM_ASSET_REPORT.keys())
 
     tl = _ensure_deal_key(term_loan.copy(), "Deal Number") if term_loan is not None else pd.DataFrame()
     valid_deals = set(tl.get("_deal_key", pd.Series(dtype="object")).dropna().astype(str).tolist())
@@ -6017,10 +5886,6 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
             current[col] = sf_term_asset[label] if label in sf_term_asset.columns else pd.NA
         current["_deal_key"] = norm_id_series(current.get("Deal Number", pd.Series([None] * len(current), index=current.index)))
         current["_asset_key"] = norm_id_series(current.get("Asset ID", pd.Series([None] * len(current), index=current.index)))
-        current["CPP JV"] = pd.NA
-        current["Special (Y/N)"] = _yn_from_bool_series(
-            sf_term_asset.get("Property Special Asset", pd.Series([pd.NA] * len(current), index=current.index))
-        )
         if valid_deals:
             current = current[current["_deal_key"].isin(valid_deals) & current["_asset_key"].notna()].copy()
         else:
@@ -6071,35 +5936,24 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         )
         out = out.drop(columns=["Portfolio_loan"], errors="ignore")
 
-    if "CPP JV" in tl.columns:
-        tl_cpp = tl[["_deal_key", "CPP JV"]].drop_duplicates("_deal_key")
-        out = out.merge(tl_cpp, on="_deal_key", how="left", suffixes=("", "_loan"))
-        out["CPP JV"] = coalesce_keep_nonblank(out.get("CPP JV_loan", pd.Series([pd.NA] * len(out), index=out.index)), out.get("CPP JV", pd.Series([pd.NA] * len(out), index=out.index)))
-        out = out.drop(columns=["CPP JV_loan"], errors="ignore")
-
-    if "Special Loans List (Y/N)" in tl.columns:
-        tl_special = tl[["_deal_key", "Special Loans List (Y/N)"]].drop_duplicates("_deal_key")
+    # Term Asset "2Q26 Special Loans List " mirrors the Term Loan special value by
+    # deal (the report uses XLOOKUP into Term Loan). Map it from whichever Term Loan
+    # special column is present.
+    _tl_special_col = None
+    for _cand in [c for c in tl.columns if re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", str(c).strip(), flags=re.I)]:
+        _tl_special_col = _cand
+        break
+    if _tl_special_col is None and "Special Loans List (Y/N)" in tl.columns:
+        _tl_special_col = "Special Loans List (Y/N)"
+    _ta_special_header = _special_list_header(quarter_end_for_run(run_dt))
+    if _tl_special_col is not None:
+        tl_special = tl[["_deal_key", _tl_special_col]].drop_duplicates("_deal_key")
         out = out.merge(tl_special, on="_deal_key", how="left")
-        out["Special (Y/N)"] = coalesce_keep_nonblank(
-            out.get("Special Loans List (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
-            out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
-        )
-        out = out.drop(columns=["Special Loans List (Y/N)"], errors="ignore")
-
-    out["Special (Y/N)"] = coalesce_keep_nonblank(
-        out.get("Special (Y/N)", pd.Series([pd.NA] * len(out), index=out.index)),
-        pd.Series(["N"] * len(out), index=out.index),
-    )
-
-    for c in ["CPP JV"]:
-        if c in out.columns:
-            out[c] = out[c].replace({"": pd.NA})
-
-    # Term Asset Value Date should remain blank unless carried from the prior completed
-    # workbook as an actual date. Do not default blank dates to N/A.
-    if "Value Date" in out.columns:
-        vd = pd.Series(out["Value Date"], index=out.index, dtype="object")
-        out["Value Date"] = vd.where(~blankish_mask(vd) & vd.astype("string").str.strip().str.upper().ne("N/A"), pd.NA)
+        out[_ta_special_header] = out[_tl_special_col]
+        if _tl_special_col != _ta_special_header:
+            out = out.drop(columns=[_tl_special_col], errors="ignore")
+    else:
+        out[_ta_special_header] = "N/A"
 
     out = _allocate_term_asset_upb_from_loan(out, term_loan, upb_col)
 
@@ -6110,7 +5964,8 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
             (~blankish_mask(out.get("Address", pd.Series([pd.NA] * len(out), index=out.index))))
             | pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
             | pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0).ne(0)
-            | pd.to_numeric(out.get("As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
+            | pd.to_numeric(out.get("Origination Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
+            | pd.to_numeric(out.get("Updated As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
         )
     )
     out = out.loc[meaningful_mask].copy()
@@ -6517,6 +6372,13 @@ def _qend_npl_header(q_end: date, suffix: str = "") -> str:
     return f"{base} {suffix}".strip()
 
 
+def _special_list_header(q_end: date) -> str:
+    quarter = (q_end.month - 1) // 3 + 1
+    yy = q_end.year % 100
+    # Report header has a trailing space, e.g. "2Q26 Special Loans List "
+    return f"{quarter}Q{yy:02d} Special Loans List "
+
+
 def _resolve_scaffold_token(value, run_dt: date, q_end: date, upb_header: str):
     if value == "__UPB__":
         return upb_header
@@ -6526,13 +6388,17 @@ def _resolve_scaffold_token(value, run_dt: date, q_end: date, upb_header: str):
         return _qend_npl_header(q_end)
     if value == "__QEND_NPL_YN__":
         return _qend_npl_header(q_end, "(Y/N)")
+    if value == "__SPECIAL_LIST__":
+        return _special_list_header(q_end)
     if value == "__RUN_DT__":
         return run_dt
     return value
 
 
 def _ensure_bridge_asset_fc_columns(ws):
-    """Insert the two new Bridge Asset foreclosure columns when an older template is used."""
+    """No-op on the new row-5 template: FC Sale Date / Rescheduled FC Sale Date
+    are already present (cols 53/54). The legacy column-insert path is retired."""
+    return
     if ws.title != "Bridge Asset":
         return
     cur_az = clean_text(ws.cell(4, 52).value)
@@ -6556,14 +6422,16 @@ def _ensure_bridge_asset_fc_columns(ws):
 
 
 def refresh_summary_labels(wb, run_dt: date, upb_header: str):
-    if "Summary" not in wb.sheetnames:
+    summary_sheets = [s for s in ("Summary", "Bridge Summary", "Term Summary") if s in wb.sheetnames]
+    if not summary_sheets:
         return
-    ws = wb["Summary"]
     current_md = f"{run_dt.month}/{run_dt.day}"
     q_end = quarter_end_for_run(run_dt)
     q_end_md = f"{q_end.month}/{q_end.day}"
 
-    for row in ws.iter_rows():
+    for _summary_name in summary_sheets:
+      ws = wb[_summary_name]
+      for row in ws.iter_rows():
         for cell in row:
             if not isinstance(cell.value, str):
                 continue
@@ -6595,21 +6463,24 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         for col_idx, val in blueprint.get("row2", {}).items():
             _set_scaffold_cell(ws, 2, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
 
+        for col_idx, val in blueprint.get("row3", {}).items():
+            _set_scaffold_cell(ws, 3, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+
         subtotal_col = blueprint.get("subtotal_col")
         subtotal_col_idx = _scaffold_col_index(subtotal_col) if subtotal_col is not None else None
-        for col_idx, val in blueprint.get("row3", {}).items():
-            col_idx = _scaffold_col_index(col_idx)
-            if val == "__RUN_DT__":
-                _set_scaffold_cell(ws, 3, col_idx, run_dt)
-            elif val == "__SUBTOTAL__":
-                col_letter = get_column_letter(subtotal_col_idx)
-                _set_scaffold_cell(ws, 3, col_idx, f"=SUBTOTAL(9,{col_letter}5:{col_letter}{max(5, ws.max_row)})")
-            else:
-                _set_scaffold_cell(ws, 3, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
-
         for col_idx, val in blueprint.get("row4", {}).items():
             col_idx = _scaffold_col_index(col_idx)
-            _set_scaffold_cell(ws, 4, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+            if val == "__RUN_DT__":
+                _set_scaffold_cell(ws, 4, col_idx, run_dt)
+            elif val == "__SUBTOTAL__":
+                col_letter = get_column_letter(subtotal_col_idx)
+                _set_scaffold_cell(ws, 4, col_idx, f"=SUBTOTAL(9,{col_letter}{DATA_START_ROW}:{col_letter}{max(DATA_START_ROW, ws.max_row)})")
+            else:
+                _set_scaffold_cell(ws, 4, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+
+        for col_idx, val in blueprint.get("row5", {}).items():
+            col_idx = _scaffold_col_index(col_idx)
+            _set_scaffold_cell(ws, 5, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
 
     refresh_summary_labels(wb, run_dt, upb_header)
 
@@ -6662,7 +6533,7 @@ def _resolve_header_value(wb, ws, cell, upb_header: str, max_depth: int = 6) -> 
     return str(cur_val).strip()
 
 
-def header_tuples_from_ws(ws, header_row: int = 4, wb=None, upb_header: Optional[str] = None) -> List[Tuple[int, str]]:
+def header_tuples_from_ws(ws, header_row: int = HEADER_ROW, wb=None, upb_header: Optional[str] = None) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
     row = list(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=False))[0]
 
@@ -6688,16 +6559,16 @@ def _validate_sheet_blueprints_or_raise():
     """
     errors: List[str] = []
     for sheet_name, blueprint in SHEET_BLUEPRINTS.items():
-        for row_name in ("row1", "row2", "row3", "row4"):
+        for row_name in ("row1", "row2", "row3", "row4", "row5"):
             for col_idx, value in blueprint.get(row_name, {}).items():
                 try:
                     _scaffold_col_index(col_idx)
                 except Exception as exc:
                     errors.append(f"{sheet_name}.{row_name}: invalid column key {col_idx!r}: {exc}")
-                if row_name == "row4" and isinstance(value, str) and value.strip().startswith("="):
+                if row_name == "row5" and isinstance(value, str) and value.strip().startswith("="):
                     errors.append(
-                        f"{sheet_name}.row4 column {col_idx!r}: header value is a formula. "
-                        "Move formulas to DRAFT_FORMULA_OVERRIDES and keep row4 as static/dynamic header text."
+                        f"{sheet_name}.row5 column {col_idx!r}: header value is a formula. "
+                        "Move formulas to DRAFT_FORMULA_OVERRIDES and keep row5 as static/dynamic header text."
                     )
     if errors:
         raise ValueError("Invalid Active Loan Report sheet blueprint:\n" + "\n".join(f"- {e}" for e in errors))
@@ -6712,6 +6583,8 @@ def _expected_header_matches(actual_header: str, expected_header: str, upb_heade
         return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", actual, flags=re.I))
     if expected == "__QEND_NPL_YN__":
         return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", actual, flags=re.I))
+    if expected == "__SPECIAL_LIST__":
+        return bool(re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", actual, flags=re.I))
     return actual == expected
 
 
@@ -6723,6 +6596,8 @@ def _formula_override_key_for_header(header: str, upb_header: str) -> str:
         return "__QEND_NPL_YN__"
     if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", header, flags=re.I):
         return "__QEND_NPL__"
+    if re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", header, flags=re.I):
+        return "__SPECIAL_LIST__"
     return header
 
 
@@ -6736,12 +6611,12 @@ def validate_sheet_schema_or_raise(wb, sheet_name: str, upb_header: str) -> None
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Required sheet missing from workbook: {sheet_name}")
     blueprint = SHEET_BLUEPRINTS.get(sheet_name, {})
-    expected = blueprint.get("row4", {})
+    expected = blueprint.get("row5", {})
     if not expected:
         return
 
     ws = wb[sheet_name]
-    actual_by_col = {col_idx: header for col_idx, header in header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)}
+    actual_by_col = {col_idx: header for col_idx, header in header_tuples_from_ws(ws, header_row=HEADER_ROW, wb=wb, upb_header=upb_header)}
     errors: List[str] = []
 
     seen: Dict[str, int] = {}
@@ -6764,7 +6639,7 @@ def validate_sheet_schema_or_raise(wb, sheet_name: str, upb_header: str) -> None
 
     overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
     if overrides and not MATERIALIZE_FORMULA_RESULT_COLUMNS:
-        formula_cols = formula_col_indices(ws, start_row=5, header_row=4, scan_rows=50)
+        formula_cols = formula_col_indices(ws, start_row=DATA_START_ROW, header_row=HEADER_ROW, scan_rows=50)
         allowed_keys = set(overrides.keys())
         for col_idx in sorted(formula_cols):
             header = actual_by_col.get(col_idx, "")
@@ -6793,7 +6668,7 @@ def validate_workbook_schema_or_raise(wb, upb_header: str, sheet_names: Optional
         validate_sheet_schema_or_raise(wb, sheet_name, upb_header)
 
 
-def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4, scan_rows: int = 50) -> Set[int]:
+def formula_col_indices(ws_formula, start_row: int = DATA_START_ROW, header_row: int = HEADER_ROW, scan_rows: int = 50) -> Set[int]:
     fcols: Set[int] = set()
     max_scan_row = min(ws_formula.max_row, start_row + scan_rows - 1)
 
@@ -6805,7 +6680,7 @@ def formula_col_indices(ws_formula, start_row: int = 5, header_row: int = 4, sca
     return fcols
 
 
-def _capture_formula_seeds(ws_formula, formula_cols: Set[int], start_row: int = 5, scan_rows: int = 50):
+def _capture_formula_seeds(ws_formula, formula_cols: Set[int], start_row: int = DATA_START_ROW, scan_rows: int = 50):
     seeds = {}
     max_scan_row = min(ws_formula.max_row, start_row + scan_rows - 1)
 
@@ -6818,14 +6693,14 @@ def _capture_formula_seeds(ws_formula, formula_cols: Set[int], start_row: int = 
     return seeds
 
 
-def _used_output_columns(ws, wb, upb_header: str, header_row: int = 4, start_row: int = 5) -> Set[int]:
+def _used_output_columns(ws, wb, upb_header: str, header_row: int = HEADER_ROW, start_row: int = DATA_START_ROW) -> Set[int]:
     hdr = header_tuples_from_ws(ws, header_row=header_row, wb=wb, upb_header=upb_header)
     cols = {c for c, _h in hdr}
     cols |= formula_col_indices(ws, start_row=start_row, header_row=header_row)
     return cols
 
 
-def _clear_sheet_body(ws, used_cols: Set[int], start_row: int = 5):
+def _clear_sheet_body(ws, used_cols: Set[int], start_row: int = DATA_START_ROW):
     if not used_cols:
         return
     max_r = ws.max_row
@@ -6834,7 +6709,7 @@ def _clear_sheet_body(ws, used_cols: Set[int], start_row: int = 5):
             ws.cell(r, c).value = None
 
 
-def _trim_sheet_body_rows(ws, row_count: int, start_row: int = 5):
+def _trim_sheet_body_rows(ws, row_count: int, start_row: int = DATA_START_ROW):
     keep_last = (start_row - 1) if row_count <= 0 else (start_row + row_count - 1)
     if ws.max_row > keep_last:
         ws.delete_rows(keep_last + 1, ws.max_row - keep_last)
@@ -6875,7 +6750,7 @@ def _drop_rows_missing_required_keys(sheet_name: str, df: pd.DataFrame) -> pd.Da
     return df.loc[mask].copy()
 
 
-def _reset_sheet_autofilter(ws, header_tuples: List[Tuple[int, str]], row_count: int, header_row: int = 4, start_row: int = 5):
+def _reset_sheet_autofilter(ws, header_tuples: List[Tuple[int, str]], row_count: int, header_row: int = HEADER_ROW, start_row: int = DATA_START_ROW):
     if not header_tuples:
         return
     first_col = min(col_idx for col_idx, _header in header_tuples)
@@ -6979,7 +6854,7 @@ def _should_preserve_datetime(sheet_name: str, header: str) -> bool:
     return header in SHEET_DATETIME_HEADERS.get(sheet_name, set())
 
 
-def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start_row: int = 5, sample_limit: int = 120, scan_limit: int = 1000) -> Set[str]:
+def _infer_template_text_headers(ws, header_tuples: List[Tuple[int, str]], start_row: int = DATA_START_ROW, sample_limit: int = 120, scan_limit: int = 1000) -> Set[str]:
     hinted: Set[str] = set()
     max_row = min(ws.max_row, start_row + scan_limit - 1)
     for col_idx, header in header_tuples:
@@ -7137,7 +7012,20 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     out["Needs NPL Value"] = _report_yn(npl_flag & most_recent_val.notna() & most_recent_val.lt(stale_threshold), idx)
 
     segment = _report_text_series_from_col(out, "Segment")
-    out["Securitized (Y/N)"] = _report_yn(segment.eq("Securitized Bridge"), idx)
+    # NEW Loan Type: Portfolio 5A/TPO/RB map to labels, else fall back to Product Type.
+    portfolio_ba = _report_text_series_from_col(out, "Portfolio")
+    product_type_ba = _report_text_series_from_col(out, "Product Type")
+    loan_type_ba = product_type_ba.copy()
+    loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("5A"), "5A Bridge")
+    loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("TPO"), "Purchased Bridge")
+    loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("RB"), "Single Asset Bridge")
+    out["Loan Type"] = loan_type_ba
+    # Widened Securitized rule: also flags CAFL 2026-R1 CV legacy.
+    financing_ba = _report_text_series_from_col(out, "Financing")
+    out["Securitized (Y/N)"] = _report_yn(
+        segment.eq("Securitized Bridge") | (financing_ba.eq("CAFL 2026-R1 CV") & segment.eq("Legacy")),
+        idx,
+    )
     out["SSP JV (Y/N)"] = _report_yn(segment.eq("SSP"), idx)
     out["CPP JV (Y/N)"] = _report_yn(segment.eq("CPP JV"), idx)
     out["Oaktree JV (Y/N)"] = _report_yn(segment.eq("Oaktree JV"), idx)
@@ -7167,6 +7055,8 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
         | _report_text_series_from_col(out, "SA Loan (Y/N)").str.upper().eq("Y")
     )
     out["Special Flag"] = _report_yn(financing.ne("Sold") & special_any, idx)
+    # Emit under the new header name too so the writer finds it.
+    out[_special_list_header(quarter_end_for_run(run_dt))] = out["Special Flag"]
     return out
 
 
@@ -7194,12 +7084,20 @@ def _materialize_term_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> pd
     next_payment = _report_date_series_from_col(out, "Next Payment Date")
     days_past_due = pd.to_numeric(out["Days Past Due"], errors="coerce")
     active_term_or_dscr = portfolio.isin(["Active Term", "DSCR"])
-    special = (
-        (active_term_or_dscr & next_payment.notna() & next_payment.lt(special_threshold))
-        | _report_text_series_from_col(out, "DQ Status").eq("REO")
-        | (active_term_or_dscr & days_past_due.ge(45))
+    dq = _report_text_series_from_col(out, "DQ Status")
+    special_txt = pd.Series(["N/A"] * len(out), index=idx, dtype="object")
+    # Order mirrors the report's nested IF (later assignments take precedence only
+    # where their condition is the matching branch).
+    special_txt = special_txt.mask(active_term_or_dscr & days_past_due.ge(45) & dq.ne("REO"), "DQ 45+")
+    special_txt = special_txt.mask(portfolio.eq("Securitized Term") & dq.eq("REO"), "CAFL REO")
+    special_txt = special_txt.mask(active_term_or_dscr & dq.eq("REO"), "Term REO")
+    special_txt = special_txt.mask(
+        active_term_or_dscr & next_payment.notna() & next_payment.le(special_threshold) & dq.ne("REO"),
+        "Q2 NPL",
     )
-    out["Special Loans List (Y/N)"] = _report_yn(special, idx)
+    special_header = _special_list_header(quarter_end_for_run(run_dt))
+    out[special_header] = special_txt
+    out["Special Loans List (Y/N)"] = special_txt
     return out
 
 
@@ -7293,7 +7191,7 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
 
 
 def _copy_reference_row_style(ws_formula, col_idx: int, target_cell):
-    ref_cell = ws_formula.cell(5, col_idx)
+    ref_cell = ws_formula.cell(DATA_START_ROW, col_idx)
     if ref_cell.has_style:
         target_cell._style = copy(ref_cell._style)
 
@@ -7312,7 +7210,7 @@ def _apply_display_style(ws_formula, row_idx: int, col_idx: int, header: str, up
             cell.number_format = money_fmt
 
 
-def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, header_tuples: List[Tuple[int, str]], upb_header: str, start_row: int = 5):
+def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, header_tuples: List[Tuple[int, str]], upb_header: str, start_row: int = DATA_START_ROW):
     if row_count <= 0:
         return
 
@@ -7327,6 +7225,8 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
             override_key = "__QEND_NPL_YN__"
         elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(header), flags=re.I):
             override_key = "__QEND_NPL__"
+        elif re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", str(header), flags=re.I):
+            override_key = "__SPECIAL_LIST__"
         else:
             override_key = header
         origin_formula = overrides.get(override_key, formula_seeds[col_idx]["formula"])
@@ -7342,7 +7242,7 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
             _copy_reference_row_style(ws_formula, col_idx, target)
 
 
-def _refresh_subtotal_formula(ws_formula, row_count: int, subtotal_row: int = 3, start_row: int = 5):
+def _refresh_subtotal_formula(ws_formula, row_count: int, subtotal_row: int = 4, start_row: int = DATA_START_ROW):
     blueprint = SHEET_BLUEPRINTS.get(ws_formula.title, {})
     subtotal_col = blueprint.get("subtotal_col")
     if not subtotal_col:
@@ -7359,7 +7259,7 @@ def write_df_to_sheet_preserve_formulas(
     header_tuples: List[Tuple[int, str]],
     formula_cols: Set[int],
     upb_header: str,
-    start_row: int = 5,
+    start_row: int = DATA_START_ROW,
 ):
     write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
     headers = [h for _c, h in write_cols]
@@ -7389,7 +7289,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     df = _drop_rows_missing_required_keys(sheet_name, df)
 
     ws = wb[sheet_name]
-    hdr = header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_col)
+    hdr = header_tuples_from_ws(ws, header_row=HEADER_ROW, wb=wb, upb_header=upb_col)
     validate_sheet_schema_or_raise(wb, sheet_name, upb_col)
     for _col_idx, _header in hdr:
         if _header in df.columns:
@@ -7399,27 +7299,42 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
         elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(_header), flags=re.I) and "3/31 NPL" in df.columns:
             df[_header] = df["3/31 NPL"]
     df = _materialize_report_formula_columns(df, sheet_name, upb_col)
-    template_text_headers = _infer_template_text_headers(ws, hdr, start_row=5)
+    template_text_headers = _infer_template_text_headers(ws, hdr, start_row=DATA_START_ROW)
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
-    fcols = formula_col_indices(ws, start_row=5, header_row=4)
+    fcols = formula_col_indices(ws, start_row=DATA_START_ROW, header_row=HEADER_ROW)
+
+    # Columns that MUST stay live formulas because they reference another sheet
+    # that is not yet written when this sheet is written.
+    always_live = {
+        "Term Loan": {"SFR Allocation", "MF Allocation", "Strategy Grouping"},
+    }.get(sheet_name, set())
+    always_live_cols = {col_idx for col_idx, header in hdr if header in always_live}
 
     if MATERIALIZE_FORMULA_RESULT_COLUMNS:
-        fcols = set()
+        fcols = always_live_cols.copy()
     elif sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
         force_write_headers = {upb_col, "Special (Y/N)"}
         force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
         fcols = {c for c in fcols if c not in force_write_cols}
 
-    formula_seeds = _capture_formula_seeds(ws, fcols, start_row=5)
+    formula_seeds = _capture_formula_seeds(ws, fcols, start_row=DATA_START_ROW)
+    # Ensure always-live cross-sheet columns have a seed even if the template
+    # carried no sample data row with formulas.
+    _overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
+    for _col_idx, _header in hdr:
+        if _col_idx in always_live_cols and _col_idx not in formula_seeds:
+            _key = _formula_override_key_for_header(_header, upb_col)
+            if _key in _overrides:
+                formula_seeds[_col_idx] = {"origin_row": DATA_START_ROW, "formula": _overrides[_key]}
 
-    used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=4, start_row=5)
-    _clear_sheet_body(ws, used_cols, start_row=5)
+    used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=HEADER_ROW, start_row=DATA_START_ROW)
+    _clear_sheet_body(ws, used_cols, start_row=DATA_START_ROW)
 
-    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=5)
-    _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=5)
-    _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=3, start_row=5)
-    _trim_sheet_body_rows(ws, row_count=len(df), start_row=5)
-    _reset_sheet_autofilter(ws, hdr, row_count=len(df), header_row=4, start_row=5)
+    write_df_to_sheet_preserve_formulas(ws, df, hdr, fcols, upb_col, start_row=DATA_START_ROW)
+    _copy_formula_columns_down(ws, formula_seeds, row_count=len(df), header_tuples=hdr, upb_header=upb_col, start_row=DATA_START_ROW)
+    _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=4, start_row=DATA_START_ROW)
+    _trim_sheet_body_rows(ws, row_count=len(df), start_row=DATA_START_ROW)
+    _reset_sheet_autofilter(ws, hdr, row_count=len(df), header_row=HEADER_ROW, start_row=DATA_START_ROW)
 
 
 def _strip_timezones_from_workbook(wb):
@@ -7444,7 +7359,7 @@ def _normalize_sheet_key_value(header: str, value) -> str:
 
 
 def _sheet_header_index(wb, ws, upb_header: str) -> Dict[str, int]:
-    return {header: col_idx for col_idx, header in header_tuples_from_ws(ws, header_row=4, wb=wb, upb_header=upb_header)}
+    return {header: col_idx for col_idx, header in header_tuples_from_ws(ws, header_row=HEADER_ROW, wb=wb, upb_header=upb_header)}
 
 
 
@@ -7522,7 +7437,7 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
 
             out_ws = wb[sheet_name]
             base_ws = base_wb[sheet_name]
-            formula_cols = formula_col_indices(out_ws, start_row=5, header_row=4)
+            formula_cols = formula_col_indices(out_ws, start_row=DATA_START_ROW, header_row=HEADER_ROW)
 
             fills = 0
             matched_rows: Set[int] = set()
