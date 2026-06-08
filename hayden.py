@@ -1580,21 +1580,34 @@ def derive_bridge_portfolio(product_type, segment, financing, deal_intro_sub_sou
     return "CV"
 
 
+def normalize_term_financing(financing) -> str:
+    """Strip the SF Current-Funding-Vehicle 'CAF ' prefix so values match the report.
+
+    e.g. 'CAF 2020-P1' -> '2020-P1', 'CAF2021-2' -> '2021-2'. Leaves non-CAF values
+    (Sold, CPP JV - ..., Morgan Stanley, CAFL 2026-R1) unchanged.
+    """
+    f = clean_text(financing)
+    if not f:
+        return f
+    return re.sub(r"^CAF\s*", "", f, flags=re.I).strip()
+
+
 def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number, template_maps: dict, sold_servicing_status=None):
     typ = clean_text(loan_type)
-    fin = clean_text(financing)
+    fin = normalize_term_financing(financing)
     buyer = clean_text(loan_buyer)
 
     if typ in TERM_DSCR_TYPES:
         return "DSCR", "DSCR", "N"
     if fin.startswith("CPP JV"):
         return "Active Term", "CPP JV", "Y"
-    if fin == "Sold" or buyer:
-        retained = bool(_sold_servicing_retained_mask(pd.Series([sold_servicing_status])).iloc[0])
-        seg = TERM_SOLD_SERVICING_RETAINED_SEGMENT if retained else "Sold Term"
-        return "Sold Term", seg, "N"
+    # Legacy deals must win before sold/securitized (some are financed "CAFL 2026-R1").
     if deal_in_lookup(deal_number, template_maps.get("legacy_term_deals", set())):
         return "Active Term", "Legacy", "N"
+    if fin == "Sold" or buyer:
+        # Segment is the buyer's short name (first word): Apollo, Blackstone, etc.
+        seg = buyer.split()[0] if buyer else "Sold Term"
+        return "Sold Term", seg, "N"
     if re.match(r"^\d{4}[-A-Za-z0-9]+$", fin):
         return "Securitized Term", "Securitized Term", "N"
     return "Active Term", "Mortgage Banking", "N"
@@ -4712,10 +4725,12 @@ def _guard_term_loan_upb_vs_amount(df: pd.DataFrame, upb_col: str, prev_maps: Op
             implausible = loan_amount.gt(0) & upb.gt(loan_amount * TERM_UPB_LOAN_AMOUNT_RATIO_LIMIT)
 
     if bool(implausible.any()):
-        # Keep the current value instead of blanking the row. A blank Term Loan UPB creates
-        # blank Term Asset UPB for every asset on the deal. Implausible balances are still
-        # surfaced by validate_term_loan_amounts_or_raise / QA diagnostics.
-        pass
+        # No usable prior UPB: the servicer match attached a balance that exceeds the
+        # loan amount (often a different/larger loan). The report never shows Term Loan
+        # UPB above Loan Amount, so fall back to Loan Amount rather than keep the bad
+        # value. This keeps Term Asset UPB populated (Loan Amount is always present)
+        # and matches the report. Implausible matches are still logged by QA.
+        out.loc[implausible, upb_col] = loan_amount.loc[implausible]
     return downcast_numeric_frame(out)
 
 
@@ -4932,8 +4947,11 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
-    # NEW column: Asset Commitment surfaces the Opportunity Loan Commitment value.
-    out["Asset Commitment"] = out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=out.index))
+    # NEW column: Asset Commitment = approved Initial Disbursement + Renovation
+    # Holdback + Interest Allocation (asset-level). Components are populated by the
+    # spine map below; the final value is computed in the materialize step so it
+    # uses the same components as SF Funded Amount. Seed the column here so it exists.
+    out["Asset Commitment"] = np.nan
 
     out["Portfolio"] = pd.NA
     out["Segment"] = pd.NA
@@ -5372,6 +5390,7 @@ def _build_term_loan_salesforce_fallback(
 
     sold_stage_series = sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
     out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
+    out["Financing"] = out["Financing"].map(normalize_term_financing).replace({"": pd.NA})
     out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
@@ -7012,6 +7031,12 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     out["Needs NPL Value"] = _report_yn(npl_flag & most_recent_val.notna() & most_recent_val.lt(stale_threshold), idx)
 
     segment = _report_text_series_from_col(out, "Segment")
+    # NEW Asset Commitment = approved Initial Disbursement + Renovation Holdback + Interest Allocation.
+    out["Asset Commitment"] = (
+        _report_numeric_series_from_col(out, "Initial Disbursement Funded").fillna(0.0)
+        + _report_numeric_series_from_col(out, "Renovation Holdback").fillna(0.0)
+        + _report_numeric_series_from_col(out, "Interest Allocation").fillna(0.0)
+    )
     # NEW Loan Type: Portfolio 5A/TPO/RB map to labels, else fall back to Product Type.
     portfolio_ba = _report_text_series_from_col(out, "Portfolio")
     product_type_ba = _report_text_series_from_col(out, "Product Type")
