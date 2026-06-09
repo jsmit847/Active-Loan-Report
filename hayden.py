@@ -22,7 +22,7 @@ import requests
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Color, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V18_ROW4_FILL"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V21_TERM_ASSET_FREEZE_HEIGHT"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2380,6 +2380,20 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
     # (across all appraisals, computed before the Complete-Delivered filter).
     if _max_order_by_asset is not None and len(_max_order_by_asset):
         cand["Most Recent Appraisal Order Date"] = cand["_asset_key"].map(_max_order_by_asset)
+
+    # If the SELECTED Complete-Delivered appraisal carries no usable As-Is value
+    # (As-Is blank or 0 after the zero-aware coalesce), the official report blanks the
+    # ENTIRE Updated triple -- including the Updated Valuation Date -- not just the value.
+    # Verified e.g. asset 1473628: newest delivered appraisal has Appraised_Value_Amount
+    # = blank and Reviewed = 0, and the report shows Updated Date = N/A. Without this, we
+    # emit the effective date with no value next to it.
+    if "Current Appraised As-Is Value" in cand.columns:
+        _no_asis = blankish_mask(cand["Current Appraised As-Is Value"]) | (
+            pd.to_numeric(cand["Current Appraised As-Is Value"], errors="coerce").fillna(0) == 0
+        )
+        for _c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
+            if _c in cand.columns:
+                cand.loc[_no_asis, _c] = pd.NA
 
     keep = ["_asset_key"] + [
         c for c in ["Asset ID", "Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]
@@ -5417,6 +5431,11 @@ def build_bridge_asset(
             "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
             "Maturity Status", "Title Company", "Tax Commentary",
             "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            # Origination valuation is a FROZEN snapshot captured at loan origination -- it is
+            # carried forward, NOT recomputed from live Salesforce each week. Verified against
+            # the official report: e.g. asset 819585 shows the origination As-Is from the prior
+            # report (94.5M), not the current Property field (98.8M). Carry-forward-first.
+            "Origination Value Dt", "Origination As-Is Value", "Origination ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         }
         for c in [x for x in keep_cols if x != "_asset_key"]:
@@ -6704,6 +6723,30 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         for col_idx, val in blueprint.get("row5", {}).items():
             col_idx = _scaffold_col_index(col_idx)
             _set_scaffold_cell(ws, 5, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
+
+        # Deterministically (re)apply the blue header fill to row 5 on exactly the
+        # titled header columns. The official report styles every header cell with a
+        # solid theme-3 fill; blank spacer columns (those not in the blueprint, e.g.
+        # Term Asset col 21) stay unfilled. Doing this explicitly -- rather than relying
+        # on the input template/prior-report styling surviving -- guarantees Term Asset
+        # gets the same blue header band as Bridge Asset / Bridge Loan / Term Loan,
+        # instead of ending up with an unstyled header row.
+        _header_fill = PatternFill(fill_type="solid", fgColor=Color(theme=3, tint=0.0))
+        for _hdr_col in blueprint.get("row5", {}):
+            _hc = _scaffold_col_index(_hdr_col)
+            ws.cell(HEADER_ROW, _hc).fill = _header_fill
+
+        # Deterministically fix the freeze pane and row heights. The official report
+        # freezes BELOW the header row (A6 with headers in row 5) and gives the header
+        # row the tall height (45), with the empty rows above at the normal height (15).
+        # Some inputs leave Term Asset shifted up by one row -- freeze at A5 and the tall
+        # height on the empty row 4 instead of row 5 -- which renders the blue header band
+        # in the wrong place and one row too high. Set these explicitly so every data
+        # sheet matches the official exactly.
+        ws.freeze_panes = f"A{DATA_START_ROW}"            # A6
+        for _r in range(1, HEADER_ROW):
+            ws.row_dimensions[_r].height = 15.0           # rows 1-4 normal
+        ws.row_dimensions[HEADER_ROW].height = 45.0       # row 5 tall header
 
     refresh_summary_labels(wb, run_dt, upb_header)
 
