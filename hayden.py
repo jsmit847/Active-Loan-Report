@@ -119,7 +119,7 @@ TERM_ACTIVE_PROPERTY_STATUSES = ["Active", "REO"]
 TERM_RECORDTYPE_NAMES = {"term loan", "dscr"}
 BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single asset bridge loan"}
 BRIDGE_RT_CONTAINS = {"sab", "single asset bridge"}
-TERM_DSCR_TYPES = {"DSCR", "Investor DSCR"}
+TERM_DSCR_TYPES = {"DSCR", "Investor DSCR", "Single Rental Loan"}
 TERM_ALWAYS_INCLUDE_DEALS = {"43422", "43462"}
 TERM_SPINE_SERVICER_FAMILIES = {"midland", "fci", "berkadia"}
 TERM_SOLD_SERVICING_RETAINED_SEGMENT = "Sold Servicing Retained"
@@ -1549,7 +1549,7 @@ def derive_bridge_segment(deal_number, financing, loan_buyer, template_maps: dic
 
     if fin.startswith("CPP JV"):
         return "CPP JV"
-    if fin.startswith("Oaktree JV"):
+    if "Oaktree JV" in fin:
         return "Oaktree JV"
     if deal_in_lookup(deal_number, template_maps.get("ssp_deals", set())):
         return "SSP"
@@ -2468,68 +2468,32 @@ def _build_am_assignments_like() -> pd.DataFrame:
 
 
 def _build_active_rm_like() -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-
-    direct_fields = existing_field_names("Opportunity", ACTIVE_RM_DIRECT_FIELD_CANDIDATES)
-    if direct_fields:
-        select_pairs = [("Deal Loan Number", "Deal_Loan_Number__c")]
-        for idx, field_api in enumerate(direct_fields, start=1):
-            select_pairs.append((f"Active RM Candidate {idx}", field_api))
-        rename_map = {expr: label for label, expr in select_pairs}
-        soql = (
-            "SELECT "
-            + ", ".join(expr for _label, expr in select_pairs)
-            + " FROM Opportunity WHERE "
-            + "Deal_Loan_Number__c != NULL AND "
-            + _soql_in("StageName", ACTIVE_RM_STAGES)
-        )
-        direct_df = run_bulk_query(soql, rename_map=rename_map)
-        if not direct_df.empty:
-            candidate_cols = [c for c in direct_df.columns if c.startswith("Active RM Candidate ")]
-            if candidate_cols:
-                cand = pd.DataFrame(index=direct_df.index)
-                for c in candidate_cols:
-                    raw = pd.Series(direct_df[c], index=direct_df.index, dtype="object")
-                    txt = raw.astype("string").str.strip().str.lower()
-                    out_col = pd.Series([pd.NA] * len(raw), index=raw.index, dtype="object")
-                    out_col = out_col.mask(~blankish_mask(raw), "Y")
-                    out_col = out_col.mask(txt.isin(["false", "f", "n", "no", "0"]), "N")
-                    out_col = out_col.mask(txt.isin(["true", "t", "y", "yes", "1"]), "Y")
-                    cand[c] = out_col
-
-                any_y = cand.eq("Y").any(axis=1)
-                any_n = cand.eq("N").any(axis=1)
-                active_rm = pd.Series([pd.NA] * len(cand), index=cand.index, dtype="object")
-                active_rm = active_rm.mask(any_y, "Y")
-                active_rm = active_rm.mask((~any_y) & any_n, "N")
-                direct_df["Active RM"] = active_rm
-                frames.append(direct_df[["Deal Loan Number", "Active RM"]])
-
-    role_values = picklist_values_for("OpportunityTeamMember", "TeamMemberRole")
-    rm_roles = [role for role in role_values if _strict_active_rm_role_match(role)]
-    if rm_roles:
-        soql = (
-            "SELECT Opportunity.Deal_Loan_Number__c, TeamMemberRole "
-            "FROM OpportunityTeamMember WHERE "
-            "Opportunity.Deal_Loan_Number__c != NULL AND "
-            + _soql_parent_name_not_equal_or_no_parent("Opportunity.AccountId", "Opportunity.Account.Name", EXCLUDED_TEST_ACCOUNT_NAME)
-            + " AND Opportunity.StageName != NULL AND "
-            + _soql_in("Opportunity.StageName", ACTIVE_RM_STAGES)
-            + " AND "
-            + _soql_in("TeamMemberRole", rm_roles)
-        )
-        role_df = run_bulk_query(soql)
-        if not role_df.empty:
-            role_df = role_df.rename(columns={"Opportunity.Deal_Loan_Number__c": "Deal Loan Number", "TeamMemberRole": "Team Role"})
-            role_df["Active RM"] = "Y"
-            frames.append(role_df[["Deal Loan Number", "Active RM"]])
-
-    if not frames:
+    # Active RM = the deal Owner (CAF Originator) is an active Salesforce user.
+    # Mirrors the "Active RM" report: group by Opportunity, surface Owner.IsActive
+    # ("CAF Originator: Active"). A deal is "Y" if ANY of its owner rows is active.
+    soql = (
+        "SELECT Deal_Loan_Number__c, Owner.IsActive "
+        "FROM Opportunity WHERE "
+        "Deal_Loan_Number__c != NULL AND "
+        + _soql_in("StageName", ACTIVE_RM_STAGES)
+    )
+    df = run_bulk_query(
+        soql,
+        rename_map={"Deal_Loan_Number__c": "Deal Loan Number", "Owner.IsActive": "Owner Active"},
+    )
+    if df.empty or "Deal Loan Number" not in df.columns:
         return pd.DataFrame(columns=["Deal Loan Number", "Active RM"])
 
-    out = pd.concat(frames, ignore_index=True, copy=False)
-    out = out.dropna(subset=["Deal Loan Number"]).copy()
+    raw = pd.Series(df.get("Owner Active", pd.Series([pd.NA] * len(df), index=df.index)), index=df.index, dtype="object")
+    txt = raw.astype("string").str.strip().str.lower()
+    active = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    active = active.mask(txt.isin(["true", "t", "y", "yes", "1"]), "Y")
+    active = active.mask(txt.isin(["false", "f", "n", "no", "0"]), "N")
+    df["Active RM"] = active
+
+    out = df.dropna(subset=["Deal Loan Number"]).copy()
     out["_deal_key"] = norm_id_series(out["Deal Loan Number"])
+    # Y wins over N when a deal has multiple owner rows.
     out["_rank"] = out["Active RM"].map({"Y": 2, "N": 1}).fillna(0)
     out = out.sort_values(["_deal_key", "_rank"]).drop_duplicates("_deal_key", keep="last")
     return out[["Deal Loan Number", "Active RM"]]
