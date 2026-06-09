@@ -1519,6 +1519,21 @@ def load_template_lookup_maps(template_bytes: bytes) -> dict:
                 grouping = clean_text(row.get(grouping_col))
                 if strategy and grouping:
                     maps["strategy_map"][strategy] = grouping
+        # SA Loan lookup: the F:G columns map an Asset Manager 1 name -> "Y".
+        # (These are the right-hand "Asset Manager 1"/"Y" columns, not the strategy pair.)
+        sa_mgr_col = None
+        sg_cols = list(sg.columns)
+        for i, c in enumerate(sg_cols):
+            if str(c).strip() == "Asset Manager 1":
+                sa_mgr_col = c
+                break
+        sa_managers = set()
+        if sa_mgr_col is not None:
+            for _, row in sg.iterrows():
+                mgr = clean_text(row.get(sa_mgr_col))
+                if mgr:
+                    sa_managers.add(mgr)
+        maps["sa_loan_managers"] = sa_managers
 
     if "SSP Loans" in xls.sheet_names:
         ssp = pd.read_excel(BytesIO(template_bytes), sheet_name="SSP Loans", header=3)
@@ -2156,12 +2171,16 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         ["Appraised_After_Repair_Value__c", "Internal_as_Rehab_Value__c", "Appraised_Value_Amount__c"],
     )
 
+    status_field = first_existing_field_name("Appraisal__c", ["Status__c", "Status_Description__c"])
+
     select_pairs = [
         ("Asset ID", f"{property_rel}.Asset_ID__c"),
         ("Property Asset Id", "Property_Asset_Id__c"),
         ("Property ID", f"{property_rel}.Id"),
         ("Appraisal Name", "Name"),
     ]
+    if status_field:
+        select_pairs.append(("Appraisal Status", status_field))
     if deal_rel:
         select_pairs.append(("Deal Loan Number", f"{deal_rel}.Deal_Loan_Number__c"))
     if order_field:
@@ -2201,11 +2220,11 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
         df["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(df["Most Recent Appraisal Order Date"])
     df["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(
         df,
-        [c for c in ["Appraisal Reviewed As-Is Value", "Appraisal As-Is Fallback Value"] if c in df.columns],
+        [c for c in ["Appraisal As-Is Fallback Value", "Appraisal Reviewed As-Is Value"] if c in df.columns],
     )
     df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
         df,
-        [c for c in ["Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in df.columns],
+        [c for c in ["Appraisal ARV Fallback", "Appraisal Reviewed ARV", "Appraisal As-Is Fallback Value"] if c in df.columns],
     )
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     return downcast_numeric_frame(df)
@@ -2233,12 +2252,25 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
         cand["Most Recent Appraisal Order Date"] = _to_datetime_series_mixed(cand["Most Recent Appraisal Order Date"])
     cand["Current Appraised As-Is Value"] = _coalesce_numeric_columns_zeroaware(
         cand,
-        [c for c in ["Current Appraised As-Is Value", "Appraisal Reviewed As-Is Value", "Appraisal As-Is Fallback Value"] if c in cand.columns],
+        [c for c in ["Current Appraised As-Is Value", "Appraisal As-Is Fallback Value", "Appraisal Reviewed As-Is Value"] if c in cand.columns],
     )
     cand["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
         cand,
-        [c for c in ["Current Appraised After Repair Value", "Appraisal Reviewed ARV", "Appraisal ARV Fallback", "Appraisal As-Is Fallback Value"] if c in cand.columns],
+        [c for c in ["Current Appraised After Repair Value", "Appraisal ARV Fallback", "Appraisal Reviewed ARV", "Appraisal As-Is Fallback Value"] if c in cand.columns],
     )
+
+    # Only Complete-Delivered appraisals feed the Updated valuation columns. The
+    # report blanks Updated values for assets whose latest appraisal is in any other
+    # status (Reviewed, Order Updated, Inspection Complete, Cancelled, etc.).
+    if "Appraisal Status" in cand.columns:
+        _status = cand["Appraisal Status"].astype("string").str.strip()
+        _delivered = cand[_status.str.casefold() == "complete-delivered"]
+        # Fall back to the unfiltered set only if the filter removes everything for
+        # an asset would otherwise have had a delivered appraisal -- i.e. keep
+        # delivered rows where they exist, drop the rest entirely (report blanks them).
+        cand = _delivered.copy()
+    if cand.empty:
+        return pd.DataFrame()
 
     cand["_bundle_effective_dt"] = _to_datetime_series_mixed(cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
     cand["_bundle_order_dt"] = _to_datetime_series_mixed(cand.get("Most Recent Appraisal Order Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
@@ -5048,6 +5080,10 @@ def build_bridge_asset(
         axis=1,
     )
     strat_guess = out["Project Strategy"].map(lambda x: strategy_grouping_from_project_strategy(x, template_maps.get("strategy_map", {})))
+    # SA Loan (Y/N) = Asset Manager 1 is in the special-asset manager list.
+    _sa_mgrs = {clean_text(m) for m in template_maps.get("sa_loan_managers", set()) if clean_text(m)}
+    _am1 = out.get("Asset Manager 1", pd.Series([pd.NA] * len(out), index=out.index)).map(clean_text)
+    out["SA Loan (Y/N)"] = _am1.map(lambda x: "Y" if x in _sa_mgrs else "N")
     port_guess = out.apply(
         lambda r: derive_bridge_portfolio(
             r.get("Product Type"),
@@ -5181,9 +5217,10 @@ def build_bridge_asset(
     sf_suspense = pd.to_numeric(out.get("Salesforce Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     serv_suspense = pd.to_numeric(out.get("_loan_suspense", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     out["_row_in_deal"] = out.groupby("_deal_key", dropna=True).cumcount()
+    # Servicer suspense is asset-level -> keep per asset. SF suspense is loan-level
+    # -> apply once per deal (first row only) as a fallback where no servicer value.
     sf_suspense_once = pd.Series(np.where(out["_row_in_deal"].eq(0), sf_suspense, np.nan), index=out.index)
-    serv_suspense_once = pd.Series(np.where(out["_row_in_deal"].eq(0), serv_suspense, np.nan), index=out.index)
-    out["Suspense Balance"] = serv_suspense_once.where(serv_suspense_once.notna(), sf_suspense_once)
+    out["Suspense Balance"] = serv_suspense.where(serv_suspense.notna(), sf_suspense_once)
     out["Suspense Balance"] = pd.to_numeric(out["Suspense Balance"], errors="coerce").fillna(0.0)
 
     # Bridge NPD is servicer-first, except for the recurring day-1/day-10 issue
@@ -6584,7 +6621,7 @@ def _formula_override_key_for_header(header: str, upb_header: str) -> str:
         return "__QEND_NPL_YN__"
     if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", header, flags=re.I):
         return "__QEND_NPL__"
-    if re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", header, flags=re.I):
+    if re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List\s*", header, flags=re.I):
         return "__SPECIAL_LIST__"
     return header
 
@@ -7036,10 +7073,12 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
         max_days_past_due = pd.Series([np.nan] * len(out), index=idx)
     out["Matured Loan (YN)"] = _report_yn(min_days_to_mat.lt(0), idx)
     out["DQ 45+ Loan (Y/N)"] = _report_yn(max_days_past_due.ge(45), idx)
+    # SA Loan (Y/N) is computed in build_bridge_asset from the Asset Manager 1
+    # special-asset lookup; keep it if present, else default N.
     out["SA Loan (Y/N)"] = coalesce_keep_nonblank(
         out.get("SA Loan (Y/N)", pd.Series([pd.NA] * len(out), index=idx)),
         pd.Series(["N"] * len(out), index=idx),
-    )
+    ).replace({"": "N"})
 
     financing = _report_text_series_from_col(out, "Financing")
     special_any = (
@@ -7302,7 +7341,15 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     always_live = {
         "Term Loan": {"SFR Allocation", "MF Allocation", "Strategy Grouping"},
     }.get(sheet_name, set())
-    always_live_cols = {col_idx for col_idx, header in hdr if header in always_live}
+    # Match always-live headers, plus the token-mapped cross-sheet columns on
+    # Term Asset (UPB + the special-loans-list, both of which reference Term Loan
+    # and must stay live so they recalc against the Term Loan sheet).
+    always_live_cols = {col_idx for col_idx, header in hdr if clean_text(header) in always_live}
+    if sheet_name == "Term Asset":
+        for col_idx, header in hdr:
+            _k = _formula_override_key_for_header(header, upb_col)
+            if _k in {"__UPB__", "__SPECIAL_LIST__"}:
+                always_live_cols.add(col_idx)
 
     if MATERIALIZE_FORMULA_RESULT_COLUMNS:
         fcols = always_live_cols.copy()
