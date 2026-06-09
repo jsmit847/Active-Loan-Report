@@ -22,7 +22,7 @@ import requests
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V15_NA_BLANK_DATARULES"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V18_ROW4_FILL"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2290,7 +2290,10 @@ def _build_appraisal_like(asset_ids=None) -> pd.DataFrame:
     )
     df["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
         df,
-        [c for c in ["Appraisal ARV Fallback", "Appraisal Reviewed ARV", "Appraisal As-Is Fallback Value"] if c in df.columns],
+        # ARV must NOT fall back to the As-Is value: when an appraisal carries no ARV
+        # (common for as-is-only appraisals) the official report shows N/A, not the
+        # As-Is amount masquerading as ARV.
+        [c for c in ["Appraisal ARV Fallback", "Appraisal Reviewed ARV"] if c in df.columns],
     )
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     return downcast_numeric_frame(df)
@@ -2322,7 +2325,8 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
     )
     cand["Current Appraised After Repair Value"] = _coalesce_numeric_columns_zeroaware(
         cand,
-        [c for c in ["Current Appraised After Repair Value", "Appraisal ARV Fallback", "Appraisal Reviewed ARV", "Appraisal As-Is Fallback Value"] if c in cand.columns],
+        # ARV must NOT borrow the As-Is value when the appraisal has no ARV.
+        [c for c in ["Current Appraised After Repair Value", "Appraisal ARV Fallback", "Appraisal Reviewed ARV"] if c in cand.columns],
     )
 
     # "Most Recent Appraisal Order Date" = MAX order date across ALL appraisals for the
@@ -6661,10 +6665,20 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         # Clear all values in the scaffold rows before rewriting them from the
         # blueprint. Without this, a prior-layout template (notably Term Asset, which
         # carried headers in row 4 AND row 5) leaves a duplicate header row that trips
-        # the QA matched-row logic. We clear values only -- styles/formatting persist.
+        # the QA matched-row logic.
+        #
+        # Also strip the cell FILL on the empty rows above the header (rows 1..HEADER_ROW-1).
+        # A prior completed report can carry a solid (blue) fill across an otherwise-empty
+        # row 4 -- visually a second, title-less blue header band above the real titles in
+        # row 5. The official report has no such fill, so clear it here. Blueprint cells
+        # (e.g. the row-4 SUBTOTAL) are re-set immediately afterward and keep their styling.
+        _no_fill = PatternFill(fill_type=None)
         for _clear_row in range(1, HEADER_ROW + 1):
             for _clear_col in range(1, ws.max_column + 1):
-                ws.cell(_clear_row, _clear_col).value = None
+                _cell = ws.cell(_clear_row, _clear_col)
+                _cell.value = None
+                if _clear_row < HEADER_ROW:  # leave the row-5 header styling untouched
+                    _cell.fill = _no_fill
 
         for col_idx, val in blueprint.get("row1", {}).items():
             _set_scaffold_cell(ws, 1, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
@@ -7431,18 +7445,28 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
 
     for col_idx in sorted(formula_seeds):
         header = header_by_col.get(col_idx, "")
+        _hdr_norm = str(header).strip()
         if header == upb_header:
             override_key = "__UPB__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", str(header), flags=re.I):
+        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", _hdr_norm, flags=re.I):
             override_key = "__QEND_NPL_YN__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", str(header), flags=re.I):
+        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", _hdr_norm, flags=re.I):
             override_key = "__QEND_NPL__"
-        elif re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", str(header), flags=re.I):
+        elif re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", _hdr_norm, flags=re.I):
             override_key = "__SPECIAL_LIST__"
         else:
             override_key = header
-        origin_formula = overrides.get(override_key, formula_seeds[col_idx]["formula"])
-        origin_row = start_row
+        seed_info = formula_seeds.get(col_idx, {})
+        if override_key in overrides:
+            # Override formulas are authored relative to DATA_START_ROW (row 6).
+            origin_formula = overrides[override_key]
+            origin_row = start_row
+        else:
+            # Seeded formulas may have been captured from any scan row; anchor the
+            # Translator to the row the seed actually came from so relative refs
+            # (e.g. $U6) shift correctly instead of freezing at the seed's row.
+            origin_formula = seed_info.get("formula")
+            origin_row = seed_info.get("origin_row", start_row)
         origin_ref = f"{get_column_letter(col_idx)}{origin_row}"
 
         for r in range(start_row, start_row + row_count):
