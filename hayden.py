@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_08_V14_ROW5_LAYOUT"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V15_NA_BLANK_DATARULES"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -234,35 +234,54 @@ DEFAULT_TEXT_HEADERS = {
 # fields. Leaving these as true Excel blanks can break downstream formulas (for example,
 # Bridge Asset DQ Status treats a blank REO Date as if the asset were REO).
 REPORT_NA_FILL_HEADERS = {
+    # VERIFIED against 20260608_Active_Loans.xlsx read with keep_default_na=False:
+    # the real report fills missing values with the literal text "N/A" in essentially
+    # every data column (true blanks only appear in unnamed spacer columns, Bridge
+    # Asset "Property Type", and the Term Asset Updated Value* columns -- the latter
+    # are handled by REPORT_FORCE_BLANK_HEADERS below). Earlier I misread this because
+    # pandas silently converts "N/A" to NaN by default; do NOT remove columns here
+    # without re-checking the actual report with keep_default_na=False.
     "Bridge Asset": {
-        "Additional APNs", "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
-        "Remedy Plan", "Delinquency Notes", "Maturity Status", "Is Special Asset (Y/N)",
+        "Loan Buyer", "Financing", "Servicer ID", "Servicer", "SF Yardi ID", "Borrower Entity",
+        "Primary Contact", "County", "CBSA", "APN", "Additional APNs", "# of Units", "Year Built",
+        "Square Feet", "First Funding Date", "Last Funding Date", "Asset Manager 1",
+        "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date", "Construction Mgr.",
+        "CM Assigned Date", "Remedy Plan", "Delinquency Notes", "Maturity Status",
         "Special Asset Status", "Special Asset Reason", "Special Asset: Special Asset Status",
-        "Special Asset: Resolved Date", "Forbearance Term Date", "FC Sale Date", "Rescheduled FC Sale Date", "REO Date",
-        # Origination Value Dt intentionally becomes N/A when Salesforce has no origination valuation date.
-        # Updated valuation fields should remain blank when no updated value exists; do not N/A-fill them.
-        "Origination Value Dt",
-        "Title Company", "Tax Due Date", "Tax Frequency", "Tax Commentary",
-        "Servicer Status", "Servicer Maturity Date", "CV Maturity Date",
-        "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+        "Special Asset: Resolved Date", "Forbearance Term Date", "FC Sale Date",
+        "Rescheduled FC Sale Date", "REO Date", "Origination Value Dt", "Origination As-Is Value",
+        "Origination ARV", "Most Recent Appraisal Order Date", "Updated Valuation Date",
+        "Updated As-Is Value", "Updated ARV", "Title Company", "Tax Due Date", "Tax Frequency",
+        "Tax Commentary", "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account",
+        "Referral Source Contact", "Servicer Status", "Servicer Maturity Date", "Maturity Difference",
+        "Most Recent Valuation Date", "Most Recent As-Is Value", "Most Recent ARV",
     },
     "Bridge Loan": {
-        "Next Advance Maturity Date", "Next Payment Date", "AM 1 Assigned Date",
-        "AM 2 Assigned Date", "CM Assigned Date", "AM Commentary",
+        "Loan Buyer", "Financing", "Servicer ID", "Servicer", "Borrower Name", "Primary Contact",
+        "Most Recent Valuation Date", "Most Recent As-Is Value", "Most Recent ARV",
+        "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account",
+        "Referral Source Contact", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
+        "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date", "AM Commentary",
     },
-    "Term Loan": {"REO Date", "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact", "AM Commentary"},
-    "Term Asset": set(),
+    "Term Loan": {
+        "Servicer ID", "Servicer", "Borrower Entity", "Financing", "Loan Buyer", "REO Date",
+        "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
+        "Referral Source Contact", "AM Commentary",
+    },
+    "Term Asset": {
+        "Financing", "CBSA", "# Units", "Origination Value Date", "Origination Value",
+        "Origination Value Type",
+    },
 }
 
 
 # Columns that must stay truly blank when source/carry-forward is blank.
-# This prevents the QA/default pass from turning intentionally blank report fields
-# into N/A, especially Term Asset and updated valuation fields.
+# VERIFIED against 20260608_Active_Loans.xlsx (keep_default_na=False): on Bridge Asset
+# the Updated/Most Recent valuation columns are N/A-when-missing (NOT blank), so they
+# are intentionally NOT listed here. Only the Term Asset Updated Value* columns are
+# genuinely blank-when-missing in the real report.
 REPORT_FORCE_BLANK_HEADERS = {
-    "Bridge Asset": {
-        "Most Recent Appraisal Order Date", "Updated Valuation Date",
-        "Updated As-Is Value", "Updated ARV",
-    },
+    "Bridge Asset": set(),
     "Bridge Loan": set(),
     "Term Loan": set(),
     "Term Asset": {"Updated Value Date", "Updated As-Is Value", "Updated Value Type"},
@@ -773,6 +792,24 @@ def coalesce_keep_nonblank(primary: pd.Series, fallback: pd.Series) -> pd.Series
     p = pd.Series(list(pd.Series(primary, copy=False)), index=pd.Series(primary, copy=False).index)
     f = pd.Series(list(pd.Series(fallback, copy=False)), index=p.index)
     return p.where(~blankish_mask(p), f)
+
+
+def blank_zero_value_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """Force 0 (and 0.0 / "0") to a true blank for value columns.
+
+    The official report leaves valuation/value cells EMPTY when there is no value --
+    never 0. A literal 0 can sneak in from a Salesforce field, a stale prior-report
+    carry-forward, or a numeric coercion. This guarantees a missing Updated ARV /
+    As-Is / value reads as an empty cell exactly like the real report, so the test
+    can never show a misleading 0 where the report shows blank.
+    """
+    for col in columns:
+        if col not in df.columns:
+            continue
+        num = pd.to_numeric(df[col], errors="coerce")
+        is_zeroish = num.eq(0)
+        df[col] = df[col].mask(is_zeroish, pd.NA)
+    return df
 
 
 def coalesce_report_display_first(primary: pd.Series, fallback: pd.Series) -> pd.Series:
@@ -1559,22 +1596,42 @@ def strategy_grouping_from_project_strategy(project_strategy, strategy_map: dict
 
 
 def derive_bridge_segment(deal_number, financing, loan_buyer, template_maps: dict):
+    # In the Bridge spine, "financing" is sourced from the Warehouse Line, which the
+    # official report uses to classify Segment (validated against SF_Bridge):
+    #   startswith "CAFL "       -> Securitized Bridge
+    #   startswith "CPP JV"       -> CPP JV
+    #   "Churchill Oaktree JV"    -> Oaktree JV
+    #   contains "Spruce"         -> SSP
+    #   Axos / Ineligible / *-NPL -> Legacy
+    #   plain bank name OR blank  -> Mortgage Banking
+    #   blank AND sold            -> Sold Servicing Retained
     fin = clean_text(financing)
     buyer = clean_text(loan_buyer)
+    u = fin.upper()
 
-    if fin.startswith("CPP JV"):
+    # Sold (servicing retained) only when there is no warehouse line to classify on.
+    if not fin:
+        if buyer or clean_text(financing) == "Sold":
+            return "Sold Servicing Retained"
+        return "Mortgage Banking"
+
+    if u.startswith("CAFL "):
+        return "Securitized Bridge"
+    if u.startswith("CPP JV"):
         return "CPP JV"
-    if "Oaktree JV" in fin:
+    if "CHURCHILL OAKTREE" in u or u == "OAKTREE JV" or "OAKTREE JV" in u:
         return "Oaktree JV"
+    if "SPRUCE" in u:
+        return "SSP"
+    if fin in ("Axos", "Ineligible") or u.endswith("- NPL") or u.endswith("-NPL"):
+        return "Legacy"
+    # Template lookups remain authoritative for hand-maintained exceptions.
     if deal_in_lookup(deal_number, template_maps.get("ssp_deals", set())):
         return "SSP"
-    if buyer or fin == "Sold":
-        return "Sold Servicing Retained"
     if deal_in_lookup(deal_number, template_maps.get("legacy_bridge_deals", set())):
         return "Legacy"
-    if fin in BRIDGE_MB_FINANCINGS:
-        return "Mortgage Banking"
-    return "Securitized Bridge"
+    # plain bank names (Goldman Sachs, Wells Fargo, Morgan Stanley, ...) -> Mortgage Banking
+    return "Mortgage Banking"
 
 
 def derive_bridge_portfolio(product_type, segment, financing, deal_intro_sub_source, deal_number):
@@ -1595,16 +1652,25 @@ def derive_bridge_portfolio(product_type, segment, financing, deal_intro_sub_sou
     return "CV"
 
 
+TERM_FUNDING_VEHICLE_REMAP = {
+    # SF Current Funding Vehicle -> report display name (securitization naming).
+    "2022-2": "2022-P2",
+    "2023-1": "2023-P1",
+}
+
+
 def normalize_term_financing(financing) -> str:
     """Strip the SF Current-Funding-Vehicle 'CAF ' prefix so values match the report.
 
     e.g. 'CAF 2020-P1' -> '2020-P1', 'CAF2021-2' -> '2021-2'. Leaves non-CAF values
-    (Sold, CPP JV - ..., Morgan Stanley, CAFL 2026-R1) unchanged.
+    (Sold, CPP JV - ..., Morgan Stanley, CAFL 2026-R1) unchanged. Then applies the
+    securitization display remap (2022-2 -> 2022-P2, 2023-1 -> 2023-P1).
     """
     f = clean_text(financing)
     if not f:
         return f
-    return re.sub(r"^CAF(?=\s|\d)\s*", "", f, flags=re.I).strip()
+    f = re.sub(r"^CAF(?=\s|\d)\s*", "", f, flags=re.I).strip()
+    return TERM_FUNDING_VEHICLE_REMAP.get(f, f)
 
 
 def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number, template_maps: dict, sold_servicing_status=None):
@@ -2259,17 +2325,40 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
         [c for c in ["Current Appraised After Repair Value", "Appraisal ARV Fallback", "Appraisal Reviewed ARV", "Appraisal As-Is Fallback Value"] if c in cand.columns],
     )
 
-    # Only Complete-Delivered appraisals feed the Updated valuation columns. The
-    # report blanks Updated values for assets whose latest appraisal is in any other
-    # status (Reviewed, Order Updated, Inspection Complete, Cancelled, etc.).
+    # "Most Recent Appraisal Order Date" = MAX order date across ALL appraisals for the
+    # asset (validated ~88% vs official). Compute it BEFORE the Complete-Delivered filter
+    # so cancelled/in-progress orders still count, then attach back per asset.
+    _max_order_by_asset = None
+    if "Most Recent Appraisal Order Date" in cand.columns:
+        _ord_all = _to_datetime_series_mixed(cand["Most Recent Appraisal Order Date"])
+        _max_order_by_asset = (
+            pd.DataFrame({"_asset_key": cand["_asset_key"], "_ord": _ord_all})
+            .dropna(subset=["_asset_key"])
+            .groupby("_asset_key")["_ord"].max()
+        )
+
+    # The official report GATES the Updated valuation triple on the asset's LATEST
+    # appraisal (by effective date, across all statuses) being Complete-Delivered.
+    # If the newest appraisal is Reviewed / Revision Required / Cancelled / etc.,
+    # the report BLANKS the Updated values -- even if an older delivered one exists.
     if "Appraisal Status" in cand.columns:
         _status = cand["Appraisal Status"].astype("string").str.strip()
-        _delivered = cand[_status.str.casefold() == "complete-delivered"]
-        # Fall back to the unfiltered set only if the filter removes everything for
-        # an asset would otherwise have had a delivered appraisal -- i.e. keep
-        # delivered rows where they exist, drop the rest entirely (report blanks them).
-        cand = _delivered.copy()
+        _eff_all = _to_datetime_series_mixed(cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
+        _gate = pd.DataFrame({"_asset_key": cand["_asset_key"], "_eff": _eff_all, "_st": _status.str.casefold()})
+        _gate = _gate.dropna(subset=["_asset_key", "_eff"])
+        if not _gate.empty:
+            _latest = _gate.sort_values(["_asset_key", "_eff"]).drop_duplicates("_asset_key", keep="last")
+            _delivered_assets = set(_latest.loc[_latest["_st"] == "complete-delivered", "_asset_key"])
+        else:
+            _delivered_assets = set()
+        # keep only Complete-Delivered rows for assets that pass the gate
+        cand = cand[(_status.str.casefold() == "complete-delivered") & cand["_asset_key"].isin(_delivered_assets)].copy()
     if cand.empty:
+        # still surface Most Recent Order Date even when no delivered appraisal exists
+        if _max_order_by_asset is not None and len(_max_order_by_asset):
+            mo = _max_order_by_asset.reset_index()
+            mo.columns = ["_asset_key", "Most Recent Appraisal Order Date"]
+            return downcast_numeric_frame(mo)
         return pd.DataFrame()
 
     cand["_bundle_effective_dt"] = _to_datetime_series_mixed(cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
@@ -2282,6 +2371,11 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
     cand = cand[cand["_asset_key"].notna()].copy()
     cand = cand.sort_values(["_asset_key", "_bundle_effective_dt", "_bundle_order_dt", "_nonnull_score"], ascending=[True, True, True, True])
     cand = cand.drop_duplicates(["_asset_key"], keep="last")
+
+    # Replace the selected row's order date with the per-asset MAX order date
+    # (across all appraisals, computed before the Complete-Delivered filter).
+    if _max_order_by_asset is not None and len(_max_order_by_asset):
+        cand["Most Recent Appraisal Order Date"] = cand["_asset_key"].map(_max_order_by_asset)
 
     keep = ["_asset_key"] + [
         c for c in ["Asset ID", "Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]
@@ -2349,11 +2443,31 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
             app = best_bundle.copy()
             df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
             df = df.merge(app, on="_asset_key", how="left", suffixes=("", "_app"))
+            # Updated valuation triple (As-Is / ARV / effective date) comes STRICTLY from
+            # the latest Complete-Delivered appraisal bundle, which reads the per-appraisal
+            # Appraised_Value_Amount__c / Appraised_After_Repair_Value__c / effective date.
+            # The Property__c roll-up (Current Appraised*) is NOT a valid source and must
+            # not survive: if the asset has no delivered appraisal, the report blanks these.
+            strict_from_bundle = {
+                "Current Appraisal Date",
+                "Current Appraised As-Is Value",
+                "Current Appraised After Repair Value",
+            }
             for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
                 app_col = f"{c}_app"
                 if app_col in df.columns:
-                    df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
+                    if c in strict_from_bundle:
+                        # bundle value only -- do NOT fall back to property roll-up
+                        df[c] = df[app_col]
+                    else:
+                        # Most Recent Order Date may still use whatever is present
+                        df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
                     df = df.drop(columns=[app_col], errors="ignore")
+        else:
+            # No appraisal bundle at all for this batch -> blank the Updated triple so the
+            # Property roll-up never leaks into Updated valuation columns.
+            for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
+                df[c] = pd.NA
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
     df["_property_id_key"] = norm_id_series(df.get("Property ID", pd.Series([None] * len(df), index=df.index)))
@@ -3232,6 +3346,12 @@ def _normalize_report_comment_text(value):
     }
     for bad, good in replacements.items():
         txt = txt.replace(bad, good)
+    # Fold unicode dashes/hyphens and the replacement char to a plain hyphen so text
+    # that is byte-identical except for a U+2011 vs "?" stops registering as a mismatch
+    # (this alone accounts for ~380 phantom Tax Commentary diffs).
+    for ch in ("\u2011", "\u2010", "\u2012", "\u2013", "\u2014", "\ufffd"):
+        txt = txt.replace(ch, "-")
+    txt = txt.replace("_x000D_", " ").replace("\r", " ")
     txt = re.sub(r"\s+", " ", txt).strip()
     return txt or pd.NA
 
@@ -3890,10 +4010,44 @@ def _find_upb_col(cols: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _detect_active_loans_header_row(file_bytes: bytes, sheet: str) -> int:
+    """Return the 0-based pandas header index for a prior Active Loan Report sheet.
+
+    The report layout changed from row-4 headers (header=3) to row-5 headers
+    (header=4) on 2026-05-27. A hardcoded header index silently breaks
+    carry-forward whenever the uploaded prior report uses the other layout
+    (every "Unnamed: X" column makes build_prev_maps find nothing, which kills
+    Strategy Grouping / Segment / valuation carry-forward). Detect the real
+    header row by looking for the sheet's key identifier columns.
+    """
+    # Identifier columns that appear in every report layout.
+    expected = {"Asset ID", "Deal Number", "Deal Name", "Portfolio"}
+    best_idx, best_hits = 4, -1
+    for h in (4, 3, 2, 5, 1, 0):
+        try:
+            probe = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=h, nrows=1)
+        except Exception:
+            continue
+        cols = {str(c).strip() for c in probe.columns}
+        hits = len(expected & cols)
+        if hits > best_hits:
+            best_idx, best_hits = h, hits
+        if hits >= 2:  # two identifier columns is a confident match
+            return h
+    return best_idx
+
+
 def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame:
-    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=3)
+    header_idx = _detect_active_loans_header_row(file_bytes, sheet)
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=header_idx)
     df = df.dropna(how="all").copy()
     df.columns = [str(c).strip() for c in df.columns]
+    # Drop any echoed header row that slipped into the data (defensive: a report
+    # that carries headers in BOTH row 4 and row 5 must not leak the dupe as data).
+    for key in ("Asset ID", "Deal Number"):
+        if key in df.columns:
+            df = df[df[key].astype(str).str.strip() != key]
+            break
     return df
 
 
@@ -5272,6 +5426,14 @@ def build_bridge_asset(
     if "Tax Commentary" in out.columns:
         out["Tax Commentary"] = pd.Series(out["Tax Commentary"], index=out.index, dtype="object").map(_normalize_report_comment_text)
 
+    # Valuation/value columns must be blank (empty cell) when there is no value --
+    # never 0 -- to match the official report. Guards against stale 0s from SF,
+    # carry-forward, or numeric coercion.
+    out = blank_zero_value_columns(out, [
+        "Updated ARV", "Updated As-Is Value", "Most Recent ARV", "Most Recent As-Is Value",
+        "Origination ARV", "Origination As-Is Value",
+    ])
+
     status_bucket = pd.Series(
         [
             normalize_bridge_servicer_status(raw_status, npd, run_dt, loan_stage, property_status, reo_date)
@@ -5397,6 +5559,11 @@ def _build_term_loan_salesforce_fallback(
     sold_stage_series = sf_term.get("Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
     out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
     out["Financing"] = out["Financing"].map(normalize_term_financing).replace({"": pd.NA})
+    # A populated Loan Buyer (Sold Loan Pool join) means the loan was sold; the report
+    # shows Financing="Sold" regardless of the funding vehicle (validated: all 387 Sold
+    # deals have a Loan Buyer). Stage=="Sold" is also honored as a fallback trigger.
+    _loan_buyer_populated = ~blankish_mask(out.get("Loan Buyer", pd.Series([pd.NA] * len(out), index=out.index)))
+    out["Financing"] = out["Financing"].mask(_loan_buyer_populated, "Sold")
     out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
@@ -5995,6 +6162,9 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     )
     out = out.loc[meaningful_mask].copy()
 
+    # Value columns blank (not 0) to match the official report.
+    out = blank_zero_value_columns(out, ["Origination Value", "Updated As-Is Value"])
+
     return downcast_numeric_frame(out.drop(columns=["_value_dt", "_mod_dt", "_created_dt", "_ala_sort"], errors="ignore"))
 
 def build_bridge_loan(
@@ -6354,6 +6524,12 @@ def build_bridge_loan(
         ],
     )
 
+    # Value rollup columns blank (not 0) to match the official report.
+    out = blank_zero_value_columns(out, [
+        "Most Recent ARV", "Most Recent As-Is Value",
+        "Origination ARV", "Origination As-Is Value", "Updated ARV", "Updated As-Is Value",
+    ])
+
     drop_cols = [
         c for c in out.columns
         if c.startswith("_") or c.endswith("_active") or c.startswith("SF ") or c.startswith("Opportunity Servicer")
@@ -6481,6 +6657,14 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         ws = wb[sheet_name]
 
         _ensure_bridge_asset_fc_columns(ws)
+
+        # Clear all values in the scaffold rows before rewriting them from the
+        # blueprint. Without this, a prior-layout template (notably Term Asset, which
+        # carried headers in row 4 AND row 5) leaves a duplicate header row that trips
+        # the QA matched-row logic. We clear values only -- styles/formatting persist.
+        for _clear_row in range(1, HEADER_ROW + 1):
+            for _clear_col in range(1, ws.max_column + 1):
+                ws.cell(_clear_row, _clear_col).value = None
 
         for col_idx, val in blueprint.get("row1", {}).items():
             _set_scaffold_cell(ws, 1, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
@@ -7175,11 +7359,6 @@ def _apply_report_blank_na_policy(df: pd.DataFrame, sheet_name: str) -> pd.DataF
         if header in out.columns:
             ser = pd.Series(out[header], index=out.index, dtype="object")
             out[header] = ser.where(~blankish_mask(ser), pd.NA)
-
-    # Origination valuation date is intentionally N/A when not found in SF.
-    if sheet_name == "Bridge Asset" and "Origination Value Dt" in out.columns:
-        ser = pd.Series(out["Origination Value Dt"], index=out.index, dtype="object")
-        out["Origination Value Dt"] = ser.where(~blankish_mask(ser), "N/A")
 
     return out
 
