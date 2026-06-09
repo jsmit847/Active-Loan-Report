@@ -1599,15 +1599,17 @@ def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number,
 
     if typ in TERM_DSCR_TYPES:
         return "DSCR", "DSCR", "N"
-    if fin.startswith("CPP JV"):
-        return "Active Term", "CPP JV", "Y"
-    # Legacy deals must win before sold/securitized (some are financed "CAFL 2026-R1").
-    if deal_in_lookup(deal_number, template_maps.get("legacy_term_deals", set())):
-        return "Active Term", "Legacy", "N"
+    # A populated Loan Buyer (or Financing=Sold) means the loan was sold -- this wins
+    # over the funding vehicle, including "CPP JV - ..." vehicles that were later sold
+    # (the report shows these as Sold/Apollo/Blackstone, not CPP JV).
     if fin == "Sold" or buyer:
-        # Segment is the buyer's short name (first word): Apollo, Blackstone, etc.
         seg = buyer.split()[0] if buyer else "Sold Term"
         return "Sold Term", seg, "N"
+    if fin.startswith("CPP JV"):
+        return "Active Term", "CPP JV", "Y"
+    # Legacy deals must win before securitized (some are financed "CAFL 2026-R1").
+    if deal_in_lookup(deal_number, template_maps.get("legacy_term_deals", set())):
+        return "Active Term", "Legacy", "N"
     if re.match(r"^\d{4}[-A-Za-z0-9]+$", fin):
         return "Securitized Term", "Securitized Term", "N"
     return "Active Term", "Mortgage Banking", "N"
