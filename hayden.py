@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V22_UPDATED_FINALIZED_HEADER_FONT"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_10_V24_STATEBRIDGE_DAY10_FCI_SUSPENSE_NPL"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2461,7 +2461,14 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
             # Appraised_Value_Amount__c / Appraised_After_Repair_Value__c / effective date.
             # The Property__c roll-up (Current Appraised*) is NOT a valid source and must
             # not survive: if the asset has no delivered appraisal, the report blanks these.
+            # Most Recent Appraisal Order Date is ALSO strict-from-bundle: the official report
+            # sources it from the per-appraisal Order_Received_Date__c (MAX across appraisals)
+            # and shows N/A when the asset has no appraisal order date. Verified against
+            # 20260608_Active_Loans: 2,034 assets with a value all have an SF appraisal Order
+            # Date; all 2,656 N/A assets have none. The Property-level BPO_Appraisal_Order_Date__c
+            # must NOT be used as a fallback -- doing so over-populated the column (~4,260 vs 2,034).
             strict_from_bundle = {
+                "Most Recent Appraisal Order Date",
                 "Current Appraisal Date",
                 "Current Appraised As-Is Value",
                 "Current Appraised After Repair Value",
@@ -2473,13 +2480,12 @@ def _build_valuation_like(asset_ids=None) -> pd.DataFrame:
                         # bundle value only -- do NOT fall back to property roll-up
                         df[c] = df[app_col]
                     else:
-                        # Most Recent Order Date may still use whatever is present
                         df[c] = coalesce_keep_nonblank(df[app_col], df.get(c, pd.Series([pd.NA] * len(df), index=df.index)))
                     df = df.drop(columns=[app_col], errors="ignore")
         else:
-            # No appraisal bundle at all for this batch -> blank the Updated triple so the
-            # Property roll-up never leaks into Updated valuation columns.
-            for c in ["Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
+            # No appraisal bundle at all for this batch -> blank the Updated triple AND the
+            # order date so the Property roll-up never leaks into these columns.
+            for c in ["Most Recent Appraisal Order Date", "Current Appraisal Date", "Current Appraised As-Is Value", "Current Appraised After Repair Value"]:
                 df[c] = pd.NA
 
     df["_asset_key"] = norm_id_series(df.get("Asset ID", pd.Series([None] * len(df), index=df.index)))
@@ -3335,8 +3341,29 @@ def _drop_term_deal_keys(df: pd.DataFrame, drop_keys: Set[str]) -> pd.DataFrame:
     return out.loc[~out["_deal_key"].astype("string").isin(drop_keys)].copy()
 
 
-def _bridge_pick_next_payment_date(sf_dates: pd.Series, servicer_dates: pd.Series, prior_dates: Optional[pd.Series] = None) -> pd.Series:
-    """Bridge NPD is servicer-first except for day-1 servicer vs day-10 SF/prior dates."""
+def _force_statebridge_day10(dates: pd.Series, servicer: pd.Series) -> pd.Series:
+    """Statebridge-serviced loans always bill on the 10th of the month in the official
+    report (verified 3280/3280 Bridge Asset + 135/135 Bridge Loan, zero exceptions). The
+    Statebridge tape itself is mostly day-10 but leaks some day-1/day-8 dates; the report
+    normalizes ALL Statebridge NPDs to the 10th. Force day=10 while preserving month/year."""
+    d = pd.to_datetime(pd.Series(dates, copy=False), errors="coerce")
+    serv = pd.Series(servicer, index=d.index, copy=False).astype(str).str.casefold()
+    is_sb = serv.str.contains("statebridge", na=False) & d.notna()
+    if is_sb.any():
+        forced = d[is_sb].apply(lambda ts: ts.replace(day=10) if pd.notna(ts) else ts)
+        d.loc[is_sb] = forced
+    return d
+
+
+def _bridge_pick_next_payment_date(
+    sf_dates: pd.Series,
+    servicer_dates: pd.Series,
+    prior_dates: Optional[pd.Series] = None,
+    servicer_names: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Bridge NPD is servicer-first. Statebridge is normalized to the 10th of the month
+    (deterministic servicer rule). For other servicers, keep the day-1/day-10 SF/prior
+    fallback as a safety net where servicer identity is unknown."""
     sf = pd.to_datetime(pd.Series(sf_dates, copy=False), errors="coerce")
     serv = pd.to_datetime(pd.Series(servicer_dates, index=sf.index, copy=False), errors="coerce")
     prior = pd.to_datetime(pd.Series(prior_dates, index=sf.index, copy=False), errors="coerce") if prior_dates is not None else pd.Series([pd.NaT] * len(sf), index=sf.index)
@@ -3346,7 +3373,11 @@ def _bridge_pick_next_payment_date(sf_dates: pd.Series, servicer_dates: pd.Serie
         out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
         same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
         out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
-    return pd.to_datetime(out, errors="coerce")
+    out = pd.to_datetime(out, errors="coerce")
+    if servicer_names is not None:
+        # Deterministic Statebridge rule wins over everything above.
+        out = _force_statebridge_day10(out, servicer_names)
+    return out
 
 
 def _normalize_report_comment_text(value):
@@ -3838,7 +3869,7 @@ def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
                 "servicer_family": "fci",
                 "servicer_id": _series_to_id(df, ["Account", "Loan Number", "Loan No"]),
                 "upb": _series_to_num(df, ["Current Balance", "Current UPB", "UPB", "Principal Balance"]),
-                "suspense": _series_to_num(df, ["Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"]),
+                "suspense": _series_to_num(df, ["Reserve Balance", "Suspense Pmt.", "Suspense Payment", "Suspense Balance", "Unapplied Balance"]),
                 "next_payment_date": _series_to_dt(df, ["Due Date", "Next Due Date", "Next Payment Date"]),
                 "maturity_date": _series_to_dt(df, ["Maturity Date", "Current Maturity Date"]),
                 "status": _series_to_text(df, ["Status", "Loan Status"]),
@@ -5175,10 +5206,17 @@ def build_bridge_asset(
         for tcol in BRIDGE_ASSET_FROM_VALUATION.keys():
             tmpcol = f"__val__{tcol}"
             if tmpcol in out.columns:
-                out[tcol] = coalesce_keep_nonblank(
-                    out.get(tcol, pd.Series([pd.NA] * len(out), index=out.index)),
-                    out[tmpcol],
-                )
+                if tcol == "Most Recent Appraisal Order Date":
+                    # The valuation path computes this strictly from the per-appraisal
+                    # Order_Received_Date__c (MAX, N/A when none) -- the authoritative source
+                    # that matches the official report. It must OVERWRITE the spine's
+                    # Property-level BPO_Appraisal_Order_Date__c, which over-populates the column.
+                    out[tcol] = out[tmpcol]
+                else:
+                    out[tcol] = coalesce_keep_nonblank(
+                        out.get(tcol, pd.Series([pd.NA] * len(out), index=out.index)),
+                        out[tmpcol],
+                    )
                 out = out.drop(columns=[tmpcol], errors="ignore")
 
     if not sf_foreclosure.empty and "Asset ID" in sf_foreclosure.columns:
@@ -5400,7 +5438,8 @@ def build_bridge_asset(
         if "Next Payment Date" in prev_npd.columns and "_asset_key" in prev_npd.columns:
             prior_map = prev_npd.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key").set_index("_asset_key")["Next Payment Date"]
             prior_npd = out["_asset_key"].map(prior_map)
-    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd)
+    _ba_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
+    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer)
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
@@ -5415,7 +5454,11 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company", "Tax Commentary",
-            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            # NOTE: "Most Recent Appraisal Order Date" is deliberately excluded here. It is a live
+            # value (MAX per-appraisal Order_Received_Date__c, N/A when none) and is authoritative
+            # even when blank. Creating a _prev for it would let coalesce_keep_nonblank resurrect a
+            # stale prior value on assets that correctly compute to N/A (the over-population bug).
+            "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
@@ -5425,7 +5468,10 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
             "Maturity Status", "Title Company", "Tax Commentary",
-            "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
+            # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
+            # validated 100% against the current SF extract, so the fresh value must win.
             # Origination valuation is a FROZEN snapshot captured at loan origination -- it is
             # carried forward, NOT recomputed from live Salesforce each week. Verified against
             # the official report: e.g. asset 819585 shows the origination As-Is from the prior
@@ -6431,7 +6477,8 @@ def build_bridge_loan(
         prev_bl = prev_maps["bridge_loan_manual"]
         if "Next Payment Date" in prev_bl.columns and "_deal_key" in prev_bl.columns:
             prior_bridge_loan_npd = out["_deal_key"].map(prev_bl.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key").set_index("_deal_key")["Next Payment Date"])
-    out["Next Payment Date"] = _bridge_pick_next_payment_date(cur_bridge_loan_npd, serv_bridge_loan_npd, prior_bridge_loan_npd)
+    _bl_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
+    out["Next Payment Date"] = _bridge_pick_next_payment_date(cur_bridge_loan_npd, serv_bridge_loan_npd, prior_bridge_loan_npd, servicer_names=_bl_servicer)
     out["Next Advance Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
 
@@ -7268,11 +7315,22 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
         _report_numeric_series_from_col(out, "Origination ARV"),
     )
 
-    if qend_npl_header not in out.columns:
-        if "3/31 NPL (Y/N)" in out.columns:
-            out[qend_npl_header] = out["3/31 NPL (Y/N)"]
-        else:
-            out[qend_npl_header] = "N"
+    # Quarter-end NPL Y/N: matches the official live formula
+    #   =IF(AND($D<>"Sold", MINIFS(NextPaymentDate, DealNumber, thisDeal) < ($DE$3-90)),"Y","N")
+    # i.e. Y when the loan is not Sold and the deal's MINIMUM Next Payment Date is more than
+    # 90 days before quarter-end (90+ days delinquent as of quarter-end). Computed here so the
+    # materialized value tracks the corrected Next Payment Date (incl. the Statebridge day-10
+    # rule) rather than inheriting the stale upstream "3/31 NPL (Y/N)" column.
+    # Verified 4690/4690 (577 Y) against 20260608_Active_Loans Bridge Asset.
+    _npl_threshold = pd.Timestamp(q_end) - pd.Timedelta(days=90)
+    _npl_npd = _report_date_series_from_col(out, "Next Payment Date")
+    _npl_deal = _report_text_series_from_col(out, "Deal Number")
+    _npl_fin = _report_text_series_from_col(out, "Financing")
+    _min_npd_by_deal = _npl_npd.groupby(_npl_deal).transform("min")
+    out[qend_npl_header] = _report_yn(
+        _npl_fin.str.casefold().ne("sold") & _min_npd_by_deal.notna() & _min_npd_by_deal.lt(_npl_threshold),
+        idx,
+    )
     npl_flag = _report_text_series_from_col(out, qend_npl_header).str.upper().eq("Y")
     stale_threshold = pd.Timestamp(q_end) - pd.DateOffset(months=6)
     most_recent_val = pd.to_datetime(out["Most Recent Valuation Date"], errors="coerce")
