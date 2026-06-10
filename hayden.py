@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V21_TERM_ASSET_FREEZE_HEIGHT"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_09_V22_UPDATED_FINALIZED_HEADER_FONT"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2341,24 +2341,21 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
             .groupby("_asset_key")["_ord"].max()
         )
 
-    # The official report GATES the Updated valuation triple on the asset's LATEST
-    # appraisal (by effective date, across all statuses) being Complete-Delivered.
-    # If the newest appraisal is Reviewed / Revision Required / Cancelled / etc.,
-    # the report BLANKS the Updated values -- even if an older delivered one exists.
+    # "Updated" = the latest FINALIZED post-origination appraisal by effective date.
+    # Finalized = Complete-Delivered OR Complete. We intentionally do NOT require the
+    # asset's newest appraisal overall to be Complete-Delivered (the old gate): the
+    # official report only honored Complete-Delivered and therefore showed STALE values
+    # when a newer Complete (but not-yet-delivered) appraisal existed -- e.g. asset
+    # 819585 had a 2026-04-30 'Complete' appraisal the official ignored in favor of an
+    # older 2025-12-26 delivered one. We treat the most recent finalized appraisal as
+    # the true Updated value. In-flight / rejected statuses (Reviewed, Revision Required,
+    # Under Review, Ordered, Cancelled, etc.) are NOT finalized and do not count.
+    _FINALIZED_STATUSES = {"complete-delivered", "complete"}
     if "Appraisal Status" in cand.columns:
         _status = cand["Appraisal Status"].astype("string").str.strip()
-        _eff_all = _to_datetime_series_mixed(cand.get("Current Appraisal Date", pd.Series([pd.NaT] * len(cand), index=cand.index)))
-        _gate = pd.DataFrame({"_asset_key": cand["_asset_key"], "_eff": _eff_all, "_st": _status.str.casefold()})
-        _gate = _gate.dropna(subset=["_asset_key", "_eff"])
-        if not _gate.empty:
-            _latest = _gate.sort_values(["_asset_key", "_eff"]).drop_duplicates("_asset_key", keep="last")
-            _delivered_assets = set(_latest.loc[_latest["_st"] == "complete-delivered", "_asset_key"])
-        else:
-            _delivered_assets = set()
-        # keep only Complete-Delivered rows for assets that pass the gate
-        cand = cand[(_status.str.casefold() == "complete-delivered") & cand["_asset_key"].isin(_delivered_assets)].copy()
+        cand = cand[_status.str.casefold().isin(_FINALIZED_STATUSES)].copy()
     if cand.empty:
-        # still surface Most Recent Order Date even when no delivered appraisal exists
+        # still surface Most Recent Order Date even when no finalized appraisal exists
         if _max_order_by_asset is not None and len(_max_order_by_asset):
             mo = _max_order_by_asset.reset_index()
             mo.columns = ["_asset_key", "Most Recent Appraisal Order Date"]
@@ -2381,12 +2378,10 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
     if _max_order_by_asset is not None and len(_max_order_by_asset):
         cand["Most Recent Appraisal Order Date"] = cand["_asset_key"].map(_max_order_by_asset)
 
-    # If the SELECTED Complete-Delivered appraisal carries no usable As-Is value
-    # (As-Is blank or 0 after the zero-aware coalesce), the official report blanks the
-    # ENTIRE Updated triple -- including the Updated Valuation Date -- not just the value.
-    # Verified e.g. asset 1473628: newest delivered appraisal has Appraised_Value_Amount
-    # = blank and Reviewed = 0, and the report shows Updated Date = N/A. Without this, we
-    # emit the effective date with no value next to it.
+    # If the SELECTED finalized appraisal carries no usable As-Is value (As-Is blank or
+    # 0 after the zero-aware coalesce), blank the ENTIRE Updated triple -- including the
+    # Updated Valuation Date -- not just the value, so we never emit a date with no value
+    # next to it.
     if "Current Appraised As-Is Value" in cand.columns:
         _no_asis = blankish_mask(cand["Current Appraised As-Is Value"]) | (
             pd.to_numeric(cand["Current Appraised As-Is Value"], errors="coerce").fillna(0) == 0
@@ -6724,17 +6719,23 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
             col_idx = _scaffold_col_index(col_idx)
             _set_scaffold_cell(ws, 5, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
 
-        # Deterministically (re)apply the blue header fill to row 5 on exactly the
-        # titled header columns. The official report styles every header cell with a
-        # solid theme-3 fill; blank spacer columns (those not in the blueprint, e.g.
-        # Term Asset col 21) stay unfilled. Doing this explicitly -- rather than relying
-        # on the input template/prior-report styling surviving -- guarantees Term Asset
-        # gets the same blue header band as Bridge Asset / Bridge Loan / Term Loan,
-        # instead of ending up with an unstyled header row.
+        # Deterministically (re)apply the blue header fill AND the white bold header
+        # font to row 5 on exactly the titled header columns. The official report styles
+        # every header cell with a solid theme-3 fill and bold theme-0 (white) text;
+        # blank spacer columns (those not in the blueprint, e.g. Term Asset col 21) stay
+        # unstyled. Doing this explicitly -- rather than relying on the input template/
+        # prior-report styling surviving -- guarantees Term Asset gets the same blue
+        # header band with readable white text as the other sheets (test builds were
+        # leaving Term Asset's header text non-bold black on blue, hard to read).
         _header_fill = PatternFill(fill_type="solid", fgColor=Color(theme=3, tint=0.0))
+        _header_font = Font(name="Aptos Narrow", size=11, bold=True, color=Color(theme=0, tint=0.0))
+        _header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for _hdr_col in blueprint.get("row5", {}):
             _hc = _scaffold_col_index(_hdr_col)
-            ws.cell(HEADER_ROW, _hc).fill = _header_fill
+            _hcell = ws.cell(HEADER_ROW, _hc)
+            _hcell.fill = _header_fill
+            _hcell.font = _header_font
+            _hcell.alignment = _header_align
 
         # Deterministically fix the freeze pane and row heights. The official report
         # freezes BELOW the header row (A6 with headers in row 5) and gives the header
