@@ -6789,6 +6789,21 @@ def refresh_summary_labels(wb, run_dt: date, upb_header: str):
                 cell.value = new_txt
 
 
+def _pin_today_formulas_to_run_date(wb, run_dt: date) -> None:
+    """Replace volatile TODAY()/NOW() in any worksheet formula with the servicer
+    import (run) date. Days Past Due / Days to Maturity anchor on the run-date cell,
+    so leaving a live TODAY() would recompute them against whatever day the workbook
+    is opened instead of the servicer tape / UPB date."""
+    date_literal = f"DATE({run_dt.year},{run_dt.month},{run_dt.day})"
+    pat = re.compile(r"\b(?:TODAY|NOW)\s*\(\s*\)", re.I)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and v.startswith("=") and pat.search(v):
+                    cell.value = pat.sub(date_literal, v)
+
+
 def restore_template_scaffold(wb, run_dt: date, upb_header: str):
     q_end = quarter_end_for_run(run_dt)
 
@@ -6873,6 +6888,9 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         ws.row_dimensions[HEADER_ROW].height = 45.0       # row 5 tall header
 
     refresh_summary_labels(wb, run_dt, upb_header)
+    # Pin volatile TODAY()/NOW() to the servicer import (run) date so Days Past Due /
+    # Days to Maturity compute against the UPB tape date, not the live open date.
+    _pin_today_formulas_to_run_date(wb, run_dt)
 
 
 def _parse_direct_ref_formula(formula_text: str):
