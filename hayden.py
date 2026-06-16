@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_10_V24_STATEBRIDGE_DAY10_FCI_SUSPENSE_NPL"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_15_V25_ONITY_RENO_HOLDBACK"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -1031,6 +1031,8 @@ def normalize_servicer_family(val) -> str:
         return ""
     if "berkadia" in s:
         return "berkadia"
+    if "onity" in s:
+        return "onity"
     if "midland" in s:
         return "midland"
     if "statebridge" in s:
@@ -2969,6 +2971,8 @@ def detect_servicer_type(filename: str) -> str:
     n = filename.lower()
     if "shellpoint" in n:
         return "Shellpoint"
+    if "onity" in n or "rs_corevest" in n or "corevest_daily" in n or "daily_report" in n:
+        return "Onity"
     if "corevest_data_tape" in n:
         return "CoreVest_Data_Tape"
     if "corevestloandata" in n:
@@ -3013,7 +3017,7 @@ def _servicer_specificity_rank(val) -> int:
         return 5
     if "shellpoint" in s:
         return 4
-    if any(x in s for x in ["statebridge", "berkadia", "midland", "selene", "sps", "fay", "cornerstone"]):
+    if any(x in s for x in ["statebridge", "berkadia", "midland", "selene", "sps", "fay", "cornerstone", "onity"]):
         return 3
     if "fci" in s or "chl" in s:
         return 2
@@ -3749,6 +3753,29 @@ def _as_of_for_df(df: pd.DataFrame, filename: str, aliases: Sequence[str]) -> da
 
 def parse_servicer_bytes(filename: str, b: bytes) -> pd.DataFrame:
     servicer_type = detect_servicer_type(filename)
+
+    if servicer_type == "Onity":
+        df, _sheet, _hdr, _score = _best_header_read_excel(
+            b,
+            [["LOAN_NUMBER", "Loan Number", "Servicer Loan Number"],
+             ["FIRST_PRINCIPAL_BALANCE", "ACQUIRED_PRINCIPAL_BALANCE", "ORIGINAL_PRINCIPAL_BALANCE", "Current UPB", "UPB"]],
+            preferred_sheets=["daily_data", "daily", "report"],
+        )
+        out = pd.DataFrame(
+            {
+                "source_file": filename,
+                "servicer": "Onity",
+                "servicer_family": "onity",
+                "servicer_id": _series_to_id(df, ["LOAN_NUMBER", "Loan Number", "Servicer Loan Number"]),
+                "upb": _series_to_num(df, ["FIRST_PRINCIPAL_BALANCE", "ACQUIRED_PRINCIPAL_BALANCE", "ORIGINAL_PRINCIPAL_BALANCE", "Current UPB", "UPB"]),
+                "suspense": _series_to_num(df, ["SUSPENSE_BALANCE", "Suspense Balance", "Suspense"]),
+                "next_payment_date": _series_to_dt(df, ["NEXT_PAYMENT_DUE_DATE", "Next Payment Date", "Next Due Date"]),
+                "maturity_date": _series_to_dt(df, ["LOAN_MATURES_DATE", "LINE_MATURITY_DATE", "NEW_LINE_MATURITY_DATE", "Maturity Date"]),
+                "status": _series_to_text(df, ["LOAN_STATUS", "Status", "Loan Status"]),
+                "as_of": pd.to_datetime(_as_of_for_df(df, filename, ["REPORT_DATE", "Report Date", "As Of Date", "Run Date"])),
+            }
+        )
+        return downcast_numeric_frame(out.dropna(subset=["servicer_id"]))
 
     if servicer_type == "Shellpoint":
         df, _hdr, _score = _best_header_read_csv(
@@ -4553,10 +4580,12 @@ def _recompute_bridge_asset_funded_amount(df: pd.DataFrame) -> pd.DataFrame:
     if {"Renovation Holdback", "Renovation Holdback Funded", "Renovation Holdback Remaining"}.issubset(out.columns):
         reno_total = _numeric_series(out, "Renovation Holdback")
         reno_funded = _numeric_series(out, "Renovation Holdback Funded")
-        interest_alloc = _numeric_series(out, "Interest Allocation")
-        # Official report behavior: remaining renovation availability includes Interest Allocation.
-        calc_remaining = reno_total.fillna(0.0) - reno_funded.fillna(0.0) + interest_alloc.fillna(0.0)
-        has_calc = reno_total.notna() | reno_funded.notna() | interest_alloc.notna()
+        # Verified against 20260615_Active_Loans (433/433 Bridge Asset, 212/213 Bridge
+        # Loan): the report's remaining = Approved Renovation Advance Amount minus
+        # Renovation Advance Amount Funded. It does NOT add Interest Allocation -- that
+        # extra term diverged from the official report on 430 rows.
+        calc_remaining = reno_total.fillna(0.0) - reno_funded.fillna(0.0)
+        has_calc = reno_total.notna() | reno_funded.notna()
         out["Renovation Holdback Remaining"] = pd.to_numeric(out["Renovation Holdback Remaining"], errors="coerce").where(
             ~has_calc,
             calc_remaining,
