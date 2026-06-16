@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V35_BL_UNITS_NO_OPP_FALLBACK"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V36_APPRAISAL_ORDER_DT_FLOOR_MIN"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -998,6 +998,14 @@ def _to_pacific_naive_series(s: pd.Series) -> pd.Series:
             parsed = parsed.dt.tz_localize(None)
         except Exception:
             parsed = _to_datetime_series_mixed(base)
+    parsed = pd.to_datetime(parsed, errors="coerce")
+    # The official report stores the appraisal order timestamp truncated to the minute
+    # (seconds = 00), e.g. 2026-02-08 17:04:00. The Salesforce value carries seconds
+    # (17:04:41); floor to the minute so it matches exactly.
+    try:
+        parsed = parsed.dt.floor("min")
+    except Exception:
+        pass
     return pd.to_datetime(parsed, errors="coerce")
 
 
