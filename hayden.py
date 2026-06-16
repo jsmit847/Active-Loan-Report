@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V29_TL_LOAN_SOLD_DATE_COLUMN"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V35_BL_UNITS_NO_OPP_FALLBACK"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -216,7 +216,10 @@ SHEET_DATE_HEADERS = {
 }
 
 SHEET_DATETIME_HEADERS = {
-    "Bridge Asset": set(),
+    # The official report keeps the appraisal Order Received timestamp as a full
+    # Pacific-local datetime (date + HH:MM:SS), not a date-only value. Preserve the
+    # time so it matches exactly instead of being truncated to midnight.
+    "Bridge Asset": {"Most Recent Appraisal Order Date"},
 }
 
 REPORT_IDENTIFIER_HEADERS = {
@@ -962,6 +965,42 @@ def _to_datetime_series_mixed(s: pd.Series) -> pd.Series:
     return pd.to_datetime(parsed, errors="coerce")
 
 
+def _to_pacific_naive_series(s: pd.Series) -> pd.Series:
+    """Parse to UTC then convert to America/Los_Angeles and drop tz, KEEPING the time.
+
+    The Salesforce Bulk API returns datetimes in UTC (e.g. 2026-02-09T01:04:00Z),
+    but the manual/official Active Loan Report renders them in the org's Pacific
+    locale (2026-02-08 17:04:00) -- both the date boundary AND the time-of-day differ
+    from a naive UTC read. This is used for the appraisal Order Received timestamp so
+    "Most Recent Appraisal Order Date" reproduces the official report exactly. (Verified
+    offset: -8 in February, -7 in April -> America/Los_Angeles with DST.)
+    """
+    base = pd.Series(list(pd.Series(s, copy=False)), index=pd.Series(s, copy=False).index, dtype="object")
+    if base.empty:
+        return pd.Series([], index=base.index, dtype="datetime64[ns]")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        warnings.simplefilter("ignore", FutureWarning)
+        try:
+            parsed = pd.to_datetime(base, errors="coerce", format="mixed", utc=True)
+        except TypeError:
+            parsed = pd.to_datetime(base, errors="coerce", utc=True)
+        except Exception:
+            parsed = pd.to_datetime(base, errors="coerce", utc=True)
+    if not isinstance(parsed, pd.Series):
+        parsed = pd.Series(parsed, index=base.index)
+    else:
+        parsed = parsed.reindex(base.index)
+    try:
+        parsed = parsed.dt.tz_convert("America/Los_Angeles").dt.tz_localize(None)
+    except Exception:
+        try:
+            parsed = parsed.dt.tz_localize(None)
+        except Exception:
+            parsed = _to_datetime_series_mixed(base)
+    return pd.to_datetime(parsed, errors="coerce")
+
+
 def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1381,6 +1420,10 @@ def _bulk_query_results_pages(job_id: str, max_records: int = BULK_PAGE_SIZE):
             expect_json=False,
             timeout=300,
         )
+        # Salesforce Bulk API returns UTF-8 CSV, but if the response Content-Type omits
+        # a charset, requests defaults to ISO-8859-1 and mangles non-ASCII text (e.g.
+        # a U+2019 apostrophe in a borrower entity name becomes "â€™"). Force UTF-8.
+        resp.encoding = "utf-8"
         yield resp.text
         locator = resp.headers.get("Sforce-Locator") or resp.headers.get("sforce-locator")
         if not locator or locator.lower() == "null":
@@ -1978,6 +2021,16 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         select_pairs.append(("Generic Value Date", generic_value_date_field))
     if generic_value_field and generic_value_field != "Appraised_Value_Amount__c":
         select_pairs.append(("Generic Value", generic_value_field))
+    # Per-property suspense balance (Property__c level). The completed report shows
+    # suspense per asset, not the deal-level Opportunity suspense spread once per deal.
+    # Looked up defensively so a missing field cannot break the (large) spine SOQL.
+    prop_suspense_field = first_existing_field_name("Property__c", ["Suspense_Balance__c", "Suspense__c", "Suspense_Amount__c"])
+    if prop_suspense_field:
+        select_pairs.append(("Property Suspense Balance", prop_suspense_field))
+    # First Payment Date (Opportunity) — drives the FCI day-1 -> first-payment-day NPD rule.
+    fpd_field = first_existing_field_name("Opportunity", ["First_Payment_Date__c", "First_Payment_Due_Date__c"])
+    if fpd_field:
+        select_pairs.append(("First Payment Date", f"{opp_rel}.{fpd_field}"))
 
     rename_map = {expr: label for label, expr in select_pairs}
 
@@ -2340,9 +2393,11 @@ def _select_best_current_appraisal_bundle(property_df: pd.DataFrame, appraisal_d
     # "Most Recent Appraisal Order Date" = MAX order date across ALL appraisals for the
     # asset (validated ~88% vs official). Compute it BEFORE the Complete-Delivered filter
     # so cancelled/in-progress orders still count, then attach back per asset.
+    # Localize to Pacific (org locale) and KEEP the time component so the value matches
+    # the official report's datetime (e.g. 2026-02-08 17:04:00), not a naive-UTC date.
     _max_order_by_asset = None
     if "Most Recent Appraisal Order Date" in cand.columns:
-        _ord_all = _to_datetime_series_mixed(cand["Most Recent Appraisal Order Date"])
+        _ord_all = _to_pacific_naive_series(cand["Most Recent Appraisal Order Date"])
         _max_order_by_asset = (
             pd.DataFrame({"_asset_key": cand["_asset_key"], "_ord": _ord_all})
             .dropna(subset=["_asset_key"])
@@ -2844,6 +2899,13 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     generic_value_date_field = first_existing_field_name("Property__c", ["Value_Date__c", "Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"])
     generic_value_field = first_existing_field_name("Property__c", ["Value__c", "Appraised_Value_Amount__c"])
     term_asset_date_field = first_existing_field_name("Property__c", ["Acquisition_Date__c", "Close_Date__c", "Purchase_Date__c"])
+    # Origination valuation fields direct from Property__c (same fields the Bridge spine uses).
+    # The completed Term Asset report sources Origination Value Date/Value/Type here; without
+    # them, brand-new Term-only deals not present in the carry-forward report come through blank
+    # (the 117-row Origination cluster). Looked up defensively so a missing field can't break SOQL.
+    orig_val_date_field = first_existing_field_name("Property__c", ["Origination_Date_Valuation_Date__c", "Origination_Valuation_Date__c"])
+    orig_val_field = first_existing_field_name("Property__c", ["Origination_Date_Value__c", "Origination_As_Is_Value__c"])
+    orig_val_type_field = first_existing_field_name("Property__c", ["Origination_Date_Valuation_Type__c", "Origination_Valuation_Type__c", "Origination_Value_Type__c"])
 
     select_pairs = [
         ("Deal Loan Number", f"{opp_rel}.Deal_Loan_Number__c"),
@@ -2867,6 +2929,12 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
         ("Property Created Date", "CreatedDate"),
         ("Property Last Modified Date", "LastModifiedDate"),
     ]
+    if orig_val_date_field:
+        select_pairs.append(("Origination Value Date", orig_val_date_field))
+    if orig_val_field:
+        select_pairs.append(("Origination Value", orig_val_field))
+    if orig_val_type_field:
+        select_pairs.append(("Origination Value Type", orig_val_type_field))
     if term_asset_date_field:
         select_pairs.append(("Date", term_asset_date_field))
     if generic_value_date_field and generic_value_date_field not in {"Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"}:
@@ -3369,15 +3437,42 @@ def _force_statebridge_day10(dates: pd.Series, servicer: pd.Series) -> pd.Series
     return d
 
 
+def _force_fci_day1_to_first_payment(dates: pd.Series, servicer: pd.Series, fpd_dates: pd.Series) -> pd.Series:
+    """FCI (exactly "FCI", not the 2012632 / v1805530 / CHL sub-flavors) reports a
+    day-1 next-payment date in its servicer file; the official report instead uses the
+    loan's First Payment Date day-of-month. Verified rule: when servicer == "FCI" and the
+    chosen NPD lands on day 1 and a First Payment Date exists, move the day to the FPD's
+    day-of-month (clamped to the month length). Additive -- only touches FCI day-1 rows."""
+    d = pd.to_datetime(pd.Series(dates, copy=False), errors="coerce")
+    fpd = pd.to_datetime(pd.Series(fpd_dates, index=d.index, copy=False), errors="coerce")
+    serv = pd.Series(servicer, index=d.index, copy=False).astype(str).str.strip().str.casefold()
+    mask = serv.eq("fci") & d.notna() & d.dt.day.eq(1) & fpd.notna()
+    if not bool(mask.any()):
+        return d
+    fixed = []
+    for ts, fp, m in zip(d, fpd, mask):
+        if m:
+            last_day = calendar.monthrange(ts.year, ts.month)[1]
+            fixed.append(ts.replace(day=min(int(fp.day), last_day)))
+        else:
+            fixed.append(ts)
+    return pd.to_datetime(pd.Series(fixed, index=d.index), errors="coerce")
+
+
 def _bridge_pick_next_payment_date(
     sf_dates: pd.Series,
     servicer_dates: pd.Series,
     prior_dates: Optional[pd.Series] = None,
     servicer_names: Optional[pd.Series] = None,
+    fpd_dates: Optional[pd.Series] = None,
 ) -> pd.Series:
     """Bridge NPD is servicer-first. Statebridge is normalized to the 10th of the month
     (deterministic servicer rule). For other servicers, keep the day-1/day-10 SF/prior
     fallback as a safety net where servicer identity is unknown.
+
+    Additive corrections layered on top (do NOT change the servicer-first base):
+      - FCI day-1 -> First Payment Date day-of-month (see _force_fci_day1_to_first_payment).
+      - Statebridge -> always day 10 (see _force_statebridge_day10).
 
     NOTE: an SF-first experiment (V26) regressed Bridge Asset NPD from 814 to 2400
     mismatches in the live build -- the API/spine Next_Payment_Date__c is NOT the same as
@@ -3393,6 +3488,8 @@ def _bridge_pick_next_payment_date(
         same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
         out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
     out = pd.to_datetime(out, errors="coerce")
+    if servicer_names is not None and fpd_dates is not None:
+        out = _force_fci_day1_to_first_payment(out, servicer_names, fpd_dates)
     if servicer_names is not None:
         # Deterministic Statebridge rule wins over everything above.
         out = _force_statebridge_day10(out, servicer_names)
@@ -5184,7 +5281,7 @@ def build_bridge_asset(
     for col, label in BRIDGE_ASSET_FROM_BRIDGE_SPINE.items():
         out[col] = sf_spine[label] if label in sf_spine.columns else pd.NA
 
-    for extra in ["Loan Commitment", "Remaining Commitment", "Current UPB", "Current Servicer UPB", "Salesforce Suspense Balance", "Comments AM"]:
+    for extra in ["Loan Commitment", "Remaining Commitment", "Current UPB", "Current Servicer UPB", "Salesforce Suspense Balance", "Property Suspense Balance", "Comments AM"]:
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
@@ -5356,6 +5453,10 @@ def build_bridge_asset(
     prop_npd = pd.to_datetime(sf_spine.get("Property Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     opp_npd = pd.to_datetime(sf_spine.get("Opportunity Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     sf_next_payment = prop_npd.where(prop_npd.notna(), opp_npd)
+    # First Payment Date for the FCI day-1 NPD correction. Computed here (same index
+    # basis as sf_next_payment) so it flows through _bridge_pick_next_payment_date with
+    # identical alignment.
+    sf_first_payment = pd.to_datetime(sf_spine.get("First Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     sf_current_upb = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
@@ -5465,12 +5566,15 @@ def build_bridge_asset(
     # multi-asset loans. If there is no servicer-file suspense, fall back to the
     # Salesforce deal-level suspense one time on the first report row for the deal.
     sf_suspense = pd.to_numeric(out.get("Salesforce Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    prop_suspense = pd.to_numeric(out.get("Property Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     serv_suspense = pd.to_numeric(out.get("_loan_suspense", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     out["_row_in_deal"] = out.groupby("_deal_key", dropna=True).cumcount()
-    # Servicer suspense is asset-level -> keep per asset. SF suspense is loan-level
-    # -> apply once per deal (first row only) as a fallback where no servicer value.
+    # Suspense is per-asset in the completed report. Prefer the servicer-file value
+    # (asset-level), then the Property__c per-asset suspense, then fall back to the
+    # deal-level Opportunity suspense applied once on the first row of the deal.
     sf_suspense_once = pd.Series(np.where(out["_row_in_deal"].eq(0), sf_suspense, np.nan), index=out.index)
-    out["Suspense Balance"] = serv_suspense.where(serv_suspense.notna(), sf_suspense_once)
+    out["Suspense Balance"] = serv_suspense.where(serv_suspense.notna(), prop_suspense)
+    out["Suspense Balance"] = out["Suspense Balance"].where(out["Suspense Balance"].notna(), sf_suspense_once)
     out["Suspense Balance"] = pd.to_numeric(out["Suspense Balance"], errors="coerce").fillna(0.0)
 
     # Bridge NPD is servicer-first, except for the recurring day-1/day-10 issue
@@ -5484,7 +5588,7 @@ def build_bridge_asset(
             prior_map = prev_npd.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key").set_index("_asset_key")["Next Payment Date"]
             prior_npd = out["_asset_key"].map(prior_map)
     _ba_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
-    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer)
+    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer, fpd_dates=sf_first_payment)
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
@@ -6474,13 +6578,16 @@ def build_bridge_loan(
         pd.to_numeric(out["Number of Assets"], errors="coerce").notna(),
         pd.to_numeric(out.get("Number of Assets SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
     )
+    # # of Units = sum of the per-asset Property Number_of_Units__c only (asset rollup,
+    # then the property-rollup fallback which is the SAME field aggregated differently).
+    # Do NOT fall back to the Opportunity-level Total_Units__c ("# of Units SF"): for ~45
+    # deals the per-asset count is genuinely blank in Salesforce and the official report
+    # shows 0/N/A there, but Total_Units__c carries the building's structural unit count
+    # (e.g. 84) and was leaking in as a non-zero override. Blank stays blank -> 0 via the
+    # end-of-function fillna, matching the report (verified 1045/1045).
     out["# of Units"] = pd.to_numeric(out.get("# of Units_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
         pd.to_numeric(out.get("# of Units_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna(),
         pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
-    )
-    out["# of Units"] = pd.to_numeric(out["# of Units"], errors="coerce").where(
-        pd.to_numeric(out["# of Units"], errors="coerce").notna(),
-        pd.to_numeric(out.get("# of Units SF", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"),
     )
     out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)_active", blank_obj), out.get("State(s)", blank_obj))
     out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)", blank_obj), out.get("State(s) SF", blank_obj))
@@ -7741,8 +7848,23 @@ def write_df_to_sheet_preserve_formulas(
     write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
     headers = [h for _c, h in write_cols]
 
-    missing = {h: pd.NA for h in headers if h not in df.columns}
-    df_out = df.assign(**missing) if missing else df
+    # Resolve each output header against df columns, tolerating leading/trailing
+    # whitespace differences. header_tuples_from_ws() strips header text, but some
+    # materialized columns carry the report's exact header WITH a trailing space
+    # (e.g. "2Q26 Special Loans List "). Without this, the stripped header is treated
+    # as "missing" and the materialized value (special-loans Y/N etc.) is silently
+    # written as N/A instead of the computed result.
+    _strip_to_actual = {}
+    for _c in df.columns:
+        _strip_to_actual.setdefault(str(_c).strip(), _c)
+    df_out = pd.DataFrame(index=df.index)
+    for h in headers:
+        if h in df.columns:
+            df_out[h] = df[h].to_numpy()
+        elif str(h).strip() in _strip_to_actual:
+            df_out[h] = df[_strip_to_actual[str(h).strip()]].to_numpy()
+        else:
+            df_out[h] = pd.NA
     df_out = df_out[headers]
 
     for r_offset, row in enumerate(df_out.itertuples(index=False, name=None), start=0):
