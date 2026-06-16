@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V26_CARRYFWD_ORIG_VAL_TAXCMT_TODAY_PIN"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V29_TL_LOAN_SOLD_DATE_COLUMN"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -211,7 +211,7 @@ SHEET_DATE_HEADERS = {
         "Next Advance Maturity Date", "Next Payment Date", "Most Recent Valuation Date",
         "AM 1 Assigned Date", "AM 2 Assigned Date", "CM Assigned Date",
     },
-    "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date"},
+    "Term Loan": {"Origination Date", "Maturity Date", "Next Payment Date", "REO Date", "Loan Sold Date"},
     "Term Asset": {"Origination Date", "Origination Value Date", "Updated Value Date"},
 }
 
@@ -266,7 +266,7 @@ REPORT_NA_FILL_HEADERS = {
     "Term Loan": {
         "Servicer ID", "Servicer", "Borrower Entity", "Financing", "Loan Buyer", "REO Date",
         "Asset Manager", "Deal Intro Sub-Source", "Referral Source Account",
-        "Referral Source Contact", "AM Commentary",
+        "Referral Source Contact", "AM Commentary", "Loan Sold Date",
     },
     "Term Asset": {
         "Financing", "CBSA", "# Units", "Origination Value Date", "Origination Value",
@@ -406,6 +406,7 @@ TERM_LOAN_FROM_TERM_WIDE = {
     "Account Name": "Account Name",
     "Do Not Lend (Y/N)": "Do Not Lend",
     "Financing": "Current Funding Vehicle",
+    "Loan Sold Date": "Sold Loan: Sold Date",
     "Loan Amount": "Loan Amount",
     "Origination Date": "Close Date",
     "Originator": "CAF Originator",
@@ -469,16 +470,21 @@ DRAFT_FORMULA_OVERRIDES = {
         "Days Past Due": "=+$V$4-$U6",
     },
     "Term Loan": {
-        "Days Past Due": "=+$U$4-$S6",
-        "DQ Status": '=IF($T6<>"N/A","REO",IF(AND($U6>0,$U6<30),"DQ 1-29",IF(AND($U6>=30,$U6<60),"DQ 30-59",IF(AND($U6>=60,$U6<90),"DQ 60-89",IF($U6>=90,"DQ 90+","Current")))))',
-        "__SPECIAL_LIST__": '=IF(AND(OR($J6="Active Term",$J6="DSCR"),$S6<=$AE$4,$V6<>"REO"),"Q2 NPL",IF(AND(OR($J6="Active Term",$J6="DSCR"),$V6="REO"),"Term REO",IF(AND($J6="Securitized Term",$V6="REO"),"CAFL REO",IF(AND(OR($J6="Active Term",$J6="DSCR"),$U6>=45,$V6<>"REO"),"DQ 45+","N/A"))))',
-        "SFR Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AF$4)",
-        "MF Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AG$4)",
-        "Strategy Grouping": '=IF($AF6>$AG6,"Single Family Rental","Multifamily")',
+        # Column letters shift +1 from "Loan Sold Date" inserted at col 15 (O):
+        #   Next Payment Date S->T(20), REO Date->U(21), Days Past Due->V(22),
+        #   DQ Status->W(23), __RUN_DT__ U4->V4, __QEND__/threshold AE->AF(32),
+        #   SFR label AF->AG(33), MF label AG->AH(34).
+        "Days Past Due": "=+$V$4-$T6",
+        "DQ Status": '=IF($U6<>"N/A","REO",IF(AND($V6>0,$V6<30),"DQ 1-29",IF(AND($V6>=30,$V6<60),"DQ 30-59",IF(AND($V6>=60,$V6<90),"DQ 60-89",IF($V6>=90,"DQ 90+","Current")))))',
+        "__SPECIAL_LIST__": '=IF(AND(OR($J6="Active Term",$J6="DSCR"),$T6<=$AF$4,$W6<>"REO"),"Q2 NPL",IF(AND(OR($J6="Active Term",$J6="DSCR"),$W6="REO"),"Term REO",IF(AND($J6="Securitized Term",$W6="REO"),"CAFL REO",IF(AND(OR($J6="Active Term",$J6="DSCR"),$V6>=45,$W6<>"REO"),"DQ 45+","N/A"))))',
+        "SFR Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AG$4)",
+        "MF Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AH$4)",
+        "Strategy Grouping": '=IF($AG6>$AH6,"Single Family Rental","Multifamily")',
     },
     "Term Asset": {
-        "__UPB__": "=+(S6/SUMIFS(S:S,B:B,B6))*_xlfn.XLOOKUP(B6,'Term Loan'!B:B,'Term Loan'!P:P)",
-        "__SPECIAL_LIST__": "=_xlfn.XLOOKUP($B6,'Term Loan'!$B:$B,'Term Loan'!$AE:$AE)",
+        # Term Loan UPB shifted P(16)->Q(17); Term Loan special-list AE(31)->AF(32).
+        "__UPB__": "=+(S6/SUMIFS(S:S,B:B,B6))*_xlfn.XLOOKUP(B6,'Term Loan'!B:B,'Term Loan'!Q:Q)",
+        "__SPECIAL_LIST__": "=_xlfn.XLOOKUP($B6,'Term Loan'!$B:$B,'Term Loan'!$AF:$AF)",
     },
 }
 
@@ -556,24 +562,24 @@ SHEET_BLUEPRINTS = {
         "subtotal_col": 26,
     },
     "Term Loan": {
-        "row1": {21: "CALC", 22: "CALC", 31: "CALC"},
-        "row2": {2: "Term Loan Level Data", 31: "__QEND__"},
+        "row1": {22: "CALC", 23: "CALC", 32: "CALC"},
+        "row2": {2: "Term Loan Level Data", 32: "__QEND__"},
         "row3": {},
         "row4": {
-            16: "__SUBTOTAL__", 21: "__RUN_DT__", 31: "=+$AE$2-90",
-            32: "Single Family Rental", 33: "Multifamily",
+            17: "__SUBTOTAL__", 22: "__RUN_DT__", 32: "=+$AF$2-90",
+            33: "Single Family Rental", 34: "Multifamily",
         },
         "row5": {
             2: "Deal Number", 3: "Servicer ID", 4: "Servicer", 5: "SF Yardi ID", 6: "Deal Name",
             7: "Borrower Entity", 8: "Account Name", 9: "Do Not Lend (Y/N)", 10: "Portfolio",
-            11: "Segment", 12: "Financing", 13: "CPP JV", 14: "Loan Buyer", 15: "Loan Amount",
-            16: "__UPB__", 17: "Origination Date", 18: "Maturity Date", 19: "Next Payment Date",
-            20: "REO Date", 21: "Days Past Due", 22: "DQ Status", 23: "Asset Manager", 24: "Originator",
-            25: "Active RM", 26: "Deal Intro Sub-Source", 27: "Referral Source Account",
-            28: "Referral Source Contact", 29: "AM Commentary", 31: "__SPECIAL_LIST__",
-            32: "SFR Allocation", 33: "MF Allocation", 34: "Strategy Grouping",
+            11: "Segment", 12: "Financing", 13: "CPP JV", 14: "Loan Buyer", 15: "Loan Sold Date",
+            16: "Loan Amount", 17: "__UPB__", 18: "Origination Date", 19: "Maturity Date",
+            20: "Next Payment Date", 21: "REO Date", 22: "Days Past Due", 23: "DQ Status",
+            24: "Asset Manager", 25: "Originator", 26: "Active RM", 27: "Deal Intro Sub-Source",
+            28: "Referral Source Account", 29: "Referral Source Contact", 30: "AM Commentary",
+            32: "__SPECIAL_LIST__", 33: "SFR Allocation", 34: "MF Allocation", 35: "Strategy Grouping",
         },
-        "subtotal_col": 16,
+        "subtotal_col": 17,
     },
     "Term Asset": {
         "row1": {20: "CALC", 22: "CALC"},
@@ -3369,24 +3375,26 @@ def _bridge_pick_next_payment_date(
     prior_dates: Optional[pd.Series] = None,
     servicer_names: Optional[pd.Series] = None,
 ) -> pd.Series:
-    """Bridge NPD follows the Salesforce Next Payment Date (Property first, then
-    Opportunity). Verified against 20260615_Active_Loans: SF-first matches the completed
-    report 4331/4706 (92%) on Bridge Asset versus ~83% for the old servicer-first rule.
-    The servicer file fills only where Salesforce is blank; the prior completed workbook
-    fills last. Statebridge is then normalized to the 10th of the month (deterministic
-    servicer rule, verified 3367/3369), overriding the chosen source.
+    """Bridge NPD is servicer-first. Statebridge is normalized to the 10th of the month
+    (deterministic servicer rule). For other servicers, keep the day-1/day-10 SF/prior
+    fallback as a safety net where servicer identity is unknown.
 
-    The previous servicer-first + "preserve day-10 when servicer says day-1" heuristic
-    INVERTED the report (e.g. FCI/Onity: servicer tape is day-1, but the heuristic forced
-    day-10 while the report keeps the SF day-1) and is removed."""
+    NOTE: an SF-first experiment (V26) regressed Bridge Asset NPD from 814 to 2400
+    mismatches in the live build -- the API/spine Next_Payment_Date__c is NOT the same as
+    the SF_Bridge report export column an offline check matched against, so servicer-first
+    is restored as the known-better behavior."""
     sf = pd.to_datetime(pd.Series(sf_dates, copy=False), errors="coerce")
     serv = pd.to_datetime(pd.Series(servicer_dates, index=sf.index, copy=False), errors="coerce")
     prior = pd.to_datetime(pd.Series(prior_dates, index=sf.index, copy=False), errors="coerce") if prior_dates is not None else pd.Series([pd.NaT] * len(sf), index=sf.index)
-    out = sf.where(sf.notna(), serv)
-    out = out.where(out.notna(), prior)
+    out = serv.where(serv.notna(), sf)
+    if BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1:
+        same_month_sf = serv.notna() & sf.notna() & serv.dt.year.eq(sf.dt.year) & serv.dt.month.eq(sf.dt.month)
+        out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
+        same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
+        out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
     out = pd.to_datetime(out, errors="coerce")
     if servicer_names is not None:
-        # Deterministic Statebridge rule wins: Statebridge always bills the 10th.
+        # Deterministic Statebridge rule wins over everything above.
         out = _force_statebridge_day10(out, servicer_names)
     return out
 
@@ -5691,6 +5699,14 @@ def _build_term_loan_salesforce_fallback(
     out["Financing"] = out["Financing"].mask(_loan_buyer_populated, "Sold")
     out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
 
+    # Loan Sold Date (sourcing-map rule #4): Sold_Loan_Pool__c.Sold_Date__c, shown ONLY
+    # for sold loans (Financing == "Sold"); otherwise left blank -> N/A by report policy.
+    if "Loan Sold Date" in out.columns:
+        _sold_mask = out["Financing"].astype("string").str.strip().eq("Sold")
+        out["Loan Sold Date"] = pd.to_datetime(out["Loan Sold Date"], errors="coerce").where(_sold_mask, pd.NaT)
+    else:
+        out["Loan Sold Date"] = pd.NaT
+
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
 
     if "term_loan_manual" in prev_maps:
@@ -6116,7 +6132,10 @@ def build_term_loan(
 
         file_mat = pd.to_datetime(out.get("_serv_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
         cur_mat = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-        out["Maturity Date"] = cur_mat.where(cur_mat.notna(), file_mat)
+        # Servicer-file maturity WINS (sourcing-map rule #10, verified 1106/1106 vs
+        # 20260615 Term Loan). The servicer carries the live modified maturity; SF only
+        # ships Original, which is ~1 month off. SF stays as fallback when no servicer row.
+        out["Maturity Date"] = file_mat.where(file_mat.notna(), cur_mat)
         out = _guard_term_loan_upb_vs_amount(out, upb_col, prev_maps=prev_maps)
 
     out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
@@ -6174,8 +6193,9 @@ def build_term_loan(
         out = out.merge(maturity_ctx, on="_deal_key", how="left")
         cur_mat = pd.to_datetime(out.get("Maturity Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
         sf_mat = pd.to_datetime(out.get("_sf_preferred_term_maturity", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
-        # Current/modified SF maturity wins when present; prior workbook fills only blanks.
-        out["Maturity Date"] = sf_mat.where(sf_mat.notna(), cur_mat)
+        # Keep the already-resolved maturity (servicer-file wins per rule #10); the SF
+        # preferred maturity only fills brand-new deals that have no servicer maturity yet.
+        out["Maturity Date"] = cur_mat.where(cur_mat.notna(), sf_mat)
         out = out.drop(columns=["_sf_preferred_term_maturity"], errors="ignore")
 
     terminal_zero_keys = _term_terminal_zero_exclusion_keys(sf_term)
