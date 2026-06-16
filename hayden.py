@@ -2946,19 +2946,23 @@ def make_upload_blob(upload, compute_hash: bool = True) -> UploadBlob:
 
 
 def date_from_filename(name: str) -> Optional[date]:
-    m = re.search(r"(20\d{2})(\d{2})(\d{2})", name)
+    # Digit-boundary guards (?<!\d)...(?!\d) so an 8-digit date isn't grabbed out of
+    # a longer digit run. Without them, typo filenames like "...202606012" (9 digits,
+    # meant to be 2026-06-12) misparse as 2026-06-01, which then wrongly wins the
+    # dominant-tape-date vote and stamps the UPB header as "6/1 UPB".
+    m = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", name)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
-    m = re.search(r"(20\d{2})[-_](\d{1,2})[-_](\d{1,2})", name)
+    m = re.search(r"(?<!\d)(20\d{2})[-_](\d{1,2})[-_](\d{1,2})(?!\d)", name)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
-    m = re.search(r"(\d{2})[_-](\d{2})[_-](20\d{2})", name)
+    m = re.search(r"(?<!\d)(\d{2})[_-](\d{2})[_-](20\d{2})(?!\d)", name)
     if m:
         return date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
 
-    m = re.search(r"(\d{2})(\d{2})(20\d{2})", name)
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})(20\d{2})(?!\d)", name)
     if m:
         mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if 1 <= mm <= 12 and 1 <= dd <= 31:
@@ -5516,8 +5520,28 @@ def build_bridge_asset(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
-    if "Tax Commentary" in out.columns:
-        out["Tax Commentary"] = pd.Series(out["Tax Commentary"], index=out.index, dtype="object").map(_normalize_report_comment_text)
+    # CAFL re-financed deals: once a deal is re-financed into a CAFL securitization its
+    # Segment must read "Securitized Bridge", even if last week's completed report still
+    # carried the prior vehicle (e.g. "CPP JV"). The prior-workbook carry-forward above is
+    # Segment-first, so it would otherwise pin the stale value. Financing (Warehouse Line)
+    # starting with "CAFL " is authoritative here and matches derive_bridge_segment().
+    # Securitized (Y/N) and CPP JV (Y/N) are workbook formulas off Segment, so they follow.
+    if "Financing" in out.columns and "Segment" in out.columns:
+        _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
+        out.loc[_cafl_mask, "Segment"] = "Securitized Bridge"
+
+    # Normalize curated free-text columns for encoding artifacts (mojibake like "â€™",
+    # U+2019/dash variants, _x000D_ carriage returns). Previously only Tax Commentary was
+    # cleaned; the same byte-noise drove phantom Data mismatches on the other narrative
+    # columns. _normalize_report_comment_text is whitespace/encoding-only -- it never
+    # alters a clean value.
+    for _txtcol in (
+        "Tax Commentary", "Special Asset Status", "Special Asset Reason",
+        "Special Asset: Special Asset Status", "Remedy Plan", "Delinquency Notes",
+        "Maturity Status",
+    ):
+        if _txtcol in out.columns:
+            out[_txtcol] = pd.Series(out[_txtcol], index=out.index, dtype="object").map(_normalize_report_comment_text)
 
     # Valuation/value columns must be blank (empty cell) when there is no value --
     # never 0 -- to match the official report. Guards against stale 0s from SF,
@@ -6221,6 +6245,18 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         )
         out = out.drop(columns=["Portfolio_loan"], errors="ignore")
 
+    # Financing is also loan-derived. New approved/purchased term assets have no prior
+    # Term Asset row, so their carried-forward Financing is blank; refresh it from the
+    # current Term Loan tab (prior value still wins, Term Loan fills the blanks).
+    if "Financing" in tl.columns:
+        tl_financing = tl[["_deal_key", "Financing"]].drop_duplicates("_deal_key")
+        out = out.merge(tl_financing, on="_deal_key", how="left", suffixes=("", "_loan"))
+        out["Financing"] = coalesce_report_display_first(
+            out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)),
+            out.get("Financing_loan", pd.Series([pd.NA] * len(out), index=out.index)),
+        )
+        out = out.drop(columns=["Financing_loan"], errors="ignore")
+
     # Term Asset "2Q26 Special Loans List " mirrors the Term Loan special value by
     # deal (the report uses XLOOKUP into Term Loan). Map it from whichever Term Loan
     # special column is present.
@@ -6573,6 +6609,14 @@ def build_bridge_loan(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
+    # CAFL re-financed deals: Segment must read "Securitized Bridge" once the deal is
+    # re-financed into a CAFL securitization, overriding the Segment-first carry-forward
+    # that would otherwise pin last week's stale vehicle (e.g. "CPP JV"). Mirrors the
+    # Bridge Asset fix; Financing (Warehouse Line) startswith "CAFL " is authoritative.
+    if "Financing" in out.columns and "Segment" in out.columns:
+        _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
+        out.loc[_cafl_mask, "Segment"] = "Securitized Bridge"
+
     # Hard-reconcile the loan-level math back to the already-built Bridge Asset rows.
     # This prevents servicer zeroes / wrong rollup fields from breaking loan-level Active Funded Amount or UPB.
     out = _reconcile_bridge_loan_from_asset_rollup(out, bridge_asset, upb_col)
@@ -6589,7 +6633,10 @@ def build_bridge_loan(
     out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
     out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-    out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    # # of Units defaults to 0 (not blank) so the baseline backfill cannot resurrect a
+    # stale prior count on deals where Salesforce now reports no units -- the completed
+    # report shows 0 for these, matching the asset rollup.
+    out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
 
     bridge_asset_deal_keys = set()
     if bridge_asset is not None and not bridge_asset.empty and "_deal_key" in bridge_asset.columns:
@@ -7380,6 +7427,9 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("TPO"), "Purchased Bridge")
     loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("RB"), "Single Asset Bridge")
     out["Loan Type"] = loan_type_ba
+    # Interest Allocation shows 0 (never blank) in the report when Salesforce has none.
+    if "Interest Allocation" in out.columns:
+        out["Interest Allocation"] = _report_numeric_series_from_col(out, "Interest Allocation").fillna(0.0)
     # Widened Securitized rule: also flags CAFL 2026-R1 CV legacy.
     financing_ba = _report_text_series_from_col(out, "Financing")
     out["Securitized (Y/N)"] = _report_yn(
@@ -7427,6 +7477,20 @@ def _materialize_bridge_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> 
     if out.empty:
         return out
     out["Days Past Due"] = _days_between(run_dt, _report_date_series_from_col(out, "Next Payment Date"))
+    # Loan Type: Portfolio 5A/TPO/RB map to fixed labels, else fall back to Product Type.
+    # Mirrors _materialize_bridge_asset_formula_columns; the Bridge Loan tab previously had
+    # no Loan Type derivation (verified vs 20260615: CV/CLO rows carry the Product Type).
+    portfolio_bl = _report_text_series_from_col(out, "Portfolio")
+    product_type_bl = _report_text_series_from_col(out, "Product Type")
+    loan_type_bl = product_type_bl.copy()
+    loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("5A"), "5A Bridge")
+    loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("TPO"), "Purchased Bridge")
+    loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("RB"), "Single Asset Bridge")
+    out["Loan Type"] = loan_type_bl
+    # Interest Allocation shows 0 (never blank) in the report (verified 20260615: 0 blanks,
+    # 845 zeros). Fill Salesforce-null with 0 so new deals match.
+    if "Interest Allocation" in out.columns:
+        out["Interest Allocation"] = _report_numeric_series_from_col(out, "Interest Allocation").fillna(0.0)
     return out
 
 
