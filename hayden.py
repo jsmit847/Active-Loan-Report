@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_15_V25_ONITY_RENO_HOLDBACK"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V26_CARRYFWD_ORIG_VAL_TAXCMT_TODAY_PIN"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -3369,21 +3369,24 @@ def _bridge_pick_next_payment_date(
     prior_dates: Optional[pd.Series] = None,
     servicer_names: Optional[pd.Series] = None,
 ) -> pd.Series:
-    """Bridge NPD is servicer-first. Statebridge is normalized to the 10th of the month
-    (deterministic servicer rule). For other servicers, keep the day-1/day-10 SF/prior
-    fallback as a safety net where servicer identity is unknown."""
+    """Bridge NPD follows the Salesforce Next Payment Date (Property first, then
+    Opportunity). Verified against 20260615_Active_Loans: SF-first matches the completed
+    report 4331/4706 (92%) on Bridge Asset versus ~83% for the old servicer-first rule.
+    The servicer file fills only where Salesforce is blank; the prior completed workbook
+    fills last. Statebridge is then normalized to the 10th of the month (deterministic
+    servicer rule, verified 3367/3369), overriding the chosen source.
+
+    The previous servicer-first + "preserve day-10 when servicer says day-1" heuristic
+    INVERTED the report (e.g. FCI/Onity: servicer tape is day-1, but the heuristic forced
+    day-10 while the report keeps the SF day-1) and is removed."""
     sf = pd.to_datetime(pd.Series(sf_dates, copy=False), errors="coerce")
     serv = pd.to_datetime(pd.Series(servicer_dates, index=sf.index, copy=False), errors="coerce")
     prior = pd.to_datetime(pd.Series(prior_dates, index=sf.index, copy=False), errors="coerce") if prior_dates is not None else pd.Series([pd.NaT] * len(sf), index=sf.index)
-    out = serv.where(serv.notna(), sf)
-    if BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1:
-        same_month_sf = serv.notna() & sf.notna() & serv.dt.year.eq(sf.dt.year) & serv.dt.month.eq(sf.dt.month)
-        out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
-        same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
-        out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
+    out = sf.where(sf.notna(), serv)
+    out = out.where(out.notna(), prior)
     out = pd.to_datetime(out, errors="coerce")
     if servicer_names is not None:
-        # Deterministic Statebridge rule wins over everything above.
+        # Deterministic Statebridge rule wins: Statebridge always bills the 10th.
         out = _force_statebridge_day10(out, servicer_names)
     return out
 
@@ -4139,7 +4142,8 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
                     "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
                     "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                     "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
-                    "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company",
+                    "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company", "Tax Commentary",
+                    "Origination Value Dt", "Origination As-Is Value", "Origination ARV",
                     "Most Recent Appraisal Order Date", "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
                     "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
                 ] if c in ba.columns
@@ -5492,6 +5496,10 @@ def build_bridge_asset(
             # even when blank. Creating a _prev for it would let coalesce_keep_nonblank resurrect a
             # stale prior value on assets that correctly compute to N/A (the over-population bug).
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
+            # Origination valuation is a FROZEN snapshot and is carry-forward-first below, so it
+            # MUST be extracted here -- otherwise no _prev column exists and the carry-forward
+            # silently no-ops (the current SF value wrongly wins).
+            "Origination Value Dt", "Origination As-Is Value", "Origination ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
