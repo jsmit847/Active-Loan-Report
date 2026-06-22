@@ -23,7 +23,7 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
 from openpyxl.styles import Alignment, Color, Font, PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 
 try:
@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_16_V36_APPRAISAL_ORDER_DT_FLOOR_MIN"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V38_PER_ASSET_SUSPENSE_GUARD"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -600,6 +600,24 @@ SHEET_BLUEPRINTS = {
         "subtotal_col": 20,
     },
 }
+
+
+# Only the blue-header columns are auto-populated by the build. Everything to the
+# right of these (the manual / self-computing CALC formula columns) is filled in by
+# hand in Excel and is intentionally excluded from BOTH the data write and the
+# openpyxl mismatch audit/baseline repair. Column letters: Bridge Asset B..CJ,
+# Term Loan B..AD, Term Asset B..T. Formula columns that fall WITHIN these ranges
+# (e.g. SF Funded Amount, UPB) are still preserved/propagated as live formulas.
+SHEET_BLUE_MAX_COLUMN = {
+    "Bridge Asset": column_index_from_string("CJ"),  # 88
+    "Term Loan": column_index_from_string("AD"),     # 30
+    "Term Asset": column_index_from_string("T"),     # 20
+}
+
+
+def _sheet_blue_max_col(sheet_name: str) -> Optional[int]:
+    """Highest auto-populated/audited column for a sheet, or None if unrestricted."""
+    return SHEET_BLUE_MAX_COLUMN.get(sheet_name)
 
 
 def hey(name: str = PRIMARY_USER_NAME) -> str:
@@ -3445,16 +3463,25 @@ def _force_statebridge_day10(dates: pd.Series, servicer: pd.Series) -> pd.Series
     return d
 
 
-def _force_fci_day1_to_first_payment(dates: pd.Series, servicer: pd.Series, fpd_dates: pd.Series) -> pd.Series:
+def _force_fci_day1_to_first_payment(dates: pd.Series, servicer: pd.Series, fpd_dates: pd.Series, run_dt: Optional[date] = None) -> pd.Series:
     """FCI (exactly "FCI", not the 2012632 / v1805530 / CHL sub-flavors) reports a
     day-1 next-payment date in its servicer file; the official report instead uses the
     loan's First Payment Date day-of-month. Verified rule: when servicer == "FCI" and the
     chosen NPD lands on day 1 and a First Payment Date exists, move the day to the FPD's
-    day-of-month (clamped to the month length). Additive -- only touches FCI day-1 rows."""
+    day-of-month (clamped to the month length). Additive -- only touches FCI day-1 rows.
+
+    Recency gate: only correct CURRENT NPDs (within ~60 days of the run date). A
+    severely delinquent FCI loan carries a frozen historical day-1 NPD (e.g.
+    2021-11-01) that must stay on day 1; applying the FPD-day shift there fabricates a
+    future-looking date that the official report never shows."""
     d = pd.to_datetime(pd.Series(dates, copy=False), errors="coerce")
     fpd = pd.to_datetime(pd.Series(fpd_dates, index=d.index, copy=False), errors="coerce")
     serv = pd.Series(servicer, index=d.index, copy=False).astype(str).str.strip().str.casefold()
     mask = serv.eq("fci") & d.notna() & d.dt.day.eq(1) & fpd.notna()
+    if run_dt is not None:
+        run_ts = pd.Timestamp(run_dt)
+        recent = d.ge(run_ts - pd.Timedelta(days=60)) & d.le(run_ts + pd.Timedelta(days=60))
+        mask = mask & recent
     if not bool(mask.any()):
         return d
     fixed = []
@@ -3473,6 +3500,7 @@ def _bridge_pick_next_payment_date(
     prior_dates: Optional[pd.Series] = None,
     servicer_names: Optional[pd.Series] = None,
     fpd_dates: Optional[pd.Series] = None,
+    run_dt: Optional[date] = None,
 ) -> pd.Series:
     """Bridge NPD is servicer-first. Statebridge is normalized to the 10th of the month
     (deterministic servicer rule). For other servicers, keep the day-1/day-10 SF/prior
@@ -3495,9 +3523,19 @@ def _bridge_pick_next_payment_date(
         out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
         same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
         out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
+    # FCI rolls its servicer-file Next Due Date FORWARD to the next scheduled payment
+    # even for severely delinquent loans, where the official report keeps the frozen
+    # historical NPD (the last real due date). When the FCI servicer NPD is far ahead of
+    # the Salesforce NPD (> 60 days), the loan is delinquent and SF holds the truth, so
+    # fall back to SF. Only FCI-family servicers exhibit this roll-forward behavior.
+    if servicer_names is not None:
+        serv_fam = pd.Series(servicer_names, index=sf.index, copy=False).astype(str).str.strip().str.casefold()
+        is_fci = serv_fam.str.startswith("fci")
+        far_future = is_fci & sf.notna() & serv.notna() & ((serv - sf).dt.days > 60)
+        out = out.where(~far_future, sf)
     out = pd.to_datetime(out, errors="coerce")
     if servicer_names is not None and fpd_dates is not None:
-        out = _force_fci_day1_to_first_payment(out, servicer_names, fpd_dates)
+        out = _force_fci_day1_to_first_payment(out, servicer_names, fpd_dates, run_dt=run_dt)
     if servicer_names is not None:
         # Deterministic Statebridge rule wins over everything above.
         out = _force_statebridge_day10(out, servicer_names)
@@ -5577,11 +5615,16 @@ def build_bridge_asset(
     prop_suspense = pd.to_numeric(out.get("Property Suspense Balance", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     serv_suspense = pd.to_numeric(out.get("_loan_suspense", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     out["_row_in_deal"] = out.groupby("_deal_key", dropna=True).cumcount()
-    # Suspense is per-asset in the completed report. Prefer the servicer-file value
-    # (asset-level), then the Property__c per-asset suspense, then fall back to the
-    # deal-level Opportunity suspense applied once on the first row of the deal.
+    # Suspense is per-asset in the completed report. The servicer-file suspense is keyed
+    # by Servicer ID (loan/SID level): on a multi-asset deal that shares one Servicer ID,
+    # applying it to every asset row repeats the WHOLE loan's suspense on each asset (the
+    # 1459786-style 119,233.93-vs-0 over-count). Only trust the servicer-file suspense at
+    # the asset level when the SID maps to a single asset in the deal (mirrors the
+    # safe_servicer_asset_upb guard above); otherwise prefer the Property__c per-asset
+    # suspense, then the deal-level Opportunity suspense applied once on the first row.
+    safe_serv_suspense = serv_suspense.where(out["_asset_count_in_deal"].le(1) | sid_count.eq(1))
     sf_suspense_once = pd.Series(np.where(out["_row_in_deal"].eq(0), sf_suspense, np.nan), index=out.index)
-    out["Suspense Balance"] = serv_suspense.where(serv_suspense.notna(), prop_suspense)
+    out["Suspense Balance"] = safe_serv_suspense.where(safe_serv_suspense.notna(), prop_suspense)
     out["Suspense Balance"] = out["Suspense Balance"].where(out["Suspense Balance"].notna(), sf_suspense_once)
     out["Suspense Balance"] = pd.to_numeric(out["Suspense Balance"], errors="coerce").fillna(0.0)
 
@@ -5596,7 +5639,7 @@ def build_bridge_asset(
             prior_map = prev_npd.dropna(subset=["_asset_key"]).drop_duplicates("_asset_key").set_index("_asset_key")["Next Payment Date"]
             prior_npd = out["_asset_key"].map(prior_map)
     _ba_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
-    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer, fpd_dates=sf_first_payment)
+    out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer, fpd_dates=sf_first_payment, run_dt=run_dt)
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
@@ -6686,7 +6729,7 @@ def build_bridge_loan(
         if "Next Payment Date" in prev_bl.columns and "_deal_key" in prev_bl.columns:
             prior_bridge_loan_npd = out["_deal_key"].map(prev_bl.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key").set_index("_deal_key")["Next Payment Date"])
     _bl_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
-    out["Next Payment Date"] = _bridge_pick_next_payment_date(cur_bridge_loan_npd, serv_bridge_loan_npd, prior_bridge_loan_npd, servicer_names=_bl_servicer)
+    out["Next Payment Date"] = _bridge_pick_next_payment_date(cur_bridge_loan_npd, serv_bridge_loan_npd, prior_bridge_loan_npd, servicer_names=_bl_servicer, run_dt=run_dt)
     out["Next Advance Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
 
@@ -7854,6 +7897,11 @@ def write_df_to_sheet_preserve_formulas(
     start_row: int = DATA_START_ROW,
 ):
     write_cols = [(c, h) for (c, h) in header_tuples if c not in formula_cols]
+    # Restrict the data write to the blue-header columns. Columns to the right of the
+    # blue range are filled in manually in Excel, so the build leaves them untouched.
+    _blue_max = _sheet_blue_max_col(ws_formula.title)
+    if _blue_max is not None:
+        write_cols = [(c, h) for (c, h) in write_cols if c <= _blue_max]
     headers = [h for _c, h in write_cols]
 
     # Resolve each output header against df columns, tolerating leading/trailing
@@ -7909,6 +7957,7 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     template_text_headers = _infer_template_text_headers(ws, hdr, start_row=DATA_START_ROW)
     df = _normalize_output_for_report(df, sheet_name, upb_col, template_text_headers=template_text_headers)
     fcols = formula_col_indices(ws, start_row=DATA_START_ROW, header_row=HEADER_ROW)
+    template_formula_cols = set(fcols)
 
     # Columns that MUST stay live formulas because they reference another sheet
     # that is not yet written when this sheet is written.
@@ -7931,6 +7980,16 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
         force_write_headers = {upb_col, "Special (Y/N)"}
         force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
         fcols = {c for c in fcols if c not in force_write_cols}
+
+    # Columns to the right of the blue range are the self-computing CALC region
+    # (Bridge Asset Days Past Due/DQ Status/Maturity Date, the special-loans list,
+    # SFR/MF allocations, etc.). They are NOT auto-filled with data, but their template
+    # formulas MUST stay live and be propagated down -- materializing or clearing them
+    # would blank the column. Keep every beyond-blue template formula column as a live
+    # formula so e.g. Days Past Due keeps recalculating off the CP4/CQ4 run-date anchor.
+    _blue_max = _sheet_blue_max_col(sheet_name)
+    if _blue_max is not None:
+        fcols |= {c for c in template_formula_cols if c > _blue_max}
 
     formula_seeds = _capture_formula_seeds(ws, fcols, start_row=DATA_START_ROW)
     # Ensure always-live cross-sheet columns have a seed even if the template
@@ -8053,6 +8112,8 @@ def repair_workbook_from_baseline(wb, baseline_bytes: Optional[bytes], upb_heade
             out_ws = wb[sheet_name]
             base_ws = base_wb[sheet_name]
             formula_cols = formula_col_indices(out_ws, start_row=DATA_START_ROW, header_row=HEADER_ROW)
+            # Manual columns past the blue range are never backfilled from the baseline.
+            blue_max = _sheet_blue_max_col(sheet_name)
 
             fills = 0
             matched_rows: Set[int] = set()
@@ -8356,6 +8417,10 @@ def _embedded_audit_openpyxl_workbook(
 
             out_ws = wb[sheet_name]
             formula_cols = formula_col_indices(out_ws)
+            # Columns past the blue range are filled manually and are not audited.
+            blue_max = _sheet_blue_max_col(sheet_name)
+            if blue_max is not None:
+                formula_cols = {c for c in formula_cols if c <= blue_max}
 
             if base_wb is None or sheet_name not in getattr(base_wb, "sheetnames", []):
                 key_headers, out_rows, out_headers, out_data_rows, out_blank_keys, dupes = _embedded_choose_structural_keys(
@@ -8436,6 +8501,7 @@ def _embedded_audit_openpyxl_workbook(
             common_headers = [
                 header for header in out_headers
                 if header in base_headers and header not in chosen_keys and not UPB_HEADER_RE.search(str(header))
+                and (blue_max is None or out_headers[header] <= blue_max)
             ]
             protected_headers = [header for header in common_headers if header in EMBEDDED_AUDIT_PROTECTED_HEADERS.get(sheet_name, set())]
             scan_cols = list(out_headers.values())
