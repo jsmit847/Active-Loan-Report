@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V38_PER_ASSET_SUSPENSE_GUARD"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V41_A2STATUS_CPPJV_MATSTATUS_AMCMT"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -295,6 +295,19 @@ REPORT_INTEGER_HEADERS = {
     "Bridge Loan": {"Number of Assets", "# of Units", "Days Past Due"},
     "Term Loan": {"Days Past Due"},
     "Term Asset": {"# Units"},
+}
+
+# Fix N: free-text columns whose SF source can carry data-entry double-spaces. The
+# official report renders these single-spaced; collapse runs of 2+ whitespace to one
+# space so byte-only whitespace diffs stop registering as mismatches.
+WHITESPACE_COLLAPSE_HEADERS = {
+    "Bridge Asset": {
+        "Deal Name", "Borrower Entity", "Account Name", "Address", "Primary Contact",
+        "APN", "Additional APNs", "Title Company",
+    },
+    "Bridge Loan": {"Deal Name", "Borrower Name", "Account", "Primary Contact"},
+    "Term Loan": {"Deal Name", "Borrower Entity", "Account Name"},
+    "Term Asset": {"Address"},
 }
 
 SHEET_MONEY2_HEADERS = {
@@ -792,6 +805,10 @@ def normalize_text_display_scalar(val):
         val = val.item()
     txt = clean_text(val)
     txt = re.sub(r"\.0$", "", txt)
+    # Collapse internal runs of 2+ whitespace to a single space. SF text fields carry
+    # data-entry double-spaces (Deal Name / APN / Borrower Entity / Account Name); the
+    # official report renders them single-spaced, so match that (Fix N).
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
     return txt if txt else pd.NA
 
 
@@ -1750,10 +1767,11 @@ def normalize_term_financing(financing) -> str:
     return TERM_FUNDING_VEHICLE_REMAP.get(f, f)
 
 
-def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number, template_maps: dict, sold_servicing_status=None):
+def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number, template_maps: dict, sold_servicing_status=None, warehouse_line=None):
     typ = clean_text(loan_type)
     fin = normalize_term_financing(financing)
     buyer = clean_text(loan_buyer)
+    wl = clean_text(warehouse_line)
 
     if typ in TERM_DSCR_TYPES:
         return "DSCR", "DSCR", "N"
@@ -1763,7 +1781,11 @@ def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number,
     if fin == "Sold" or buyer:
         seg = buyer.split()[0] if buyer else "Sold Term"
         return "Sold Term", seg, "N"
-    if fin.startswith("CPP JV"):
+    # Fix E.2: CPP JV is keyed off the Warehouse Line as well as the funding vehicle.
+    # Verified same-day SF_Term: deals 61366/62486/63175/63243 carry
+    # Warehouse_Line__c="CPP JV - Morgan Stanley" but a non-CPP Current Funding Vehicle,
+    # so they were mis-binned Mortgage Banking. Sold/DSCR are still decided first above.
+    if fin.startswith("CPP JV") or wl.startswith("CPP JV"):
         return "Active Term", "CPP JV", "Y"
     # Legacy deals must win before securitized (some are financed "CAFL 2026-R1").
     if deal_in_lookup(deal_number, template_maps.get("legacy_term_deals", set())):
@@ -5643,6 +5665,25 @@ def build_bridge_asset(
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
+    # Fix A.2 (Status half): the FCI servicer file rolls a delinquent loan's Status forward
+    # along with its NPD. A.1 already reverted Next Payment Date to the frozen SF value for
+    # these rows, so detect them index-safely (servicer NPD now >60 days past the chosen
+    # NPD) and blank the stale servicer-file Status so it does not publish a post-
+    # modification CURRENT/REO bucket. (The UPB half of A.2 is intentionally NOT applied
+    # here -- it needs a same-index SF UPB basis and must be verified against a rebuild.)
+    _a2_serv = coalesce_keep_nonblank(
+        out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj)
+    ).astype("string").str.casefold()
+    _a2_serv_npd = pd.to_datetime(out.get("_serv_next_payment_date"), errors="coerce")
+    _a2_chosen_npd = pd.to_datetime(out.get("Next Payment Date"), errors="coerce")
+    _fci_rolled_mask = (
+        _a2_serv.str.startswith("fci").fillna(False)
+        & _a2_serv_npd.notna()
+        & _a2_chosen_npd.notna()
+        & ((_a2_serv_npd - _a2_chosen_npd).dt.days > 60)
+    )
+    if bool(_fci_rolled_mask.any()):
+        out.loc[_fci_rolled_mask, "Servicer Status"] = "N/A"
     out["Servicer Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file"), errors="coerce")
     out = out.drop(columns=["_prev_upb"], errors="ignore")
 
@@ -5671,7 +5712,11 @@ def build_bridge_asset(
             "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
-            "Maturity Status", "Title Company", "Tax Commentary",
+            # Fix F: "Maturity Status" is intentionally NOT carry-forward-first. It is a
+            # live per-asset Property__c.Maturity_Status__c value with date-stamped notes
+            # (e.g. "06/18/2026 Payoff Pending ..."); the fresh SF value must win, not last
+            # week's stale text. Verified against same-day real on deals 41341/50140.
+            "Title Company", "Tax Commentary",
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
@@ -5826,15 +5871,23 @@ def _build_term_loan_salesforce_fallback(
         out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM_sf", pd.Series([pd.NA] * len(out), index=out.index)), out["Active RM"])
         out = out.drop(columns=["Active RM_sf"], errors="ignore")
 
+    # Fix K: classify the DSCR portfolio off "Product Type" (LOC_Loan_Type__c), not the
+    # deal "Type". Verified against same-day SF_Term: 132/133 real-DSCR deals have
+    # Product Type in {DSCR, Single Rental Loan} (the 1 exception is Single Rental Loan,
+    # also DSCR), and 82/82 real-Active-Term deals have Product Type "Term Loan". New
+    # DSCR deals (63010/63704/63709) carry Product Type=DSCR but were mis-binned as
+    # Active Term off "Type". derive_term_portfolio_segment uses loan_type ONLY for the
+    # DSCR check, so this does not affect Segment/CPP. Fall back to "Type" when blank.
     cls = sf_term.apply(
         lambda r: pd.Series(
             derive_term_portfolio_segment(
-                r.get("Type"),
+                r.get("Product Type") if clean_text(r.get("Product Type")) else r.get("Type"),
                 r.get("Current Funding Vehicle"),
                 r.get("Sold Loan: Sold To"),
                 r.get("Deal Loan Number"),
                 template_maps,
                 sold_servicing_status=r.get("Sold Loan: Servicing Status"),
+                warehouse_line=r.get("Warehouse Line"),
             ),
             index=["Portfolio", "Segment", "CPP JV"],
         ),
@@ -6615,10 +6668,13 @@ def build_bridge_loan(
         out["Special Focus (Y/N)"] = "N"
 
     out["Primary Contact"] = coalesce_keep_nonblank(out.get("Primary Contact_active", blank_obj), out.get("Primary Contact", blank_obj))
-    out["Last Funding Date"] = pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
-        pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
-        pd.to_datetime(out.get("Last Funding Date_active", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
-    )
+    # Fix H.1: BL Last Funding Date = MAX of the per-asset "Last Funding Date" across the
+    # deal's Bridge Asset rows (verified 5/5 vs same-day real). The asset rollup is the
+    # authoritative source; the deal-level property rollup is only a fallback. The
+    # Opportunity Funds_Released/Last_Funding field ("Last Funding Date SF") is NOT used
+    # below -- it carries later post-closing advances the official report excludes
+    # (the 2021-10-08-vs-2021-01-27 leak on deals like 33182).
+    out["Last Funding Date"] = _coalesce_datetime_columns(out, ["Last Funding Date_active", "Last Funding Date"])
     out["Servicer ID"] = coalesce_keep_nonblank(out.get("Servicer ID_active", blank_obj), out.get("Servicer ID", blank_obj))
     out["Servicer"] = coalesce_keep_nonblank(out.get("Servicer_active", blank_obj), out.get("Servicer", blank_obj))
     out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets_active", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").where(
@@ -6642,10 +6698,9 @@ def build_bridge_loan(
     )
     out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)_active", blank_obj), out.get("State(s)", blank_obj))
     out["State(s)"] = coalesce_keep_nonblank(out.get("State(s)", blank_obj), out.get("State(s) SF", blank_obj))
-    out["Last Funding Date"] = pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
-        pd.to_datetime(out.get("Last Funding Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
-        pd.to_datetime(out.get("Last Funding Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
-    )
+    # Fix H.1: intentionally NO "Last Funding Date SF" (Opportunity Funds_Released_Date__c /
+    # Last_Funding_Date__c) fallback here -- it leaks later advances the report excludes.
+    # Last Funding Date is the asset-rollup MAX set above.
     out["Most Recent Valuation Date"] = pd.to_datetime(out.get("Most Recent Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").where(
         pd.to_datetime(out.get("Most Recent Valuation Date", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce").notna(),
         pd.to_datetime(out.get("Most Recent Valuation Date SF", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"),
@@ -6778,7 +6833,11 @@ def build_bridge_loan(
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
         bridge_loan_carry_forward_first = {
             "Portfolio", "Segment", "Financing", "Strategy Grouping", "Loan Level Delinquency",
-            "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value",
+            # Fix F: "AM Commentary" is intentionally NOT carry-forward-first -- it is the
+            # live Opportunity.Asset_Management_Comments__c, which carries the current
+            # date-stamped note (verified vs same-day real on deals 41341/44313/50140). The
+            # fresh SF value must win over last week's text.
+            "Special Focus (Y/N)", "3/31 NPL", "Needs NPL Value",
             "Active RM", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
             "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date",
         }
@@ -6814,7 +6873,19 @@ def build_bridge_loan(
 
     out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
-    out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out.get("Special Focus (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
+    # Fix G: Special Focus (Y/N) = Y iff the deal has an "Asset Manager 2" assignment.
+    # Verified 5/5 vs same-day SF_AM_Assignments (54050/54051 Y -> have AM2; 49519/51299/
+    # 54652 N -> no AM2; none are Is-Special-Asset). This is the authoritative rule and
+    # OVERRIDES the prior Special-Flag rollup / NPL flag / carry-forward, which drifted in
+    # both directions. AM2 presence is read from the already-built Bridge Asset rows
+    # (their "Asset Manager 2" column is the SF_AM_Assignments "Asset Manager 2" pivot).
+    _am2_deals = set()
+    if bridge_asset is not None and not bridge_asset.empty and {"_deal_key", "Asset Manager 2"}.issubset(bridge_asset.columns):
+        _am2_ser = pd.Series(bridge_asset["Asset Manager 2"], index=bridge_asset.index, dtype="object")
+        _am2_txt = _am2_ser.astype("string").str.strip().str.upper()
+        _has_am2 = (~blankish_mask(_am2_ser)) & _am2_txt.ne("N/A")
+        _am2_deals = set(pd.Series(bridge_asset["_deal_key"], index=bridge_asset.index)[_has_am2].dropna().astype(str).tolist())
+    out["Special Focus (Y/N)"] = out["_deal_key"].astype(str).isin(_am2_deals).map({True: "Y", False: "N"})
     out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
@@ -7794,6 +7865,14 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
     for header in text_headers:
         if header in out.columns:
             out[header] = normalize_text_display_series(out[header])
+
+    # Fix N: collapse data-entry double-spaces in free-text columns so they render
+    # single-spaced like the official report. These columns are written verbatim from SF
+    # and do not all route through normalize_text_display_series, so collapse them here.
+    for header in WHITESPACE_COLLAPSE_HEADERS.get(sheet_name, set()):
+        if header in out.columns:
+            ser = pd.Series(out[header], index=out.index, dtype="object")
+            out[header] = ser.map(lambda v: re.sub(r"\s{2,}", " ", v).strip() if isinstance(v, str) else v)
 
     out = _apply_report_blank_na_policy(out, sheet_name)
 
