@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V41_A2STATUS_CPPJV_MATSTATUS_AMCMT"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V44_FCI_NPD_PLUS_L_SERVICER_GATE"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -1771,7 +1771,6 @@ def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number,
     typ = clean_text(loan_type)
     fin = normalize_term_financing(financing)
     buyer = clean_text(loan_buyer)
-    wl = clean_text(warehouse_line)
 
     if typ in TERM_DSCR_TYPES:
         return "DSCR", "DSCR", "N"
@@ -1781,11 +1780,11 @@ def derive_term_portfolio_segment(loan_type, financing, loan_buyer, deal_number,
     if fin == "Sold" or buyer:
         seg = buyer.split()[0] if buyer else "Sold Term"
         return "Sold Term", seg, "N"
-    # Fix E.2: CPP JV is keyed off the Warehouse Line as well as the funding vehicle.
-    # Verified same-day SF_Term: deals 61366/62486/63175/63243 carry
-    # Warehouse_Line__c="CPP JV - Morgan Stanley" but a non-CPP Current Funding Vehicle,
-    # so they were mis-binned Mortgage Banking. Sold/DSCR are still decided first above.
-    if fin.startswith("CPP JV") or wl.startswith("CPP JV"):
+    # NOTE (V42): the Warehouse-Line CPP JV trigger (former Fix E.2) was REVERTED. It
+    # inverted brand-new DSCR deals whose API Product Type was not yet "DSCR" (63709/64595
+    # -> wrongly CPP JV) and was overridden by the Segment carry-forward for existing
+    # deals, so it had no upside. `warehouse_line` is accepted but unused for now.
+    if fin.startswith("CPP JV"):
         return "Active Term", "CPP JV", "Y"
     # Legacy deals must win before securitized (some are financed "CAFL 2026-R1").
     if deal_in_lookup(deal_number, template_maps.get("legacy_term_deals", set())):
@@ -3556,8 +3555,12 @@ def _bridge_pick_next_payment_date(
         far_future = is_fci & sf.notna() & serv.notna() & ((serv - sf).dt.days > 60)
         out = out.where(~far_future, sf)
     out = pd.to_datetime(out, errors="coerce")
-    if servicer_names is not None and fpd_dates is not None:
-        out = _force_fci_day1_to_first_payment(out, servicer_names, fpd_dates, run_dt=run_dt)
+    # V43: the FCI day-1 -> First-Payment-day shift (_force_fci_day1_to_first_payment) is
+    # DISABLED. Same-day comparison vs the 6/22 real report proved real keeps the FCI
+    # servicer-file date as-is (current FCI loans show day-1, e.g. 2026-07-01), while the
+    # shift was forcing them to day-10 (2026-07-10) -- ~500+ BA NPD cells plus the BL
+    # Days Past Due / NPL cascade. The far-future delinquent gate above (revert FCI
+    # rolled-forward NPDs to the SF date) is retained; only the day-of-month shift is off.
     if servicer_names is not None:
         # Deterministic Statebridge rule wins over everything above.
         out = _force_statebridge_day10(out, servicer_names)
@@ -5665,25 +5668,9 @@ def build_bridge_asset(
 
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
-    # Fix A.2 (Status half): the FCI servicer file rolls a delinquent loan's Status forward
-    # along with its NPD. A.1 already reverted Next Payment Date to the frozen SF value for
-    # these rows, so detect them index-safely (servicer NPD now >60 days past the chosen
-    # NPD) and blank the stale servicer-file Status so it does not publish a post-
-    # modification CURRENT/REO bucket. (The UPB half of A.2 is intentionally NOT applied
-    # here -- it needs a same-index SF UPB basis and must be verified against a rebuild.)
-    _a2_serv = coalesce_keep_nonblank(
-        out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj)
-    ).astype("string").str.casefold()
-    _a2_serv_npd = pd.to_datetime(out.get("_serv_next_payment_date"), errors="coerce")
-    _a2_chosen_npd = pd.to_datetime(out.get("Next Payment Date"), errors="coerce")
-    _fci_rolled_mask = (
-        _a2_serv.str.startswith("fci").fillna(False)
-        & _a2_serv_npd.notna()
-        & _a2_chosen_npd.notna()
-        & ((_a2_serv_npd - _a2_chosen_npd).dt.days > 60)
-    )
-    if bool(_fci_rolled_mask.any()):
-        out.loc[_fci_rolled_mask, "Servicer Status"] = "N/A"
+    # NOTE (V42): the FCI rolled-forward Servicer Status -> "N/A" gate (former Fix A.2) was
+    # REVERTED -- it regressed BA Servicer Status from 26 -> 91 mismatches against same-day
+    # real (it blanked rows where real kept a real status). A.1's NPD far-future gate stays.
     out["Servicer Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file"), errors="coerce")
     out = out.drop(columns=["_prev_upb"], errors="ignore")
 
@@ -5712,11 +5699,10 @@ def build_bridge_asset(
             "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
-            # Fix F: "Maturity Status" is intentionally NOT carry-forward-first. It is a
-            # live per-asset Property__c.Maturity_Status__c value with date-stamped notes
-            # (e.g. "06/18/2026 Payoff Pending ..."); the fresh SF value must win, not last
-            # week's stale text. Verified against same-day real on deals 41341/50140.
-            "Title Company", "Tax Commentary",
+            # NOTE (V42): "Maturity Status" REVERTED back to carry-forward-first -- the live
+            # Property__c.Maturity_Status__c value regressed BA Maturity Status 16 -> 23 vs
+            # same-day real (prior workbook value matched better).
+            "Maturity Status", "Title Company", "Tax Commentary",
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
@@ -6406,6 +6392,27 @@ def build_term_loan(
         out["Maturity Date"] = cur_mat.where(cur_mat.notna(), sf_mat)
         out = out.drop(columns=["_sf_preferred_term_maturity"], errors="ignore")
 
+    # Fix L: a brand-new term deal that Salesforce names a servicer for, but which has NO
+    # servicer-file activity (no positive UPB in any uploaded servicer file), is shown as
+    # N/A by the official report until payments actually start hitting the servicer.
+    # Verified vs same-day real: 36 newly-boarded Berkadia/FCI/SPS deals (47576, 59864,
+    # 61372, 61683, 62486, ...) read N/A. The gate is restricted to deals ABSENT from the
+    # prior workbook so an established / carried-forward servicer (e.g. Selene on 63181) is
+    # never blanked. _loan_upb is the servicer-file UPB merged earlier in this function.
+    if prev_keys:
+        _l_file_upb = pd.to_numeric(out.get("_loan_upb", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        _l_has_activity = _l_file_upb.gt(0).fillna(False)
+        _l_is_new = ~out["_deal_key"].astype(str).isin(prev_keys)
+        _l_servicer = pd.Series(out.get("Servicer", blank_obj), index=out.index, dtype="object")
+        _l_named = (~blankish_mask(_l_servicer)) & _l_servicer.astype("string").str.strip().str.upper().ne("N/A")
+        _l_boarding_only = _l_is_new & _l_named & (~_l_has_activity)
+        if bool(_l_boarding_only.any()):
+            out.loc[_l_boarding_only, "Servicer"] = "N/A"
+            out.loc[_l_boarding_only, "Servicer ID"] = "N/A"
+            out.loc[_l_boarding_only, upb_col] = np.nan
+            if "Next Payment Date" in out.columns:
+                out.loc[_l_boarding_only, "Next Payment Date"] = pd.NaT
+
     terminal_zero_keys = _term_terminal_zero_exclusion_keys(sf_term)
     if terminal_zero_keys:
         out = _drop_term_deal_keys(out, terminal_zero_keys)
@@ -6833,11 +6840,10 @@ def build_bridge_loan(
         out = out.merge(man, on="_deal_key", how="left", suffixes=("", "_prev"))
         bridge_loan_carry_forward_first = {
             "Portfolio", "Segment", "Financing", "Strategy Grouping", "Loan Level Delinquency",
-            # Fix F: "AM Commentary" is intentionally NOT carry-forward-first -- it is the
-            # live Opportunity.Asset_Management_Comments__c, which carries the current
-            # date-stamped note (verified vs same-day real on deals 41341/44313/50140). The
-            # fresh SF value must win over last week's text.
-            "Special Focus (Y/N)", "3/31 NPL", "Needs NPL Value",
+            # NOTE (V42): "AM Commentary" REVERTED back to carry-forward-first -- the live
+            # Opportunity.Asset_Management_Comments__c pull did not beat the prior value vs
+            # same-day real (49 mismatches unchanged; the live API note was older than real's).
+            "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value",
             "Active RM", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
             "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date",
         }
@@ -6873,19 +6879,10 @@ def build_bridge_loan(
 
     out["Servicer ID"] = normalize_servicer_id_for_report(out.get("Servicer ID", blank_obj), out.get("Servicer", blank_obj))
     out["Active RM"] = coalesce_keep_nonblank(out.get("Active RM", blank_obj), pd.Series(["N"] * len(out), index=out.index))
-    # Fix G: Special Focus (Y/N) = Y iff the deal has an "Asset Manager 2" assignment.
-    # Verified 5/5 vs same-day SF_AM_Assignments (54050/54051 Y -> have AM2; 49519/51299/
-    # 54652 N -> no AM2; none are Is-Special-Asset). This is the authoritative rule and
-    # OVERRIDES the prior Special-Flag rollup / NPL flag / carry-forward, which drifted in
-    # both directions. AM2 presence is read from the already-built Bridge Asset rows
-    # (their "Asset Manager 2" column is the SF_AM_Assignments "Asset Manager 2" pivot).
-    _am2_deals = set()
-    if bridge_asset is not None and not bridge_asset.empty and {"_deal_key", "Asset Manager 2"}.issubset(bridge_asset.columns):
-        _am2_ser = pd.Series(bridge_asset["Asset Manager 2"], index=bridge_asset.index, dtype="object")
-        _am2_txt = _am2_ser.astype("string").str.strip().str.upper()
-        _has_am2 = (~blankish_mask(_am2_ser)) & _am2_txt.ne("N/A")
-        _am2_deals = set(pd.Series(bridge_asset["_deal_key"], index=bridge_asset.index)[_has_am2].dropna().astype(str).tolist())
-    out["Special Focus (Y/N)"] = out["_deal_key"].astype(str).isin(_am2_deals).map({True: "Y", False: "N"})
+    # NOTE (V42): the "Special Focus = has Asset Manager 2 assignment" rule (former Fix G)
+    # was REVERTED -- it regressed BL Special Focus from 24 -> 111 mismatches against
+    # same-day real. Restored the rollup/NPL/carry-forward-derived value.
+    out["Special Focus (Y/N)"] = coalesce_keep_nonblank(out.get("Special Focus (Y/N)", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["3/31 NPL"] = coalesce_keep_nonblank(out.get("3/31 NPL", blank_obj), pd.Series(["N"] * len(out), index=out.index))
     out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
