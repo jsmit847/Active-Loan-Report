@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_22_V44_FCI_NPD_PLUS_L_SERVICER_GATE"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_29_V45_SSR_TAXONOMY_PLUS_ACTIVE_RM_CAF"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2743,18 +2743,31 @@ def _build_am_assignments_like() -> pd.DataFrame:
 
 
 def _build_active_rm_like() -> pd.DataFrame:
-    # Active RM = the deal Owner (CAF Originator) is an active Salesforce user.
-    # Mirrors the "Active RM" report: group by Opportunity, surface Owner.IsActive
-    # ("CAF Originator: Active"). A deal is "Y" if ANY of its owner rows is active.
+    # Active RM = the deal's CAF Originator (loan officer) is an active Salesforce user.
+    # Verified 6/29 same-day: per-originator deterministic across 60 originators (zero
+    # split). The discriminator is the CAF Originator lookup's IsActive, NOT the record
+    # Owner (Owner can be an active ops user even when the originator is inactive). Resolve
+    # the CAF Originator User lookup defensively; fall back to Owner.IsActive if absent.
+    _caf_field = first_existing_field_name(
+        "Opportunity",
+        ["CAF_Originator__c", "CAF_Originator_User__c", "CAF_Loan_Originator__c", "Originator__c", "Loan_Originator__c"],
+    )
+    _caf_rel = None
+    if _caf_field:
+        try:
+            _caf_rel = relationship_name_for("Opportunity", _caf_field)
+        except KeyError:
+            _caf_rel = None
+    _active_expr = f"{_caf_rel}.IsActive" if _caf_rel else "Owner.IsActive"
     soql = (
-        "SELECT Deal_Loan_Number__c, Owner.IsActive "
+        f"SELECT Deal_Loan_Number__c, {_active_expr} "
         "FROM Opportunity WHERE "
         "Deal_Loan_Number__c != NULL AND "
         + _soql_in("StageName", ACTIVE_RM_STAGES)
     )
     df = run_bulk_query(
         soql,
-        rename_map={"Deal_Loan_Number__c": "Deal Loan Number", "Owner.IsActive": "Owner Active"},
+        rename_map={"Deal_Loan_Number__c": "Deal Loan Number", _active_expr: "Owner Active"},
     )
     if df.empty or "Deal Loan Number" not in df.columns:
         return pd.DataFrame(columns=["Deal Loan Number", "Active RM"])
@@ -3590,6 +3603,41 @@ def _normalize_report_comment_text(value):
 def _term_segment_is_sold_servicing_retained(segment_series: pd.Series) -> pd.Series:
     txt = pd.Series(segment_series, copy=False).astype("string").str.strip()
     return txt.isin(list(TERM_SOLD_RETAINED_SEGMENT_VALUES))
+
+
+def _term_sold_servicing_retained_deal_keys(sf_term: pd.DataFrame) -> Set[str]:
+    """Deal keys whose Term Loan is Sold AND Berkadia-serviced.
+
+    Verified rule (6/29 same-day real): Stage == 'Sold' AND Servicer Name == 'Berkadia'
+    -> Portfolio = Financing = 'Sold Servicing Retained' (384/384 sold deals match). This
+    cascades to Term Asset, which inherits the parent deal's Portfolio/Financing.
+    """
+    if sf_term is None or sf_term.empty or "Deal Loan Number" not in sf_term.columns:
+        return set()
+    stage = sf_term.get("Stage", pd.Series([pd.NA] * len(sf_term), index=sf_term.index)).astype("string").str.strip()
+    servicer = sf_term.get("Servicer Name", pd.Series([pd.NA] * len(sf_term), index=sf_term.index)).astype("string").str.strip()
+    mask = stage.eq("Sold") & servicer.eq("Berkadia")
+    keys = norm_id_series(sf_term["Deal Loan Number"]).loc[mask].dropna().astype(str).tolist()
+    return {clean_text(k) for k in keys if clean_text(k)}
+
+
+def _apply_term_sold_servicing_retained(df: pd.DataFrame, ssr_keys: Set[str]) -> pd.DataFrame:
+    """Relabel the Sold-Servicing-Retained deals' Portfolio and Financing.
+
+    `ssr_keys` is the Sold+Berkadia deal-key set. Must run AFTER the prior-workbook
+    carry-forward (coalesce_report_display_first lets last week's 'Sold Term'/'Sold' win
+    over the live derivation) and AFTER Loan Sold Date is derived off the Financing=='Sold'
+    flag, so the relabel sticks without breaking Loan Sold Date. Called on Term Loan and
+    again on Term Asset so the taxonomy cascades to the child assets.
+    """
+    if df is None or df.empty or not ssr_keys or "_deal_key" not in df.columns:
+        return df
+    mask = df["_deal_key"].astype("string").isin(ssr_keys)
+    if "Portfolio" in df.columns:
+        df["Portfolio"] = df["Portfolio"].mask(mask, TERM_SOLD_SERVICING_RETAINED_SEGMENT)
+    if "Financing" in df.columns:
+        df["Financing"] = df["Financing"].mask(mask, TERM_SOLD_SERVICING_RETAINED_SEGMENT)
+    return df
 
 
 def _id_key_no_leading_zeros_scalar(val) -> str:
@@ -5930,6 +5978,12 @@ def _build_term_loan_salesforce_fallback(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
+    # SSR taxonomy: Sold + Berkadia-serviced term deals display Portfolio = Financing =
+    # 'Sold Servicing Retained' (verified 384/384). Runs after the carry-forward so last
+    # week's 'Sold Term'/'Sold' is overridden, and after Loan Sold Date (derived above off
+    # Financing=='Sold'). The deal-key set drives the Term Asset cascade in build_term_asset.
+    out = _apply_term_sold_servicing_retained(out, _term_sold_servicing_retained_deal_keys(sf_term))
+
     # Re-apply current/modified SF maturity after prior manual carry-forward.
     # The prior workbook is only a fallback for Maturity Date; it should not block
     # maturity changes after loan modifications/extensions.
@@ -6499,6 +6553,19 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
             out.get("Financing_loan", pd.Series([pd.NA] * len(out), index=out.index)),
         )
         out = out.drop(columns=["Financing_loan"], errors="ignore")
+
+    # SSR taxonomy cascade: Term Asset inherits the parent deal's Portfolio/Financing, but
+    # the prior Term Asset carry-forward wins over the Term Loan value via
+    # coalesce_report_display_first. Derive the SSR deal set from the built Term Loan
+    # (Portfolio == 'Sold Servicing Retained') and force it onto the child assets.
+    if "Portfolio" in tl.columns:
+        _ssr_keys = set(
+            tl.loc[
+                tl["Portfolio"].astype("string").str.strip().eq(TERM_SOLD_SERVICING_RETAINED_SEGMENT),
+                "_deal_key",
+            ].dropna().astype(str).tolist()
+        )
+        out = _apply_term_sold_servicing_retained(out, _ssr_keys)
 
     # Term Asset "2Q26 Special Loans List " mirrors the Term Loan special value by
     # deal (the report uses XLOOKUP into Term Loan). Map it from whichever Term Loan
