@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_30_V47_LOAN_COMMITMENT_SERVICER_STATUS_ASIS"
+APP_BUILD_VERSION = "ALR_FIX_2026_07_20_V48_BRIDGE_ASSET_UPB_PER_ASSET_REVERT"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -5709,31 +5709,15 @@ def build_bridge_asset(
     )
     allocated_fallback = pd.to_numeric(pd.Series(allocated_fallback, index=out.index), errors="coerce")
 
-    # UPB allocation fix (V46): for any deal that carries a FRESH servicer/SF loan-level
-    # UPB, the official report distributes that loan UPB across the deal's assets pro-rata
-    # by SF Funded Amount, assigning $0 to every zero-funded asset. The prior per-asset
-    # path (funded amount / Property Current_UPB__c) both (a) leaked a value onto
-    # zero-funded assets -- e.g. deal 34733's 6 assets showed a value where the report
-    # shows 0 -- and (b) never scaled the deal total to the servicer UPB, so paid-down
-    # deals (e.g. 39268) summed to Sum(funded) instead of the servicer number. Deals
-    # WITHOUT a fresh loan UPB (prior-only / carried-forward late-stage) have no fresh
-    # source here, so the gate stays off and their existing asset-level / prior
-    # carry-forward behavior is preserved unchanged. Validated vs 20260629 official:
-    # Bridge Asset UPB cell mismatches 350 -> 41; the 44 prior-only deals are untouched.
-    fresh_loan_upb_row = sf_loan_upb.fillna(0).gt(0) | servicer_file_upb.fillna(0).gt(0)
-    deal_has_fresh_loan_upb = (
-        fresh_loan_upb_row.groupby(out["_deal_key"]).transform("max").fillna(False).astype(bool)
-    )
-    funded_share_alloc = pd.to_numeric(
-        out["_loan_upb_for_alloc"] * (out["_funded_weight"] / out["_funded_weight_sum"]),
-        errors="coerce",
-    )
-    use_funded_alloc = (
-        deal_has_fresh_loan_upb
-        & out["_funded_weight_sum"].fillna(0).gt(0)
-        & pd.to_numeric(out["_loan_upb_for_alloc"], errors="coerce").fillna(0).gt(0)
-    )
-
+    # V48: the Bridge Asset UPB is the asset's OWN balance (asset_level_upb above),
+    # NOT a funded-weighted split of the loan UPB. The 7/20 official report proves
+    # this: assets with identical SF Funded Amount carry different per-asset UPB that
+    # sum to the loan total (e.g. deal 40477). The earlier V46 override replaced the
+    # correct per-asset values with a uniform funded-weighted allocation, which matched
+    # by coincidence at one snapshot but flattened every unevenly-paid-down multi-asset
+    # deal (regression: Bridge Asset UPB mismatches jumped to 1,301 on the 7/17 build).
+    # allocated_fallback (funded-weighted) stays below as the genuine LAST resort, used
+    # only when a deal has no asset-level balance at all.
     out[upb_col] = pd.to_numeric(asset_level_upb, errors="coerce")
     out[upb_col] = out[upb_col].where(out[upb_col].notna(), allocated_fallback)
 
@@ -5742,11 +5726,6 @@ def build_bridge_asset(
         ~((reo_mask | late_stage_mask) & (current_upb_series.isna() | current_upb_series.le(0))),
         prev_asset_upb_vals,
     )
-
-    # Fresh-UPB deals: funded-weighted allocation of the servicer loan UPB is the final
-    # word (zero-funded -> 0), applied AFTER the late-stage/REO prev tail so the
-    # intentional zeros are not clobbered back to a prior per-asset value.
-    out[upb_col] = funded_share_alloc.where(use_funded_alloc, pd.to_numeric(out[upb_col], errors="coerce"))
 
     # Suspense is servicer-loan-level when the servicer file supplies it. Do not
     # allocate it across every property in the deal, because that double-counts
