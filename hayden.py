@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_06_29_V45_SSR_TAXONOMY_PLUS_ACTIVE_RM_CAF"
+APP_BUILD_VERSION = "ALR_FIX_2026_06_30_V47_LOAN_COMMITMENT_SERVICER_STATUS_ASIS"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -121,6 +121,11 @@ BRIDGE_RT_EXACT = {"acquired bridge loan", "bridge loan", "sab loan", "single as
 BRIDGE_RT_CONTAINS = {"sab", "single asset bridge"}
 TERM_DSCR_TYPES = {"DSCR", "Investor DSCR", "Single Rental Loan"}
 TERM_ALWAYS_INCLUDE_DEALS = {"43422", "43462"}
+# V41: deals that surface in SF_Term but the official report does NOT carry on the Term
+# tab. 20747 is a bridge-to-term refinance that still appears in the Term Salesforce pull
+# (Closed Won, ~$1.4M Statebridge UPB) but real treats it as Bridge-only, so the generic
+# UPB keep would wrongly include it. Force-excluded from the Term Loan/Term Asset population.
+TERM_FORCE_EXCLUDE_DEALS = {"20747"}
 TERM_SPINE_SERVICER_FAMILIES = {"midland", "fci", "berkadia"}
 TERM_SOLD_SERVICING_RETAINED_SEGMENT = "Sold Servicing Retained"
 TERM_SOLD_RETAINED_SEGMENT_VALUES = {
@@ -2258,6 +2263,16 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
         ("Property Status", "Status__c"),
         ("Property Current UPB", "Current_UPB__c"),
     ]
+    # V41: Bridge Loan "Loan Commitment" = SUM of the per-asset Approved Advance Amount Max
+    # (verified deal 33182: 102,500 = 56,000 + 46,500), NOT Opportunity.LOC_Commitment__c
+    # (which returned 10,000,000). Resolve the field defensively so a rename can't break the
+    # rollup SOQL; when absent, Loan Commitment falls back to the spine value below.
+    _aam_field = first_existing_field_name(
+        "Property__c",
+        ["Approved_Advance_Amount_Max__c", "Approved_Max_Advance_Amount__c", "Approved_Advance_Amount__c", "Max_Advance_Amount__c"],
+    )
+    if _aam_field:
+        select_pairs.append(("Approved Advance Amount Max", _aam_field))
     rename_map = {expr: label for label, expr in select_pairs}
 
     where_parts = [
@@ -2289,6 +2304,9 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
     is_active_asset = status.isin(BRIDGE_ACTIVE_PROPERTY_STATUSES)
     df["_active_asset_upb"] = asset_upb.where(is_active_asset, 0.0)
     df["_is_active_asset"] = is_active_asset.astype("int8")
+    _has_aam = "Approved Advance Amount Max" in df.columns
+    if _has_aam:
+        df["_aam"] = pd.to_numeric(df["Approved Advance Amount Max"], errors="coerce")
 
     g = df.groupby("_deal_key", dropna=True)
     out = pd.DataFrame(
@@ -2301,6 +2319,9 @@ def _build_bridge_property_rollup_like() -> pd.DataFrame:
             "Active Asset UPB": pd.to_numeric(g["_active_asset_upb"].sum(min_count=1), errors="coerce"),
         }
     ).reset_index()
+    if _has_aam:
+        _aam_sum = pd.to_numeric(g["_aam"].sum(min_count=1), errors="coerce").rename("Loan Commitment (AAM)").reset_index()
+        out = out.merge(_aam_sum, on="_deal_key", how="left")
     return downcast_numeric_frame(out)
 
 
@@ -2745,9 +2766,10 @@ def _build_am_assignments_like() -> pd.DataFrame:
 def _build_active_rm_like() -> pd.DataFrame:
     # Active RM = the deal's CAF Originator (loan officer) is an active Salesforce user.
     # Verified 6/29 same-day: per-originator deterministic across 60 originators (zero
-    # split). The discriminator is the CAF Originator lookup's IsActive, NOT the record
-    # Owner (Owner can be an active ops user even when the originator is inactive). Resolve
-    # the CAF Originator User lookup defensively; fall back to Owner.IsActive if absent.
+    # split) -- e.g. all 110 'N' deals share originator Dan Niemeyer (inactive). The
+    # discriminator is the CAF Originator lookup's IsActive, NOT the record Owner (Owner
+    # can be an active ops user even when the originator is inactive). Resolve the CAF
+    # Originator User lookup defensively; fall back to Owner.IsActive only if it is absent.
     _caf_field = first_existing_field_name(
         "Opportunity",
         ["CAF_Originator__c", "CAF_Originator_User__c", "CAF_Loan_Originator__c", "Originator__c", "Loan_Originator__c"],
@@ -3192,7 +3214,7 @@ def _bridge_bucket_from_days(days_past_due) -> Optional[str]:
     except Exception:
         return None
     if days >= 90:
-        return "90 + DAYS"
+        return "90 +  DAYS"
     if days >= 60:
         return "60 - 89 DAYS"
     if days >= 30:
@@ -3201,7 +3223,9 @@ def _bridge_bucket_from_days(days_past_due) -> Optional[str]:
 
 
 def _bridge_status_severity(status) -> int:
-    s = clean_text(status).upper()
+    # Collapse internal whitespace so the double-space report label "90 +  DAYS" matches
+    # the single-space map keys below (the displayed label carries a double space).
+    s = re.sub(r"\s+", " ", clean_text(status).upper())
     order = {
         "CURRENT": 0,
         "CURRENT": 0,
@@ -3219,7 +3243,7 @@ def _bridge_status_severity(status) -> int:
 
 
 def _bridge_bucket_to_report_label(bucket, days_past_due=np.nan):
-    s = clean_text(bucket).upper()
+    s = re.sub(r"\s+", " ", clean_text(bucket).upper())
     try:
         days = float(days_past_due)
     except Exception:
@@ -3289,7 +3313,7 @@ def _guess_days_past_due(next_payment_date, run_date: date) -> float:
 
 
 def _guess_days_from_bridge_bucket(status) -> float:
-    s = clean_text(status).upper()
+    s = re.sub(r"\s+", " ", clean_text(status).upper())
     mapping = {
         "CURRENT": 0.0,
         "DQ 1-29": 14.0,
@@ -3319,7 +3343,9 @@ def normalize_bridge_servicer_status(raw_status, next_payment_date, run_date: da
         if "reo" in txt_compact:
             return "REO"
         if any(tok in txt_compact for tok in ["90", "120", "180", "nonperform", "default", "foreclos", "serious delin"]):
-            return "90 + DAYS"
+            # Official report label carries a DOUBLE space ("90 +  DAYS"); matching it
+            # exactly clears the recurring BA Servicer Status whitespace mismatch (V41).
+            return "90 +  DAYS"
         if any(tok in txt_compact for tok in ["60", "61", "89", "2 month"]):
             return "60 - 89 DAYS"
         if any(tok in txt_compact for tok in ["30", "31", "59", "1 month"]):
@@ -3451,11 +3477,17 @@ def _term_report_keep_mask(
         is_reo = is_reo | pd.Series(extra_reo_mask, index=stage.index, copy=False).fillna(False).astype(bool)
     is_sold = stage.eq("Sold")
     positive_upb_keep = current_upb.gt(0) & ~is_sold
-    preboarding_keep = stage.isin(TERM_PREBOARDING_STAGES) & (current_upb.gt(0) | loan_amount.gt(0))
     # Do not keep zero-UPB REO / payoff-style term deals solely because Stage is REO.
     # Prior workbook carry-forward must not reintroduce current terminal zero-balance loans.
     reo_positive_keep = is_reo & current_upb.gt(0)
-    keep = (reo_positive_keep | sold_retained | positive_upb_keep | preboarding_keep) & ~is_paid_off & ~is_reo_sold
+    # V41: a Sold deal with no balance (Stage=='Sold' AND UPB<=0, e.g. deal 37638) is NOT
+    # carried on the report -- exclude it even when a sold-servicing-retained flag is set.
+    sold_zero = is_sold & ~current_upb.gt(0)
+    # V41: pre-funding deals ('Approved by Committee' / 'Purchased') are NOT on the report
+    # (verified 6/29: 15 of 18 extras were Approved-by-Committee). The former preboarding_keep
+    # that admitted them on Loan-Amount-only is removed; TERM_ALWAYS_INCLUDE_DEALS still
+    # force-keeps the two documented exceptions downstream. `loan_amount` is now unused here.
+    keep = (reo_positive_keep | sold_retained | positive_upb_keep) & ~is_paid_off & ~is_reo_sold & ~sold_zero
     return keep.fillna(False)
 
 
@@ -4179,8 +4211,14 @@ def choose_dominant_servicer_report_date(file_dates: Sequence[date]) -> date:
 
     The completed Active Loan Report uses the dominant external servicer tape date
     from the uploaded filenames. It should not drift to a later workbook run date
-    embedded inside one servicer file. If there is a tie, choose the earlier date
-    because that is the safer/common weekly cutoff.
+    embedded inside one servicer file.
+
+    This report is produced weekly, so the UPB header date is supposed to advance
+    every run; it must never inherit the prior week's date. On a tie, choose the
+    LATEST date: a stale leftover tape from the previous week (e.g. a 6/19 file still
+    sitting in the upload set next to the current 6/26 tapes) must not drag the header
+    backward. The dominant-count vote still wins when one date clearly predominates;
+    only genuine ties resolve to the most recent week.
     """
     counts: Dict[date, int] = {}
     for d in file_dates or []:
@@ -4190,7 +4228,7 @@ def choose_dominant_servicer_report_date(file_dates: Sequence[date]) -> date:
         return today_et()
     top_count = max(counts.values())
     candidates = [d for d, c in counts.items() if c == top_count]
-    return min(candidates)
+    return max(candidates)
 
 
 def build_servicer_lookup(
@@ -5671,6 +5709,31 @@ def build_bridge_asset(
     )
     allocated_fallback = pd.to_numeric(pd.Series(allocated_fallback, index=out.index), errors="coerce")
 
+    # UPB allocation fix (V46): for any deal that carries a FRESH servicer/SF loan-level
+    # UPB, the official report distributes that loan UPB across the deal's assets pro-rata
+    # by SF Funded Amount, assigning $0 to every zero-funded asset. The prior per-asset
+    # path (funded amount / Property Current_UPB__c) both (a) leaked a value onto
+    # zero-funded assets -- e.g. deal 34733's 6 assets showed a value where the report
+    # shows 0 -- and (b) never scaled the deal total to the servicer UPB, so paid-down
+    # deals (e.g. 39268) summed to Sum(funded) instead of the servicer number. Deals
+    # WITHOUT a fresh loan UPB (prior-only / carried-forward late-stage) have no fresh
+    # source here, so the gate stays off and their existing asset-level / prior
+    # carry-forward behavior is preserved unchanged. Validated vs 20260629 official:
+    # Bridge Asset UPB cell mismatches 350 -> 41; the 44 prior-only deals are untouched.
+    fresh_loan_upb_row = sf_loan_upb.fillna(0).gt(0) | servicer_file_upb.fillna(0).gt(0)
+    deal_has_fresh_loan_upb = (
+        fresh_loan_upb_row.groupby(out["_deal_key"]).transform("max").fillna(False).astype(bool)
+    )
+    funded_share_alloc = pd.to_numeric(
+        out["_loan_upb_for_alloc"] * (out["_funded_weight"] / out["_funded_weight_sum"]),
+        errors="coerce",
+    )
+    use_funded_alloc = (
+        deal_has_fresh_loan_upb
+        & out["_funded_weight_sum"].fillna(0).gt(0)
+        & pd.to_numeric(out["_loan_upb_for_alloc"], errors="coerce").fillna(0).gt(0)
+    )
+
     out[upb_col] = pd.to_numeric(asset_level_upb, errors="coerce")
     out[upb_col] = out[upb_col].where(out[upb_col].notna(), allocated_fallback)
 
@@ -5679,6 +5742,11 @@ def build_bridge_asset(
         ~((reo_mask | late_stage_mask) & (current_upb_series.isna() | current_upb_series.le(0))),
         prev_asset_upb_vals,
     )
+
+    # Fresh-UPB deals: funded-weighted allocation of the servicer loan UPB is the final
+    # word (zero-funded -> 0), applied AFTER the late-stage/REO prev tail so the
+    # intentional zeros are not clobbered back to a prior per-asset value.
+    out[upb_col] = funded_share_alloc.where(use_funded_alloc, pd.to_numeric(out[upb_col], errors="coerce"))
 
     # Suspense is servicer-loan-level when the servicer file supplies it. Do not
     # allocate it across every property in the deal, because that double-counts
@@ -5743,14 +5811,16 @@ def build_bridge_asset(
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
         bridge_asset_carry_forward_first = {
-            "Portfolio", "Segment", "Strategy Grouping", "REO Date", "Active RM",
+            "Portfolio", "Segment", "Strategy Grouping", "REO Date",
             "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
-            "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
-            "Construction Mgr.", "CM Assigned Date", "Remedy Plan", "Delinquency Notes",
-            # NOTE (V42): "Maturity Status" REVERTED back to carry-forward-first -- the live
-            # Property__c.Maturity_Status__c value regressed BA Maturity Status 16 -> 23 vs
-            # same-day real (prior workbook value matched better).
-            "Maturity Status", "Title Company", "Tax Commentary",
+            "Remedy Plan", "Delinquency Notes",
+            # V41: Active RM, the Asset/Construction Manager assignments + their dates, and
+            # Maturity Status are LIVE Salesforce values and must NOT be carry-forward-first.
+            # A reassignment (e.g. the 2026-06-23 Cole Smith Special-Asset move on deals
+            # 54127/54129/54130/54131/54180) would otherwise be pinned to last week's stale
+            # name/date. Fresh SF wins; the prior workbook still backfills via the SF-first
+            # else branch when SF has no value for an asset.
+            "Title Company", "Tax Commentary",
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
@@ -5769,6 +5839,14 @@ def build_bridge_asset(
                 else:
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
+
+    # SA Loan (Y/N) depends on Asset Manager 1, which the SF-first carry-forward above may
+    # have just finalized (Cole Smith reassignment, or a prior-workbook backfill of an SA
+    # manager). Recompute from the FINAL Asset Manager 1 -- the earlier compute (~line 5532)
+    # ran before the carry-forward. The materializer keeps this value as-is.
+    if "Asset Manager 1" in out.columns:
+        _am1_final = out["Asset Manager 1"].map(clean_text)
+        out["SA Loan (Y/N)"] = _am1_final.map(lambda x: "Y" if x in _sa_mgrs else "N")
 
     # CAFL re-financed deals: once a deal is re-financed into a CAFL securitization its
     # Segment must read "Securitized Bridge", even if last week's completed report still
@@ -5796,8 +5874,12 @@ def build_bridge_asset(
     # Valuation/value columns must be blank (empty cell) when there is no value --
     # never 0 -- to match the official report. Guards against stale 0s from SF,
     # carry-forward, or numeric coercion.
+    # V41 (Cluster 7.5): "Updated As-Is Value" is intentionally EXCLUDED here -- the
+    # official report carries a genuine 0/appraised value there that the blank-zero rule
+    # was wrongly emptying (190 cells). Only true nulls should read blank for that column,
+    # which is already its natural state, so it is simply left out of the blank-zero list.
     out = blank_zero_value_columns(out, [
-        "Updated ARV", "Updated As-Is Value", "Most Recent ARV", "Most Recent As-Is Value",
+        "Updated ARV", "Most Recent ARV", "Most Recent As-Is Value",
         "Origination ARV", "Origination As-Is Value",
     ])
 
@@ -5978,10 +6060,10 @@ def _build_term_loan_salesforce_fallback(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
-    # SSR taxonomy: Sold + Berkadia-serviced term deals display Portfolio = Financing =
+    # V37 taxonomy: Sold + Berkadia-serviced term deals display Portfolio = Financing =
     # 'Sold Servicing Retained' (verified 384/384). Runs after the carry-forward so last
     # week's 'Sold Term'/'Sold' is overridden, and after Loan Sold Date (derived above off
-    # Financing=='Sold'). The deal-key set drives the Term Asset cascade in build_term_asset.
+    # Financing=='Sold'). The deal-key set drives the Term Asset cascade.
     out = _apply_term_sold_servicing_retained(out, _term_sold_servicing_retained_deal_keys(sf_term))
 
     # Re-apply current/modified SF maturity after prior manual carry-forward.
@@ -6418,6 +6500,13 @@ def build_term_loan(
             except Exception:
                 pass
 
+    # V41: deals SF_Term surfaces but the official Term tab does not carry (e.g. 20747, a
+    # bridge-to-term refi real treats as Bridge-only). Force-excluded last so no enrichment
+    # path can reintroduce them.
+    _force_exclude_keys = set(norm_id_series(pd.Series(list(TERM_FORCE_EXCLUDE_DEALS), dtype="object")).dropna().tolist())
+    if _force_exclude_keys:
+        out = _drop_term_deal_keys(out, _force_exclude_keys)
+
     # Final display guard: the completed report displays Salesforce Servicer
     # Commitment Id by Deal Number. Servicer-file/alternate keys can enrich UPB,
     # but should not replace the visible report ID.
@@ -6554,7 +6643,7 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         )
         out = out.drop(columns=["Financing_loan"], errors="ignore")
 
-    # SSR taxonomy cascade: Term Asset inherits the parent deal's Portfolio/Financing, but
+    # V37 taxonomy cascade: Term Asset inherits the parent deal's Portfolio/Financing, but
     # the prior Term Asset carry-forward wins over the Term Loan value via
     # coalesce_report_display_first. Derive the SSR deal set from the built Term Loan
     # (Portfolio == 'Sold Servicing Retained') and force it onto the child assets.
@@ -6663,6 +6752,15 @@ def build_bridge_loan(
         out["State(s)"] = pd.NA
         out["Active Asset Count"] = 0
         out["Active Asset UPB"] = np.nan
+
+    # V41: Loan Commitment = SUM(per-asset Approved Advance Amount Max) from the property
+    # rollup (verified deal 33182 = 102,500), which supersedes the spine LOC_Commitment__c.
+    # The summed value wins when present/positive; otherwise the spine value is kept.
+    if "Loan Commitment (AAM)" in out.columns:
+        _aam_commit = pd.to_numeric(out["Loan Commitment (AAM)"], errors="coerce")
+        _spine_commit = pd.to_numeric(out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+        out["Loan Commitment"] = _aam_commit.where(_aam_commit.gt(0), _spine_commit)
+        out = out.drop(columns=["Loan Commitment (AAM)"], errors="ignore")
 
     if bridge_asset is not None and not bridge_asset.empty:
         ba = bridge_asset.copy()
