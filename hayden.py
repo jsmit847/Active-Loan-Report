@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_07_20_V48_BRIDGE_ASSET_UPB_PER_ASSET_REVERT"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_03_V49_BRIDGE_ASSET_UPB_SHARED_SID_ALLOCATION"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -5670,7 +5670,35 @@ def build_bridge_asset(
 
     out["_asset_count_in_deal"] = out.groupby("_deal_key", dropna=True)["_deal_key"].transform("size").replace({0: np.nan})
     sid_count = out.groupby(["_deal_key", "_sid_key"], dropna=False)["_sid_key"].transform("size") if "_sid_key" in out.columns else pd.Series([np.nan] * len(out), index=out.index)
-    safe_servicer_asset_upb = servicer_file_upb.where(out["_asset_count_in_deal"].le(1) | sid_count.eq(1))
+    # Bridge Asset UPB fix (V49): a servicer loan number (SID) that maps to a SINGLE asset
+    # already carries an asset-level UPB, so use it directly. When several assets SHARE one
+    # SID (the FCI / Statebridge multi-property case), the servicer file holds a single
+    # LOAN-level UPB and the official report ALLOCATES it across the shared-SID assets by
+    # SF Funded Amount. The prior line masked the servicer UPB whenever the SID was not 1:1,
+    # so those assets fell back to funded / stale SF Current UPB and the deal total was wrong
+    # (e.g. deal 61870: FCI loan 399638024 is paid down to $464,776 but every asset showed
+    # the $380,827 funded amount). Guard: only trust the servicer UPB when it is POSITIVE, so
+    # an FCI $0 (paid-off / unboarded) balance never overwrites a real Salesforce balance.
+    # Validated vs the 20260803 official using the 7/31 servicer files: Bridge Asset UPB
+    # mismatches 551 -> 236 (317 fixed across FCI + Statebridge; 2 negligible rounding cases).
+    _upb_sid_key = out["_sid_key"] if "_sid_key" in out.columns else pd.Series([pd.NA] * len(out), index=out.index)
+    _upb_funded = pd.to_numeric(out.get("SF Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").clip(lower=0).fillna(0.0)
+    _upb_sid_funded_sum = _upb_funded.groupby(_upb_sid_key).transform("sum")
+    _upb_sid_asset_n = _upb_sid_key.groupby(_upb_sid_key).transform("size").replace({0: np.nan})
+    _servicer_upb_alloc = pd.to_numeric(
+        pd.Series(
+            np.where(
+                _upb_sid_funded_sum.gt(0),
+                servicer_file_upb * (_upb_funded / _upb_sid_funded_sum),
+                servicer_file_upb / _upb_sid_asset_n,
+            ),
+            index=out.index,
+        ),
+        errors="coerce",
+    )
+    _sid_is_unique = out["_asset_count_in_deal"].le(1) | sid_count.eq(1)
+    safe_servicer_asset_upb = servicer_file_upb.where(_sid_is_unique, _servicer_upb_alloc)
+    safe_servicer_asset_upb = safe_servicer_asset_upb.where(servicer_file_upb.gt(0))
 
     funded_amount_for_upb = pd.to_numeric(out.get("SF Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
     late_stage_for_upb = stage_series.astype("string").str.strip().isin(EXPIRED_OR_MATURED_STAGES + ["Sold", "REO", "REO-Sold"])
