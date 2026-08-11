@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_03_V49_1_BRIDGE_ASSET_UPB_SHARED_SID_ALLOCATION"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_10_V50_TEXT_NA_ZERO_TO_NA_PLUS_V49_UPB"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -8042,12 +8042,29 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
     out = _apply_report_blank_na_policy(out, sheet_name)
 
     force_blank_headers = REPORT_FORCE_BLANK_HEADERS.get(sheet_name, set())
+    # Numeric/money/date N/A-fill columns keep a legitimate 0 (e.g. Bridge Asset "# of Units"
+    # is genuinely 0 in the official). TEXT N/A-fill columns never carry a real 0, so a value
+    # that arrives as the literal "0"/"0.0" there is a coercion artifact (e.g. Term Loan
+    # Borrower Entity showing "0" where the official shows "N/A"). Treat that "0" as missing so
+    # the N/A fill catches it, without disturbing numeric columns.
+    _numeric_na_cols = (
+        set(REPORT_INTEGER_HEADERS.get(sheet_name, set()))
+        | set(SHEET_MONEY2_HEADERS.get(sheet_name, set()))
+        | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
+        | set(SHEET_DATE_HEADERS.get(sheet_name, set()))
+    )
+    if upb_col:
+        _numeric_na_cols.add(upb_col)
     for header in REPORT_NA_FILL_HEADERS.get(sheet_name, set()):
         if header in force_blank_headers:
             continue
         if header in out.columns:
             ser = pd.Series(out[header], index=out.index, dtype="object")
-            out[header] = ser.where(~blankish_mask(ser), "N/A")
+            missing = blankish_mask(ser)
+            if header not in _numeric_na_cols:
+                zero_txt = ser.astype("string").str.strip().isin(["0", "0.0", "0.00"]).fillna(False)
+                missing = missing | zero_txt
+            out[header] = ser.where(~missing, "N/A")
 
     money_headers = set(SHEET_MONEY2_HEADERS.get(sheet_name, set())) | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
     if upb_col:
