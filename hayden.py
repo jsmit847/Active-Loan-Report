@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_03_V49_BRIDGE_ASSET_UPB_SHARED_SID_ALLOCATION"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_03_V49_1_BRIDGE_ASSET_UPB_SHARED_SID_ALLOCATION"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -5683,19 +5683,15 @@ def build_bridge_asset(
     # mismatches 551 -> 236 (317 fixed across FCI + Statebridge; 2 negligible rounding cases).
     _upb_sid_key = out["_sid_key"] if "_sid_key" in out.columns else pd.Series([pd.NA] * len(out), index=out.index)
     _upb_funded = pd.to_numeric(out.get("SF Funded Amount", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").clip(lower=0).fillna(0.0)
-    _upb_sid_funded_sum = _upb_funded.groupby(_upb_sid_key).transform("sum")
-    _upb_sid_asset_n = _upb_sid_key.groupby(_upb_sid_key).transform("size").replace({0: np.nan})
-    _servicer_upb_alloc = pd.to_numeric(
-        pd.Series(
-            np.where(
-                _upb_sid_funded_sum.gt(0),
-                servicer_file_upb * (_upb_funded / _upb_sid_funded_sum),
-                servicer_file_upb / _upb_sid_asset_n,
-            ),
-            index=out.index,
-        ),
-        errors="coerce",
-    )
+    # groupby transform on a key that contains <NA> (blank Servicer IDs) leaves <NA> in the
+    # result, which makes np.where raise "boolean value of NA is ambiguous". Coerce to plain
+    # float and fill so every mask below is a clean, NA-free boolean.
+    _upb_sid_funded_sum = pd.to_numeric(_upb_funded.groupby(_upb_sid_key).transform("sum"), errors="coerce").fillna(0.0)
+    _upb_sid_asset_n = pd.to_numeric(_upb_sid_key.groupby(_upb_sid_key).transform("size"), errors="coerce")
+    _sid_has_funded = _upb_sid_funded_sum.gt(0)
+    _alloc_by_funded = servicer_file_upb * (_upb_funded / _upb_sid_funded_sum.where(_sid_has_funded))
+    _alloc_equal = servicer_file_upb / _upb_sid_asset_n.where(_upb_sid_asset_n.gt(0))
+    _servicer_upb_alloc = pd.to_numeric(_alloc_by_funded.where(_sid_has_funded, _alloc_equal), errors="coerce")
     _sid_is_unique = out["_asset_count_in_deal"].le(1) | sid_count.eq(1)
     safe_servicer_asset_upb = servicer_file_upb.where(_sid_is_unique, _servicer_upb_alloc)
     safe_servicer_asset_upb = safe_servicer_asset_upb.where(servicer_file_upb.gt(0))
