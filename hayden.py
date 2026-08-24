@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_10_V50_TEXT_NA_ZERO_TO_NA_PLUS_V49_UPB"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_10_V55_BL_VALUATION_DATE_MIN"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -132,6 +132,29 @@ TERM_SOLD_RETAINED_SEGMENT_VALUES = {
     TERM_SOLD_SERVICING_RETAINED_SEGMENT,
     "Sold Servcing Retained",
 }
+
+# ---------------------------------------------------------------------------
+# V43 taxonomy (verified against 20260803 Active Loans, incl. its live formulas)
+# ---------------------------------------------------------------------------
+# The official report renamed the Bridge "Securitized Bridge" segment to
+# "RTL Securitizations" and the RB Loan Type label from "Single Asset Bridge"
+# to "RTL". Bridge Asset!CM6 and CX6 confirm both:
+#   =IF(...,IF($B6="RB","RTL",$BW6))
+#   =IF(OR($BV6="RTL Securitizations",AND($D6="CAFL 2026-R1 CV",...
+BRIDGE_SECURITIZED_SEGMENT = "RTL Securitizations"
+BRIDGE_RB_LOAN_TYPE = "RTL"
+# Sold bridge loans display Financing == Segment == "Sold Servicing Retained"
+# (the report's NPL / special-list formulas gate on $D6<>"Sold Servicing Retained").
+BRIDGE_SOLD_FINANCING = "Sold Servicing Retained"
+BRIDGE_SOLD_SEGMENT = "Sold Servicing Retained"
+BRIDGE_SOLD_FINANCING_VALUES = {"Sold", BRIDGE_SOLD_FINANCING, "Sold Servcing Retained"}
+# Term: Portfolio reads "Sold Term" while Financing reads "Sold Servicing Retained"
+# (Term Loan!J = 'Sold Term' 288 / Term Loan!L = 'Sold Servicing Retained' 288).
+TERM_SOLD_PORTFOLIO = "Sold Term"
+# Quarter-end NPL columns are 3-valued in the official report: REO / NPL / N.
+QEND_NPL_REO_VALUE = "REO"
+QEND_NPL_NPL_VALUE = "NPL"
+QEND_NPL_NONE_VALUE = "N"
 
 ACTIVE_RM_STAGES = [
     "Closed Won", "Expired", "Matured", "Sold", "REO", "REO-Sold",
@@ -263,6 +286,12 @@ REPORT_NA_FILL_HEADERS = {
         "Tax Commentary", "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account",
         "Referral Source Contact", "Servicer Status", "Servicer Maturity Date", "Maturity Difference",
         "Most Recent Valuation Date", "Most Recent As-Is Value", "Most Recent ARV",
+        # "% of Reno Budget" is a hand/upstream-maintained ratio with no Salesforce or
+        # servicer source the build can reach (20260803 shows values >1 on rows with zero
+        # funded renovation, so it is not any funded/approved combination available here).
+        # It is N/A-when-missing in the report, so let the N/A policy fill it rather than
+        # leaving ~4,900 true blanks for the zero-blank QA to flag.
+        "% of Reno Budget",
     },
     "Bridge Loan": {
         "Loan Buyer", "Financing", "Servicer ID", "Servicer", "Borrower Name", "Primary Contact",
@@ -270,6 +299,8 @@ REPORT_NA_FILL_HEADERS = {
         "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account",
         "Referral Source Contact", "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2",
         "AM 2 Assigned Date", "Construction Mgr.", "CM Assigned Date", "AM Commentary",
+        # V54: reads "N/A" when no child asset has a unit count (45 deals on 20260810).
+        "# of Units",
     },
     "Term Loan": {
         "Servicer ID", "Servicer", "Borrower Entity", "Financing", "Loan Buyer", "REO Date",
@@ -313,6 +344,15 @@ WHITESPACE_COLLAPSE_HEADERS = {
     "Bridge Loan": {"Deal Name", "Borrower Name", "Account", "Primary Contact"},
     "Term Loan": {"Deal Name", "Borrower Entity", "Account Name"},
     "Term Asset": {"Address"},
+}
+
+# The inverse of the above: columns whose values are fixed report LABELS whose internal
+# spacing is significant, so the generic text-display collapse must not touch them.
+# Bridge Asset Servicer Status is the case that matters -- the official report's 90-day
+# bucket is literally "90 +  DAYS" with a double space, and normalize_text_display_scalar
+# was squashing it to "90 + DAYS" on every one of those rows.
+PRESERVE_INTERNAL_WHITESPACE_HEADERS = {
+    "Bridge Asset": {"Servicer Status"},
 }
 
 SHEET_MONEY2_HEADERS = {
@@ -462,64 +502,81 @@ TERM_ASSET_FROM_TERM_ASSET_REPORT = {
 }
 
 
+# Formula text is transcribed verbatim from the 20260803 official report's own row 6
+# (read back with openpyxl data_only=False), so the letters below are the report's, not a
+# re-derivation. Bridge Asset shifted +1 from BO ("% of Reno Budget", col 67) onward
+# relative to the previous build. "{qlabel}" is substituted with the running quarter
+# ("Q3") at seed time by _resolve_formula_override.
 DRAFT_FORMULA_OVERRIDES = {
     "Bridge Asset": {
-        "SF Funded Amount": "=+$BK6+$BM6+$BP6",
-        "Loan Type": '=IF($B6="5A","5A Bridge",IF($B6="TPO","Purchased Bridge",IF($B6="RB","Single Asset Bridge",$BV6)))',
-        "CV Maturity Date": '=IF(OR($BV6="Credit Line",$BW6="Line of Credit"),$AG6,$AE6)',
-        "Maturity Difference": '=IFERROR($CM6-$CJ6,"N/A")',
-        "Maturity Date": '=IF($CJ6<>"N/A",$CJ6,$CM6)',
-        "Days to Maturity": "=+$CO6-$CP$4",
-        "Days Past Due": "=+$CQ$4-$AC6",
-        "DQ Status": '=IF($BC6<>"N/A","REO",IF(AND($CQ6>0,$CQ6<30),"DQ 1-29",IF(AND($CQ6>=30,$CQ6<60),"DQ 30-59",IF(AND($CQ6>=60,$CQ6<90),"DQ 60-89",IF($CQ6>=90,"DQ 90+","Current")))))',
+        "SF Funded Amount": "=+$BK6+$BM6+$BQ6",
+        "Loan Type": '=IF($B6="5A","5A Bridge",IF($B6="TPO","Purchased Bridge",IF($B6="RB","RTL",$BW6)))',
+        "CV Maturity Date": '=IF(OR($BW6="Credit Line",$BX6="Line of Credit"),$AG6,$AE6)',
+        "Maturity Difference": '=IFERROR($CN6-$CK6,"N/A")',
+        "Maturity Date": '=IF($CK6<>"N/A",$CK6,$CN6)',
+        "Days to Maturity": "=+$CP6-$CQ$4",
+        "Days Past Due": "=+$CR$4-$AC6",
+        "DQ Status": '=IF($BC6<>"N/A","REO",IF(AND($CR6>0,$CR6<30),"DQ 1-29",IF(AND($CR6>=30,$CR6<60),"DQ 30-59",IF(AND($CR6>=60,$CR6<90),"DQ 60-89",IF($CR6>=90,"DQ 90+","Current")))))',
         "Most Recent Valuation Date": '=IF($BH6<>"N/A",$BH6,$BD6)',
         "Most Recent As-Is Value": '=IF($BH6<>"N/A",$BI6,$BE6)',
         "Most Recent ARV": '=IF($BH6<>"N/A",$BJ6,$BF6)',
-        "Needs NPL Value": '=IF(AND($DE6="Y",$CS6<$CV$4),"Y","N")',
-        "Securitized (Y/N)": '=IF(OR($BU6="Securitized Bridge",AND($D6="CAFL 2026-R1 CV",$BU6="Legacy")),"Y","N")',
-        "SSP JV (Y/N)": '=IF($BU6="SSP","Y","N")',
-        "CPP JV (Y/N)": '=IF($BU6="CPP JV","Y","N")',
-        "Oaktree JV (Y/N)": '=IF($BU6="Oaktree JV","Y","N")',
-        "Legacy (Y/N)": '=IF($BU6="Legacy","Y","N")',
-        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CP:$CP,$E:$E,$E6)<0,"Y","N")',
-        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CQ:$CQ,$E:$E,$E6)>=45,"Y","N")',
+        "Needs NPL Value": '=IF(AND($D6<>"Sold Servicing Retained",OR($DF6="NPL",$DF6="REO"),$CT6<$CW$4),"Y","N")',
+        "Securitized (Y/N)": '=IF(OR($BV6="RTL Securitizations",AND($D6="CAFL 2026-R1 CV",$BV6="Legacy")),"Y","N")',
+        "SSP JV (Y/N)": '=IF($BV6="SSP","Y","N")',
+        "CPP JV (Y/N)": '=IF($BV6="CPP JV","Y","N")',
+        "Oaktree JV (Y/N)": '=IF($BV6="Oaktree JV","Y","N")',
+        "Legacy (Y/N)": '=IF($BV6="Legacy","Y","N")',
+        "Matured Loan (YN)": '=IF(_xlfn.MINIFS($CQ:$CQ,$E:$E,$E6)<0,"Y","N")',
+        "DQ 45+ Loan (Y/N)": '=IF(_xlfn.MAXIFS($CR:$CR,$E:$E,$E6)>=45,"Y","N")',
         "SA Loan (Y/N)": "=IFERROR(VLOOKUP($AL6,'Strategy Groupings'!$F$4:$G$14,2,0),\"N\")",
-        "__QEND_NPL_YN__": '=IF(AND($D6<>"Sold",_xlfn.MINIFS($AC:$AC,$E:$E,$E6)<$DE$4),"Y","N")',
-        "__SPECIAL_LIST__": '=IF(AND($D6<>"Sold",OR($DA6="Y",$DB6="Y",$DC6="Y",$DD6="Y")),"Y","N")',
+        "__QEND_NPL_REO__": '=IF(AND($D6<>"Sold Servicing Retained",$CS6="REO"),"REO",IF(AND($D6<>"Sold Servicing Retained",_xlfn.MINIFS($AC:$AC,$E:$E,$E6)<=$DF$4),"NPL","N"))',
+        "__SPECIAL_LIST__": '=IF(AND($D6<>"Sold Servicing Retained",OR($DB6="Y",$DC6="Y",$DD6="Y",$DE6="Y",OR($DF6="NPL",$DF6="REO"))),"Y","N")',
     },
     "Bridge Loan": {
         "Days Past Due": "=+$V$4-$U6",
     },
     "Term Loan": {
-        # Column letters shift +1 from "Loan Sold Date" inserted at col 15 (O):
-        #   Next Payment Date S->T(20), REO Date->U(21), Days Past Due->V(22),
-        #   DQ Status->W(23), __RUN_DT__ U4->V4, __QEND__/threshold AE->AF(32),
-        #   SFR label AF->AG(33), MF label AG->AH(34).
         "Days Past Due": "=+$V$4-$T6",
         "DQ Status": '=IF($U6<>"N/A","REO",IF(AND($V6>0,$V6<30),"DQ 1-29",IF(AND($V6>=30,$V6<60),"DQ 30-59",IF(AND($V6>=60,$V6<90),"DQ 60-89",IF($V6>=90,"DQ 90+","Current")))))',
-        "__SPECIAL_LIST__": '=IF(AND(OR($J6="Active Term",$J6="DSCR"),$T6<=$AF$4,$W6<>"REO"),"Q2 NPL",IF(AND(OR($J6="Active Term",$J6="DSCR"),$W6="REO"),"Term REO",IF(AND($J6="Securitized Term",$W6="REO"),"CAFL REO",IF(AND(OR($J6="Active Term",$J6="DSCR"),$V6>=45,$W6<>"REO"),"DQ 45+","N/A"))))',
+        # V52 (20260810): the "CAFL REO" branch (Securitized Term + REO) was REMOVED from
+        # the official formula. 20260810 Term Loan!AF6 yields only N/A / Q3 NPL / Term REO /
+        # DQ 45+, and the tab carries zero "CAFL REO" cells (1,018 N/A, 12 Q3 NPL, 1 Term
+        # REO). Securitized-Term REO deals now fall through to N/A.
+        "__SPECIAL_LIST__": '=IF(AND(OR($J6="Active Term",$J6="DSCR"),$T6<=$AF$4,$W6<>"REO"),"{qlabel} NPL",IF(AND(OR($J6="Active Term",$J6="DSCR"),$W6="REO"),"Term REO",IF(AND(OR($J6="Active Term",$J6="DSCR"),$V6>=45,$W6<>"REO"),"DQ 45+","N/A")))',
         "SFR Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AG$4)",
         "MF Allocation": "=SUMIFS('Term Asset'!$S:$S,'Term Asset'!$B:$B,'Term Loan'!$B6,'Term Asset'!$O:$O,'Term Loan'!AH$4)",
         "Strategy Grouping": '=IF($AG6>$AH6,"Single Family Rental","Multifamily")',
     },
     "Term Asset": {
-        # Term Loan UPB shifted P(16)->Q(17); Term Loan special-list AE(31)->AF(32).
-        "__UPB__": "=+(S6/SUMIFS(S:S,B:B,B6))*_xlfn.XLOOKUP(B6,'Term Loan'!B:B,'Term Loan'!Q:Q)",
+        "__UPB__": "=+(S6/SUMIFS($S:$S,$B:$B,$B6))*_xlfn.XLOOKUP($B6,'Term Loan'!$B:$B,'Term Loan'!$Q:$Q)",
         "__SPECIAL_LIST__": "=_xlfn.XLOOKUP($B6,'Term Loan'!$B:$B,'Term Loan'!$AF:$AF)",
     },
 }
 
+
+def _resolve_formula_override(formula: str, q_end: date) -> str:
+    """Substitute run-dependent literals inside an override formula."""
+    if not isinstance(formula, str) or "{qlabel}" not in formula:
+        return formula
+    return formula.replace("{qlabel}", f"Q{(q_end.month - 1) // 3 + 1}")
+
+
 SHEET_BLUEPRINTS = {
+    # Bridge Asset layout matches 20260803: "% of Reno Budget" sits at BO (67) between
+    # Renovation Holdback Remaining (BN) and Interest Allocation (BP), so every column
+    # from 67 on is +1 versus the previous build. Last blue column is now CK (89).
     "Bridge Asset": {
-        "row1": {c: "CALC" for c in [35] + list(range(90, 111))},
+        "row1": {c: "CALC" for c in [35] + list(range(91, 112))},
         "row2": {2: "Bridge Asset Level Data"},
-        "row3": {109: "__QEND__"},
+        # B3 continues the report-date banner chain the official report carries across the
+        # data tabs (Bridge Summary -> Bridge Loan -> Bridge Asset -> Term Loan -> Term Asset).
+        "row3": {2: "=+'Bridge Loan'!$B$3", 110: "__QEND__"},
         "row4": {
             36: "__SUBTOTAL__",
-            94: "__RUN_DT__",
-            95: "=+$CP$4",
-            100: "=EDATE(DE3,-6)",
-            109: "=+$DE$3-90",
+            95: "__RUN_DT__",
+            96: "=+$CQ$4",
+            101: "=EDATE(DF3,-6)",
+            110: "=+$DF$3-90",
         },
         "row5": {
             2: "Portfolio", 3: "Loan Buyer", 4: "Financing", 5: "Deal Number",
@@ -541,26 +598,31 @@ SHEET_BLUEPRINTS = {
             58: "Origination ARV", 59: "Most Recent Appraisal Order Date", 60: "Updated Valuation Date",
             61: "Updated As-Is Value", 62: "Updated ARV", 63: "Initial Disbursement Funded",
             64: "Renovation Holdback", 65: "Renovation Holdback Funded", 66: "Renovation Holdback Remaining",
-            67: "Interest Allocation", 68: "Interest Allocation Funded", 69: "Title Company",
-            70: "Tax Due Date", 71: "Tax Frequency", 72: "Tax Commentary", 73: "Segment",
-            74: "Product Type", 75: "Product Sub-Type", 76: "Transaction Type", 77: "Project Strategy",
-            78: "Strategy Grouping", 79: "Property Type", 80: "Originator", 81: "Active RM",
-            82: "Deal Intro Sub-Source", 83: "Referral Source Account", 84: "Referral Source Contact",
-            85: "Loan Stage", 86: "Property Status", 87: "Servicer Status", 88: "Servicer Maturity Date",
-            90: "Loan Type", 91: "CV Maturity Date", 92: "Maturity Difference", 93: "Maturity Date",
-            94: "Days to Maturity", 95: "Days Past Due", 96: "DQ Status", 97: "Most Recent Valuation Date",
-            98: "Most Recent As-Is Value", 99: "Most Recent ARV", 100: "Needs NPL Value",
-            101: "Securitized (Y/N)", 102: "SSP JV (Y/N)", 103: "CPP JV (Y/N)", 104: "Oaktree JV (Y/N)",
-            105: "Legacy (Y/N)", 106: "Matured Loan (YN)", 107: "DQ 45+ Loan (Y/N)", 108: "SA Loan (Y/N)",
-            109: "__QEND_NPL_YN__", 110: "__SPECIAL_LIST__",
+            67: "% of Reno Budget",
+            68: "Interest Allocation", 69: "Interest Allocation Funded", 70: "Title Company",
+            71: "Tax Due Date", 72: "Tax Frequency", 73: "Tax Commentary", 74: "Segment",
+            75: "Product Type", 76: "Product Sub-Type", 77: "Transaction Type", 78: "Project Strategy",
+            79: "Strategy Grouping", 80: "Property Type", 81: "Originator", 82: "Active RM",
+            83: "Deal Intro Sub-Source", 84: "Referral Source Account", 85: "Referral Source Contact",
+            86: "Loan Stage", 87: "Property Status", 88: "Servicer Status", 89: "Servicer Maturity Date",
+            91: "Loan Type", 92: "CV Maturity Date", 93: "Maturity Difference", 94: "Maturity Date",
+            95: "Days to Maturity", 96: "Days Past Due", 97: "DQ Status", 98: "Most Recent Valuation Date",
+            99: "Most Recent As-Is Value", 100: "Most Recent ARV", 101: "Needs NPL Value",
+            102: "Securitized (Y/N)", 103: "SSP JV (Y/N)", 104: "CPP JV (Y/N)", 105: "Oaktree JV (Y/N)",
+            106: "Legacy (Y/N)", 107: "Matured Loan (YN)", 108: "DQ 45+ Loan (Y/N)", 109: "SA Loan (Y/N)",
+            110: "__QEND_NPL_REO__", 111: "__SPECIAL_LIST__",
         },
         "subtotal_col": 36,
     },
     "Bridge Loan": {
         "row1": {22: "CALC"},
         "row2": {2: "Bridge Loan Level Data"},
-        "row3": {},
-        "row4": {22: "=+'Bridge Asset'!$CP$4", 26: "__SUBTOTAL__"},
+        "row3": {2: "=+'Bridge Summary'!$B$3"},
+        # Bridge Asset's run-date anchor moved CP4 -> CQ4 with the "% of Reno Budget" insert.
+        "row4": {22: "=+'Bridge Asset'!$CQ$4", 26: "__SUBTOTAL__"},
+        # 20260803 has NO "Remaining Commitment" on Bridge Loan: AA (Suspense Balance) is
+        # followed directly by AB (Most Recent Valuation Date), so the tab ends at BG
+        # (AM Commentary, col 59) rather than BH.
         "row5": {
             2: "Portfolio", 3: "Loan Buyer", 4: "Financing", 5: "Deal Number", 6: "Servicer ID",
             7: "Servicer", 8: "Deal Name", 9: "Borrower Name", 10: "Account", 11: "Do Not Lend (Y/N)",
@@ -568,24 +630,24 @@ SHEET_BLUEPRINTS = {
             16: "Origination Date", 17: "Last Funding Date", 18: "Original Maturity Date",
             19: "Current Maturity Date", 20: "Next Advance Maturity Date", 21: "Next Payment Date",
             22: "Days Past Due", 23: "Loan Level Delinquency", 24: "Loan Commitment",
-            25: "Active Funded Amount", 26: "__UPB__", 27: "Suspense Balance", 28: "Remaining Commitment",
-            29: "Most Recent Valuation Date", 30: "Most Recent As-Is Value", 31: "Most Recent ARV",
-            32: "Initial Disbursement Funded", 33: "Renovation Holdback", 34: "Renovation HB Funded",
-            35: "Renovation HB Remaining", 36: "Interest Allocation", 37: "Interest Allocation Funded",
-            38: "Loan Stage", 39: "Segment", 40: "Loan Type", 41: "Product Type", 42: "Product Sub Type",
-            43: "Transaction Type", 44: "Project Strategy", 45: "Strategy Grouping", 46: "CV Originator",
-            47: "Active RM", 48: "Deal Intro Sub-Source", 49: "Referral Source Account",
-            50: "Referral Source Contact", 51: "__QEND_NPL__", 52: "Needs NPL Value",
-            53: "Special Focus (Y/N)", 54: "Asset Manager 1", 55: "AM 1 Assigned Date",
-            56: "Asset Manager 2", 57: "AM 2 Assigned Date", 58: "Construction Mgr.",
-            59: "CM Assigned Date", 60: "AM Commentary",
+            25: "Active Funded Amount", 26: "__UPB__", 27: "Suspense Balance",
+            28: "Most Recent Valuation Date", 29: "Most Recent As-Is Value", 30: "Most Recent ARV",
+            31: "Initial Disbursement Funded", 32: "Renovation Holdback", 33: "Renovation HB Funded",
+            34: "Renovation HB Remaining", 35: "Interest Allocation", 36: "Interest Allocation Funded",
+            37: "Loan Stage", 38: "Segment", 39: "Loan Type", 40: "Product Type", 41: "Product Sub Type",
+            42: "Transaction Type", 43: "Project Strategy", 44: "Strategy Grouping", 45: "CV Originator",
+            46: "Active RM", 47: "Deal Intro Sub-Source", 48: "Referral Source Account",
+            49: "Referral Source Contact", 50: "__QEND_NPL__", 51: "Needs NPL Value",
+            52: "Special Focus (Y/N)", 53: "Asset Manager 1", 54: "AM 1 Assigned Date",
+            55: "Asset Manager 2", 56: "AM 2 Assigned Date", 57: "Construction Mgr.",
+            58: "CM Assigned Date", 59: "AM Commentary",
         },
         "subtotal_col": 26,
     },
     "Term Loan": {
         "row1": {22: "CALC", 23: "CALC", 32: "CALC"},
         "row2": {2: "Term Loan Level Data", 32: "__QEND__"},
-        "row3": {},
+        "row3": {2: "=+'Bridge Asset'!$B$3"},
         "row4": {
             17: "__SUBTOTAL__", 22: "__RUN_DT__", 32: "=+$AF$2-90",
             33: "Single Family Rental", 34: "Multifamily",
@@ -605,7 +667,7 @@ SHEET_BLUEPRINTS = {
     "Term Asset": {
         "row1": {20: "CALC", 22: "CALC"},
         "row2": {2: "Term Asset Level Data"},
-        "row3": {},
+        "row3": {2: "=+'Term Loan'!$B$3"},
         "row4": {20: "__SUBTOTAL__"},
         "row5": {
             2: "Deal Number", 3: "Asset ID", 4: "Portfolio", 5: "Segment", 6: "Financing",
@@ -627,7 +689,8 @@ SHEET_BLUEPRINTS = {
 # Term Loan B..AD, Term Asset B..T. Formula columns that fall WITHIN these ranges
 # (e.g. SF Funded Amount, UPB) are still preserved/propagated as live formulas.
 SHEET_BLUE_MAX_COLUMN = {
-    "Bridge Asset": column_index_from_string("CJ"),  # 88
+    # Bridge Asset gained "% of Reno Budget" at BO, so the last blue column is CK (89).
+    "Bridge Asset": column_index_from_string("CK"),  # 89
     "Term Loan": column_index_from_string("AD"),     # 30
     "Term Asset": column_index_from_string("T"),     # 20
 }
@@ -1697,7 +1760,7 @@ def strategy_grouping_from_project_strategy(project_strategy, strategy_map: dict
 def derive_bridge_segment(deal_number, financing, loan_buyer, template_maps: dict):
     # In the Bridge spine, "financing" is sourced from the Warehouse Line, which the
     # official report uses to classify Segment (validated against SF_Bridge):
-    #   startswith "CAFL "       -> Securitized Bridge
+    #   startswith "CAFL "       -> RTL Securitizations  (V43 rename)
     #   startswith "CPP JV"       -> CPP JV
     #   "Churchill Oaktree JV"    -> Oaktree JV
     #   contains "Spruce"         -> SSP
@@ -1710,12 +1773,12 @@ def derive_bridge_segment(deal_number, financing, loan_buyer, template_maps: dic
 
     # Sold (servicing retained) only when there is no warehouse line to classify on.
     if not fin:
-        if buyer or clean_text(financing) == "Sold":
-            return "Sold Servicing Retained"
+        if buyer or clean_text(financing) in BRIDGE_SOLD_FINANCING_VALUES:
+            return BRIDGE_SOLD_SEGMENT
         return "Mortgage Banking"
 
     if u.startswith("CAFL "):
-        return "Securitized Bridge"
+        return BRIDGE_SECURITIZED_SEGMENT
     if u.startswith("CPP JV"):
         return "CPP JV"
     if "CHURCHILL OAKTREE" in u or u == "OAKTREE JV" or "OAKTREE JV" in u:
@@ -3587,8 +3650,26 @@ def _bridge_pick_next_payment_date(
     if BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1:
         same_month_sf = serv.notna() & sf.notna() & serv.dt.year.eq(sf.dt.year) & serv.dt.month.eq(sf.dt.month)
         out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
-        same_month_prior = serv.notna() & prior.notna() & serv.dt.year.eq(prior.dt.year) & serv.dt.month.eq(prior.dt.month)
-        out = out.where(~(same_month_prior & serv.dt.day.eq(1) & prior.dt.day.eq(10)), prior)
+        # V53: these loans bill on the 10th. When the prior completed report carried a
+        # day-10 NPD and the fresh source reports day 1, the official report keeps the 10th
+        # but advances to the FRESH source's month -- e.g. asset 1190539: FCI tape says
+        # 2026-09-01, prior report 2026-08-10, official 2026-09-10. The old rule required
+        # both dates to be in the SAME month, so it could never advance the month.
+        # Deal-uniform on 20260810 (0 of 817 FCI deals split), and lifts Bridge Asset NPD
+        # from 4,327/4,917 to 4,602/4,917 on its own.
+        out = pd.to_datetime(out, errors="coerce")
+        _day10_prior = out.notna() & prior.notna() & out.dt.day.eq(1) & prior.dt.day.eq(10)
+        if bool(_day10_prior.any()):
+            out = out.mask(_day10_prior, out + pd.to_timedelta(9, unit="D"))
+    # V53b: when NEITHER the servicer file nor Salesforce carries a next-payment date, the
+    # official report keeps the prior completed report's value rather than blanking the cell
+    # (e.g. deal 64324's 17 assets and deal 63094's 85 all read 2026-09-10, with no servicer
+    # row and no SF date anywhere on the deal). This is the last resort -- it only fills a
+    # cell that would otherwise be empty. Verified 313/313 on 20260810.
+    out = pd.to_datetime(out, errors="coerce")
+    _prior_only = out.isna() & prior.notna()
+    if bool(_prior_only.any()):
+        out = out.mask(_prior_only, prior)
     # FCI rolls its servicer-file Next Due Date FORWARD to the next scheduled payment
     # even for severely delinquent loans, where the official report keeps the frozen
     # historical NPD (the last real due date). When the FCI servicer NPD is far ahead of
@@ -3657,16 +3738,21 @@ def _apply_term_sold_servicing_retained(df: pd.DataFrame, ssr_keys: Set[str]) ->
     """Relabel the Sold-Servicing-Retained deals' Portfolio and Financing.
 
     `ssr_keys` is the Sold+Berkadia deal-key set. Must run AFTER the prior-workbook
-    carry-forward (coalesce_report_display_first lets last week's 'Sold Term'/'Sold' win
-    over the live derivation) and AFTER Loan Sold Date is derived off the Financing=='Sold'
-    flag, so the relabel sticks without breaking Loan Sold Date. Called on Term Loan and
-    again on Term Asset so the taxonomy cascades to the child assets.
+    carry-forward (coalesce_report_display_first lets last week's value win over the live
+    derivation) and AFTER Loan Sold Date is derived off the Financing=='Sold' flag, so the
+    relabel sticks without breaking Loan Sold Date. Called on Term Loan and again on Term
+    Asset so the taxonomy cascades to the child assets.
+
+    V43: the two columns carry DIFFERENT labels in the official report --
+    Portfolio = 'Sold Term', Financing = 'Sold Servicing Retained' (20260803 Term Loan
+    J/L: 288 each; Term Asset D/F: 6,886 each). The previous build wrote
+    'Sold Servicing Retained' into both, which produced ~7,150 Portfolio mismatches.
     """
     if df is None or df.empty or not ssr_keys or "_deal_key" not in df.columns:
         return df
     mask = df["_deal_key"].astype("string").isin(ssr_keys)
     if "Portfolio" in df.columns:
-        df["Portfolio"] = df["Portfolio"].mask(mask, TERM_SOLD_SERVICING_RETAINED_SEGMENT)
+        df["Portfolio"] = df["Portfolio"].mask(mask, TERM_SOLD_PORTFOLIO)
     if "Financing" in df.columns:
         df["Financing"] = df["Financing"].mask(mask, TERM_SOLD_SERVICING_RETAINED_SEGMENT)
     return df
@@ -4401,6 +4487,12 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
             keep = [
                 c for c in [
                     "Asset ID", "Portfolio", "Segment", "Strategy Grouping", "REO Date", "Active RM",
+                    # V53: "Next Payment Date" MUST be carried forward. _bridge_pick_next_payment_date
+                    # takes a `prior_dates` argument and uses it to preserve the report's day-10
+                    # billing convention, but the column was never extracted here, so `prior` was
+                    # always empty and that whole branch was dead code (654 Bridge Asset NPD
+                    # mismatches against 20260810).
+                    "Next Payment Date",
                     "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
                     "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                     "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
@@ -4428,6 +4520,8 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
         keep = [
             c for c in [
                 "Deal Number", "Portfolio", "Segment", "Strategy Grouping", "Loan Level Delinquency",
+                # V53: same reason as Bridge Asset -- the loan-level day-10 preservation needs this.
+                "Next Payment Date",
                 "Special Focus (Y/N)", "AM Commentary", "3/31 NPL", "Needs NPL Value", "Active RM",
                 "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                 "Construction Mgr.", "CM Assigned Date",
@@ -5605,7 +5699,11 @@ def build_bridge_asset(
 
     base_stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
     out["Financing"] = pd.Series(out.get("Financing", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object")
-    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & base_stage_series.eq("Sold"), "Sold")
+    # V43: sold bridge rows display the full "Sold Servicing Retained" label, not "Sold"
+    # (20260803 Bridge Asset!D: 12 rows). The report's NPL/special-list formulas compare
+    # against that exact string, so writing bare "Sold" both mismatched the cell and
+    # silently disabled the sold exclusion on recalc.
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & base_stage_series.eq("Sold"), BRIDGE_SOLD_FINANCING)
 
     prop_npd = pd.to_datetime(sf_spine.get("Property Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
     opp_npd = pd.to_datetime(sf_spine.get("Opportunity Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
@@ -5785,6 +5883,21 @@ def build_bridge_asset(
     _ba_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
     out["Next Payment Date"] = _bridge_pick_next_payment_date(sf_next_payment, serv_next_payment, prior_npd, servicer_names=_ba_servicer, fpd_dates=sf_first_payment, run_dt=run_dt)
 
+    # V53: an asset with NO servicer-file row and NO Salesforce next-payment date inherits
+    # the deal's date -- the official report shows one NPD for every asset on such a deal
+    # (e.g. deal 63094's 85 assets all read 2026-09-10). Verified 315/315 on 20260810 using
+    # the deal's modal resolved NPD; First Payment Date is the last resort for a brand-new
+    # deal where no sibling has one either. Together with the day-10 rule above this takes
+    # Bridge Asset NPD to 4,914/4,917.
+    _npd_fill = pd.to_datetime(out["Next Payment Date"], errors="coerce")
+    if bool(_npd_fill.isna().any()):
+        _npd_deal_mode = _npd_fill.groupby(out["_deal_key"]).transform(
+            lambda s: s.mode().iloc[0] if len(s.dropna()) and len(s.mode()) else pd.NaT
+        )
+        _npd_fill = _npd_fill.where(_npd_fill.notna(), _npd_deal_mode)
+        _npd_fill = _npd_fill.where(_npd_fill.notna(), pd.to_datetime(sf_first_payment, errors="coerce"))
+        out["Next Payment Date"] = _npd_fill
+
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("_servicer_status_file", blank_obj), out.get("Servicer Status", blank_obj))
     # NOTE (V42): the FCI rolled-forward Servicer Status -> "N/A" gate (former Fix A.2) was
@@ -5852,14 +5965,14 @@ def build_bridge_asset(
         out["SA Loan (Y/N)"] = _am1_final.map(lambda x: "Y" if x in _sa_mgrs else "N")
 
     # CAFL re-financed deals: once a deal is re-financed into a CAFL securitization its
-    # Segment must read "Securitized Bridge", even if last week's completed report still
+    # Segment must read BRIDGE_SECURITIZED_SEGMENT, even if last week's completed report still
     # carried the prior vehicle (e.g. "CPP JV"). The prior-workbook carry-forward above is
     # Segment-first, so it would otherwise pin the stale value. Financing (Warehouse Line)
     # starting with "CAFL " is authoritative here and matches derive_bridge_segment().
     # Securitized (Y/N) and CPP JV (Y/N) are workbook formulas off Segment, so they follow.
     if "Financing" in out.columns and "Segment" in out.columns:
         _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
-        out.loc[_cafl_mask, "Segment"] = "Securitized Bridge"
+        out.loc[_cafl_mask, "Segment"] = BRIDGE_SECURITIZED_SEGMENT
 
     # Normalize curated free-text columns for encoding artifacts (mojibake like "â€™",
     # U+2019/dash variants, _x000D_ carriage returns). Previously only Tax Commentary was
@@ -5910,6 +6023,20 @@ def build_bridge_asset(
         dtype="float64",
     )
     out["Servicer Status"] = coalesce_keep_nonblank(out.get("Servicer Status", blank_obj), status_bucket)
+
+    # A row with no servicer has no servicer status: the official report shows N/A, not a
+    # derived delinquency bucket. Verified exactly on 20260803 Bridge Asset -- Servicer
+    # blank/N/A and Servicer Status N/A coincide on all 400 such rows with no exceptions
+    # in either direction, plus 5 Sold-Servicing-Retained rows that also read N/A. The
+    # previous build back-filled these from Next Payment Date and produced ~400
+    # CURRENT/Performing cells where the report has N/A.
+    _no_servicer = _report_is_blank_or_na(
+        pd.Series(out.get("Servicer", blank_obj), index=out.index, dtype="object")
+    )
+    _sold_serviced = _report_is_sold_financing(out)
+    out["Servicer Status"] = pd.Series(out["Servicer Status"], index=out.index, dtype="object").mask(
+        _no_servicer | _sold_serviced, "N/A"
+    )
 
     # This column must match the visible workbook formula:
     # Initial Disbursement Funded + Renovation Holdback Funded + Interest Allocation Funded.
@@ -6646,14 +6773,43 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
         )
         out = out.drop(columns=["Financing_loan"], errors="ignore")
 
+    # Segment is loan-derived too, and for the same reason: newly appended assets carry no
+    # prior Term Asset row. The official tab has ZERO blank Segment cells; the previous
+    # build shipped 152 (exactly its new-asset rows). Fill from the parent Term Loan.
+    if "Segment" in tl.columns:
+        tl_segment = tl[["_deal_key", "Segment"]].drop_duplicates("_deal_key")
+        out = out.merge(tl_segment, on="_deal_key", how="left", suffixes=("", "_loan"))
+        out["Segment"] = coalesce_keep_nonblank(
+            out.get("Segment", pd.Series([pd.NA] * len(out), index=out.index)),
+            out.get("Segment_loan", pd.Series([pd.NA] * len(out), index=out.index)),
+        )
+        out = out.drop(columns=["Segment_loan"], errors="ignore")
+
+    # Grouping drives the Term Loan SFR/MF allocation split, so a blank silently
+    # mis-buckets the parent deal's Strategy Grouping. The official tab has zero blanks.
+    # Property Type resolves it for every new row: Multifamily/Other -> Multifamily,
+    # everything else (SFR, 2-4 Unit, Condo, Townhome, PUD, ...) -> Single Family Rental.
+    # (Mixed Use splits 40/28 in the source data, so the upstream value wins where present
+    # and this only fills what would otherwise ship blank.)
+    _grouping = pd.Series(
+        out.get("Grouping", pd.Series([pd.NA] * len(out), index=out.index)), index=out.index, dtype="object"
+    )
+    _prop_type = _report_text_series_from_col(out, "Property Type")
+    _grouping_guess = pd.Series(["Single Family Rental"] * len(out), index=out.index, dtype="object").mask(
+        _prop_type.isin(["Multifamily", "Other"]), "Multifamily"
+    )
+    out["Grouping"] = coalesce_keep_nonblank(_grouping, _grouping_guess)
+
     # V37 taxonomy cascade: Term Asset inherits the parent deal's Portfolio/Financing, but
     # the prior Term Asset carry-forward wins over the Term Loan value via
     # coalesce_report_display_first. Derive the SSR deal set from the built Term Loan
-    # (Portfolio == 'Sold Servicing Retained') and force it onto the child assets.
+    # (Portfolio == 'Sold Term' in V43; older workbooks carried 'Sold Servicing Retained'
+    # there, so accept both when reading the parent back) and force it onto the assets.
     if "Portfolio" in tl.columns:
+        _ssr_labels = {TERM_SOLD_PORTFOLIO} | TERM_SOLD_RETAINED_SEGMENT_VALUES
         _ssr_keys = set(
             tl.loc[
-                tl["Portfolio"].astype("string").str.strip().eq(TERM_SOLD_SERVICING_RETAINED_SEGMENT),
+                tl["Portfolio"].astype("string").str.strip().isin(_ssr_labels),
                 "_deal_key",
             ].dropna().astype(str).tolist()
         )
@@ -6745,7 +6901,8 @@ def build_bridge_loan(
 
     sold_stage_series = out.get("Loan Stage", pd.Series([pd.NA] * len(out), index=out.index)).astype("string").str.strip()
     out["Financing"] = pd.Series(out.get("Financing", blank_obj), index=out.index, dtype="object")
-    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), "Sold")
+    # V43: mirrors the Bridge Asset label -- "Sold Servicing Retained", not "Sold".
+    out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & sold_stage_series.eq("Sold"), BRIDGE_SOLD_FINANCING)
 
     if bridge_property_rollup is not None and not bridge_property_rollup.empty:
         out = out.merge(bridge_property_rollup, on="_deal_key", how="left")
@@ -6814,7 +6971,11 @@ def build_bridge_loan(
                 "Loan Level Delinquency_active": g.apply(lambda grp: _bridge_loan_rollup_label(grp.get("_bridge_dq_bucket", pd.Series(dtype="object")), grp.get("_bridge_dpd_num", pd.Series(dtype="float")))) if "_bridge_dq_bucket" in ba.columns else pd.Series(dtype="string"),
                 "Active Funded Amount": pd.to_numeric(g["SF Funded Amount"].sum(min_count=1), errors="coerce") if "SF Funded Amount" in ba.columns else np.nan,
                 "Suspense Balance_active": pd.to_numeric(g["Suspense Balance"].sum(min_count=1), errors="coerce") if "Suspense Balance" in ba.columns else np.nan,
-                "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_max_dt),
+                # V55: the official Bridge Loan "Most Recent Valuation Date" is the MINIMUM
+                # (oldest) of the deal's asset valuation dates, not the newest -- it flags how
+                # stale the weakest collateral value is. 993/996 deals against 20260810; MAX
+                # matched only 893. (Consistent with Next Payment Date, which is also a MIN.)
+                "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_min_dt),
                 "Most Recent As-Is Value": pd.to_numeric(g["_roll_recent_asis"].sum(min_count=1), errors="coerce"),
                 "Most Recent ARV": pd.to_numeric(g["_roll_recent_arv"].sum(min_count=1), errors="coerce"),
                 "Initial Disbursement Funded": pd.to_numeric(g["Initial Disbursement Funded"].sum(min_count=1), errors="coerce") if "Initial Disbursement Funded" in ba.columns else np.nan,
@@ -6960,6 +7121,24 @@ def build_bridge_loan(
             prior_bridge_loan_npd = out["_deal_key"].map(prev_bl.dropna(subset=["_deal_key"]).drop_duplicates("_deal_key").set_index("_deal_key")["Next Payment Date"])
     _bl_servicer = coalesce_keep_nonblank(out.get("_servicer_file", pd.Series([pd.NA] * len(out), index=out.index)), out.get("Servicer", pd.Series([pd.NA] * len(out), index=out.index)))
     out["Next Payment Date"] = _bridge_pick_next_payment_date(cur_bridge_loan_npd, serv_bridge_loan_npd, prior_bridge_loan_npd, servicer_names=_bl_servicer, run_dt=run_dt)
+
+    # V54: the official Bridge Loan Next Payment Date is the MINIMUM of the deal's Bridge
+    # Asset next-payment dates -- exact on 996/996 deals against 20260810 (MAX matches 990,
+    # mode 995). This supersedes the loan-level servicer/Salesforce lookup above, which is
+    # kept only as the fallback for a deal whose assets carry no date at all. Rolling up from
+    # the assets also means the asset-level day-10 / prior-report rules propagate to the loan
+    # tab automatically instead of being re-derived from a different source.
+    if bridge_asset is not None and not bridge_asset.empty and "Next Payment Date" in bridge_asset.columns:
+        _ba_npd_roll = pd.to_datetime(bridge_asset["Next Payment Date"], errors="coerce")
+        _ba_dk_roll = (
+            bridge_asset["_deal_key"] if "_deal_key" in bridge_asset.columns
+            else norm_id_series(bridge_asset.get("Deal Number", pd.Series([pd.NA] * len(bridge_asset), index=bridge_asset.index)))
+        )
+        _min_npd_by_deal = _ba_npd_roll.groupby(_ba_dk_roll).min()
+        _rolled_npd = pd.to_datetime(out["_deal_key"].map(_min_npd_by_deal), errors="coerce")
+        out["Next Payment Date"] = _rolled_npd.where(
+            _rolled_npd.notna(), pd.to_datetime(out["Next Payment Date"], errors="coerce")
+        )
     out["Next Advance Maturity Date"] = pd.to_datetime(out.get("_servicer_maturity_file", pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce")
     out["Servicer"] = coalesce_keep_nonblank(out.get("_servicer_file", blank_obj), out.get("Servicer", blank_obj))
 
@@ -7028,13 +7207,13 @@ def build_bridge_loan(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
-    # CAFL re-financed deals: Segment must read "Securitized Bridge" once the deal is
+    # CAFL re-financed deals: Segment must read BRIDGE_SECURITIZED_SEGMENT once the deal is
     # re-financed into a CAFL securitization, overriding the Segment-first carry-forward
     # that would otherwise pin last week's stale vehicle (e.g. "CPP JV"). Mirrors the
     # Bridge Asset fix; Financing (Warehouse Line) startswith "CAFL " is authoritative.
     if "Financing" in out.columns and "Segment" in out.columns:
         _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
-        out.loc[_cafl_mask, "Segment"] = "Securitized Bridge"
+        out.loc[_cafl_mask, "Segment"] = BRIDGE_SECURITIZED_SEGMENT
 
     # Hard-reconcile the loan-level math back to the already-built Bridge Asset rows.
     # This prevents servicer zeroes / wrong rollup fields from breaking loan-level Active Funded Amount or UPB.
@@ -7055,10 +7234,12 @@ def build_bridge_loan(
     out["Needs NPL Value"] = coalesce_keep_nonblank(out.get("Needs NPL Value", blank_obj), pd.Series(["N"] * len(out), index=out.index))
 
     out["Number of Assets"] = pd.to_numeric(out.get("Number of Assets", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-    # # of Units defaults to 0 (not blank) so the baseline backfill cannot resurrect a
-    # stale prior count on deals where Salesforce now reports no units -- the completed
-    # report shows 0 for these, matching the asset rollup.
-    out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0)
+    # V54: "# of Units" is N/A -- NOT 0 -- when no child asset carries a unit count.
+    # 20260810 Bridge Loan holds the literal text "N/A" on exactly 45 deals, and on 44 of
+    # those every child Bridge Asset unit count is likewise blank (the 45th is a single-asset
+    # rounding case). The previous fillna(0) turned all of them into 0. Leaving the rollup
+    # NaN lets REPORT_NA_FILL_HEADERS render "N/A" at write time.
+    out["# of Units"] = pd.to_numeric(out.get("# of Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
 
     bridge_asset_deal_keys = set()
     if bridge_asset is not None and not bridge_asset.empty and "_deal_key" in bridge_asset.columns:
@@ -7136,6 +7317,11 @@ def _qend_npl_header(q_end: date, suffix: str = "") -> str:
     return f"{base} {suffix}".strip()
 
 
+def _qend_npl_reo_header(q_end: date) -> str:
+    """Bridge Asset's 3-valued NPL column, e.g. '9/30 NPL/REO' (20260803 col DF)."""
+    return f"{q_end.month}/{q_end.day} NPL/REO"
+
+
 def _special_list_header(q_end: date) -> str:
     quarter = (q_end.month - 1) // 3 + 1
     yy = q_end.year % 100
@@ -7152,6 +7338,8 @@ def _resolve_scaffold_token(value, run_dt: date, q_end: date, upb_header: str):
         return _qend_npl_header(q_end)
     if value == "__QEND_NPL_YN__":
         return _qend_npl_header(q_end, "(Y/N)")
+    if value == "__QEND_NPL_REO__":
+        return _qend_npl_reo_header(q_end)
     if value == "__SPECIAL_LIST__":
         return _special_list_header(q_end)
     if value == "__RUN_DT__":
@@ -7226,8 +7414,55 @@ def _pin_today_formulas_to_run_date(wb, run_dt: date) -> None:
                     cell.value = pat.sub(date_literal, v)
 
 
+def _migrate_sheet_columns_to_blueprint(ws) -> List[str]:
+    """Insert/delete physical columns so an older template/baseline matches the blueprint.
+
+    Must run BEFORE the row 1..5 scaffold is cleared, because it identifies the layout
+    from the existing headers. Only the two V43 structural changes are handled; both are
+    idempotent (a workbook already on the new layout is left untouched).
+
+      Bridge Asset  insert "% of Reno Budget" at BO (67). 20260803 carries it between
+                    Renovation Holdback Remaining (BN) and Interest Allocation (BP);
+                    every column from 67 on shifts +1.
+      Bridge Loan   delete "Remaining Commitment" at AB (28). The official tab goes
+                    straight from Suspense Balance (AA) to Most Recent Valuation Date.
+
+    openpyxl's insert_cols/delete_cols relocates cells without rewriting formula text,
+    which is safe here: every data-row formula in the affected ranges is re-seeded from
+    DRAFT_FORMULA_OVERRIDES (whose letters are the official report's) immediately after
+    the blueprint headers are written.
+    """
+    notes: List[str] = []
+
+    def header_at(col_idx: int) -> str:
+        return clean_text(ws.cell(HEADER_ROW, col_idx).value)
+
+    if ws.title == "Bridge Asset":
+        if header_at(67) != "% of Reno Budget":
+            existing = {header_at(c) for c in range(1, ws.max_column + 1)}
+            if "% of Reno Budget" in existing:
+                notes.append("Bridge Asset: '% of Reno Budget' present at an unexpected column; left as-is")
+            elif header_at(67) == "Interest Allocation":
+                ws.insert_cols(67)
+                ws.cell(HEADER_ROW, 67).value = "% of Reno Budget"
+                notes.append("Bridge Asset: inserted '% of Reno Budget' column at BO (layout shifted +1 from BO)")
+            else:
+                notes.append(
+                    "Bridge Asset: expected 'Interest Allocation' at BO for the "
+                    f"'% of Reno Budget' insert, found {header_at(67)!r}; skipped"
+                )
+
+    if ws.title == "Bridge Loan":
+        if header_at(28) == "Remaining Commitment":
+            ws.delete_cols(28)
+            notes.append("Bridge Loan: removed 'Remaining Commitment' column at AB (layout shifted -1 from AB)")
+
+    return notes
+
+
 def restore_template_scaffold(wb, run_dt: date, upb_header: str):
     q_end = quarter_end_for_run(run_dt)
+    migration_notes: List[str] = []
 
     for sheet_name, blueprint in SHEET_BLUEPRINTS.items():
         if sheet_name not in wb.sheetnames:
@@ -7235,6 +7470,7 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
         ws = wb[sheet_name]
 
         _ensure_bridge_asset_fc_columns(ws)
+        migration_notes.extend(_migrate_sheet_columns_to_blueprint(ws))
 
         # Clear all values in the scaffold rows before rewriting them from the
         # blueprint. Without this, a prior-layout template (notably Term Asset, which
@@ -7279,6 +7515,33 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
             col_idx = _scaffold_col_index(col_idx)
             _set_scaffold_cell(ws, 5, col_idx, _resolve_scaffold_token(val, run_dt, q_end, upb_header))
 
+        # Re-seed the DATA_START_ROW formula cells from DRAFT_FORMULA_OVERRIDES now that
+        # the headers are authoritative. Two reasons this has to happen here:
+        #  * _migrate_sheet_columns_to_blueprint moves cells with insert_cols/delete_cols,
+        #    which relocates a formula without rewriting its column letters -- so a
+        #    migrated template's seeds still point at the pre-shift columns.
+        #  * an uploaded prior-week workbook carries whatever formulas that week had,
+        #    including the pre-V43 "Securitized Bridge" / $DE$4 / "Sold" variants.
+        # Only columns that already hold a formula, or that live beyond the blue
+        # auto-populated range, are touched -- a data column is never turned into one.
+        _fx_overrides = DRAFT_FORMULA_OVERRIDES.get(sheet_name, {})
+        if _fx_overrides:
+            _fx_blue_max = _sheet_blue_max_col(sheet_name)
+            for col_idx, val in blueprint.get("row5", {}).items():
+                col_idx = _scaffold_col_index(col_idx)
+                key = _formula_override_key_for_header(
+                    _resolve_scaffold_token(val, run_dt, q_end, upb_header), upb_header
+                )
+                if key not in _fx_overrides:
+                    continue
+                cur = ws.cell(DATA_START_ROW, col_idx).value
+                is_formula = isinstance(cur, str) and cur.startswith("=")
+                beyond_blue = _fx_blue_max is not None and col_idx > _fx_blue_max
+                if is_formula or beyond_blue:
+                    ws.cell(DATA_START_ROW, col_idx).value = _resolve_formula_override(
+                        _fx_overrides[key], q_end
+                    )
+
         # Deterministically (re)apply the blue header fill AND the white bold header
         # font to row 5 on exactly the titled header columns. The official report styles
         # every header cell with a solid theme-3 fill and bold theme-0 (white) text;
@@ -7313,6 +7576,7 @@ def restore_template_scaffold(wb, run_dt: date, upb_header: str):
     # Pin volatile TODAY()/NOW() to the servicer import (run) date so Days Past Due /
     # Days to Maturity compute against the UPB tape date, not the live open date.
     _pin_today_formulas_to_run_date(wb, run_dt)
+    return migration_notes
 
 
 def _parse_direct_ref_formula(formula_text: str):
@@ -7413,6 +7677,8 @@ def _expected_header_matches(actual_header: str, expected_header: str, upb_heade
         return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", actual, flags=re.I))
     if expected == "__QEND_NPL_YN__":
         return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", actual, flags=re.I))
+    if expected == "__QEND_NPL_REO__":
+        return bool(re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s*/\s*REO", actual, flags=re.I))
     if expected == "__SPECIAL_LIST__":
         return bool(re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", actual, flags=re.I))
     return actual == expected
@@ -7422,6 +7688,8 @@ def _formula_override_key_for_header(header: str, upb_header: str) -> str:
     header = clean_text(header)
     if header == clean_text(upb_header):
         return "__UPB__"
+    if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s*/\s*REO", header, flags=re.I):
+        return "__QEND_NPL_REO__"
     if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", header, flags=re.I):
         return "__QEND_NPL_YN__"
     if re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", header, flags=re.I):
@@ -7762,6 +8030,17 @@ def _report_yn(mask: pd.Series, index) -> pd.Series:
     return pd.Series(np.where(pd.Series(mask, index=index).fillna(False).astype(bool), "Y", "N"), index=index, dtype="object")
 
 
+def _report_is_sold_financing(df: pd.DataFrame) -> pd.Series:
+    """Rows the report's NPL / special-list formulas exclude as sold.
+
+    The official formulas literally test $D6<>"Sold Servicing Retained". Accept the bare
+    "Sold" and the misspelled legacy variant too, so a carried-forward value from an older
+    workbook cannot silently re-enable the flags for a sold loan.
+    """
+    fin = _report_text_series_from_col(df, "Financing").str.casefold()
+    return fin.isin({v.casefold() for v in BRIDGE_SOLD_FINANCING_VALUES}).fillna(False)
+
+
 def _days_between(later, earlier: pd.Series) -> pd.Series:
     later_ts = pd.Timestamp(later)
     earlier_ts = pd.to_datetime(earlier, errors="coerce")
@@ -7790,6 +8069,7 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     idx = out.index
     q_end = quarter_end_for_run(run_dt)
     qend_npl_header = _qend_npl_header(q_end, "(Y/N)")
+    qend_npl_reo_header = _qend_npl_reo_header(q_end)
 
     product_type = _report_text_series_from_col(out, "Product Type")
     product_sub_type = _report_text_series_from_col(out, "Product Sub-Type")
@@ -7831,26 +8111,43 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
         _report_numeric_series_from_col(out, "Origination ARV"),
     )
 
-    # Quarter-end NPL Y/N: matches the official live formula
-    #   =IF(AND($D<>"Sold", MINIFS(NextPaymentDate, DealNumber, thisDeal) < ($DE$3-90)),"Y","N")
-    # i.e. Y when the loan is not Sold and the deal's MINIMUM Next Payment Date is more than
-    # 90 days before quarter-end (90+ days delinquent as of quarter-end). Computed here so the
-    # materialized value tracks the corrected Next Payment Date (incl. the Statebridge day-10
-    # rule) rather than inheriting the stale upstream "3/31 NPL (Y/N)" column.
-    # Verified 4690/4690 (577 Y) against 20260608_Active_Loans Bridge Asset.
+    # Quarter-end NPL column. V43: this is THREE-valued (REO / NPL / N), not Y/N, and it
+    # is titled "<m>/<d> NPL/REO". Transcribed from 20260803 Bridge Asset!DF6:
+    #   =IF(AND($D6<>"Sold Servicing Retained",$CS6="REO"),"REO",
+    #      IF(AND($D6<>"Sold Servicing Retained",MINIFS($AC:$AC,$E:$E,$E6)<=$DF$4),"NPL","N"))
+    # where $CS6 is DQ Status, $AC is Next Payment Date, $E is Deal Number and
+    # $DF$4 = quarter-end minus 90 days. Note the comparison is <= (not <) and the sold
+    # exclusion tests the full "Sold Servicing Retained" label.
+    # Computed here rather than left as a live formula so the materialized value tracks the
+    # corrected Next Payment Date (incl. the Statebridge day-10 rule) instead of inheriting
+    # the stale upstream "3/31 NPL (Y/N)" column.
+    # Verified 4941/4941 against 20260803 Bridge Asset.
     _npl_threshold = pd.Timestamp(q_end) - pd.Timedelta(days=90)
     _npl_npd = _report_date_series_from_col(out, "Next Payment Date")
     _npl_deal = _report_text_series_from_col(out, "Deal Number")
-    _npl_fin = _report_text_series_from_col(out, "Financing")
+    _not_sold = ~_report_is_sold_financing(out)
     _min_npd_by_deal = _npl_npd.groupby(_npl_deal).transform("min")
-    out[qend_npl_header] = _report_yn(
-        _npl_fin.str.casefold().ne("sold") & _min_npd_by_deal.notna() & _min_npd_by_deal.lt(_npl_threshold),
-        idx,
+    _dq_reo = _report_text_series_from_col(out, "DQ Status").str.upper().eq("REO")
+    qend_npl_reo = pd.Series([QEND_NPL_NONE_VALUE] * len(out), index=idx, dtype="object")
+    qend_npl_reo = qend_npl_reo.mask(
+        _not_sold & _min_npd_by_deal.notna() & _min_npd_by_deal.le(_npl_threshold),
+        QEND_NPL_NPL_VALUE,
     )
-    npl_flag = _report_text_series_from_col(out, qend_npl_header).str.upper().eq("Y")
+    qend_npl_reo = qend_npl_reo.mask(_not_sold & _dq_reo, QEND_NPL_REO_VALUE)
+    out[qend_npl_reo_header] = qend_npl_reo
+    # Keep the legacy Y/N alias so downstream consumers / prior-workbook joins still resolve.
+    out[qend_npl_header] = _report_yn(qend_npl_reo.ne(QEND_NPL_NONE_VALUE), idx)
+
+    # Needs NPL Value, from 20260803 Bridge Asset!CW6:
+    #   =IF(AND($D6<>"Sold Servicing Retained",OR($DF6="NPL",$DF6="REO"),$CT6<$CW$4),"Y","N")
+    # $CW$4 = EDATE(quarter-end, -6), $CT6 = Most Recent Valuation Date.
+    npl_flag = qend_npl_reo.isin([QEND_NPL_NPL_VALUE, QEND_NPL_REO_VALUE])
     stale_threshold = pd.Timestamp(q_end) - pd.DateOffset(months=6)
     most_recent_val = pd.to_datetime(out["Most Recent Valuation Date"], errors="coerce")
-    out["Needs NPL Value"] = _report_yn(npl_flag & most_recent_val.notna() & most_recent_val.lt(stale_threshold), idx)
+    out["Needs NPL Value"] = _report_yn(
+        _not_sold & npl_flag & most_recent_val.notna() & most_recent_val.lt(stale_threshold),
+        idx,
+    )
 
     segment = _report_text_series_from_col(out, "Segment")
     # NEW Asset Commitment = approved Initial Disbursement + Renovation Holdback + Interest Allocation.
@@ -7865,7 +8162,7 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     loan_type_ba = product_type_ba.copy()
     loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("5A"), "5A Bridge")
     loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("TPO"), "Purchased Bridge")
-    loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("RB"), "Single Asset Bridge")
+    loan_type_ba = loan_type_ba.mask(portfolio_ba.eq("RB"), BRIDGE_RB_LOAN_TYPE)
     out["Loan Type"] = loan_type_ba
     # Interest Allocation shows 0 (never blank) in the report when Salesforce has none.
     if "Interest Allocation" in out.columns:
@@ -7873,7 +8170,7 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     # Widened Securitized rule: also flags CAFL 2026-R1 CV legacy.
     financing_ba = _report_text_series_from_col(out, "Financing")
     out["Securitized (Y/N)"] = _report_yn(
-        segment.eq("Securitized Bridge") | (financing_ba.eq("CAFL 2026-R1 CV") & segment.eq("Legacy")),
+        segment.eq(BRIDGE_SECURITIZED_SEGMENT) | (financing_ba.eq("CAFL 2026-R1 CV") & segment.eq("Legacy")),
         idx,
     )
     out["SSP JV (Y/N)"] = _report_yn(segment.eq("SSP"), idx)
@@ -7899,14 +8196,19 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
         pd.Series(["N"] * len(out), index=idx),
     ).replace({"": "N"})
 
-    financing = _report_text_series_from_col(out, "Financing")
+    # Special loans list, from 20260803 Bridge Asset!DG6:
+    #   =IF(AND($D6<>"Sold Servicing Retained",
+    #          OR($DB6="Y",$DC6="Y",$DD6="Y",$DE6="Y",OR($DF6="NPL",$DF6="REO"))),"Y","N")
+    # i.e. Legacy / Matured Loan / DQ 45+ / SA Loan, PLUS the NPL-or-REO term the previous
+    # build omitted entirely.
     special_any = (
         _report_text_series_from_col(out, "Legacy (Y/N)").str.upper().eq("Y")
         | _report_text_series_from_col(out, "Matured Loan (YN)").str.upper().eq("Y")
         | _report_text_series_from_col(out, "DQ 45+ Loan (Y/N)").str.upper().eq("Y")
         | _report_text_series_from_col(out, "SA Loan (Y/N)").str.upper().eq("Y")
+        | npl_flag
     )
-    out["Special Flag"] = _report_yn(financing.ne("Sold") & special_any, idx)
+    out["Special Flag"] = _report_yn(_not_sold & special_any, idx)
     # Emit under the new header name too so the writer finds it.
     out[_special_list_header(quarter_end_for_run(run_dt))] = out["Special Flag"]
     return out
@@ -7925,12 +8227,36 @@ def _materialize_bridge_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> 
     loan_type_bl = product_type_bl.copy()
     loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("5A"), "5A Bridge")
     loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("TPO"), "Purchased Bridge")
-    loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("RB"), "Single Asset Bridge")
+    loan_type_bl = loan_type_bl.mask(portfolio_bl.eq("RB"), BRIDGE_RB_LOAN_TYPE)
     out["Loan Type"] = loan_type_bl
     # Interest Allocation shows 0 (never blank) in the report (verified 20260615: 0 blanks,
     # 845 zeros). Fill Salesforce-null with 0 so new deals match.
     if "Interest Allocation" in out.columns:
         out["Interest Allocation"] = _report_numeric_series_from_col(out, "Interest Allocation").fillna(0.0)
+
+    # Quarter-end NPL: the Bridge Loan tab carries the loan-level counterpart of Bridge
+    # Asset's "<m>/<d> NPL/REO", and it is likewise three-valued (REO / NPL / N). 20260803
+    # Bridge Loan!AX is a pasted value, so the rule was recovered by fitting the tab:
+    #   Financing == "Sold Servicing Retained"      -> N
+    #   Loan Level Delinquency == "REO"             -> REO
+    #   Next Payment Date <= quarter-end minus 90d  -> NPL
+    #   otherwise                                   -> N
+    # Reproduces 1,024/1,026 rows (the 2 exceptions are hand overrides on deal 39499,
+    # which the report shows as NPL despite Loan Level Delinquency == REO).
+    idx = out.index
+    q_end = quarter_end_for_run(run_dt)
+    _npl_threshold = pd.Timestamp(q_end) - pd.Timedelta(days=90)
+    _not_sold = ~_report_is_sold_financing(out)
+    _npd = _report_date_series_from_col(out, "Next Payment Date")
+    _lld_reo = _report_text_series_from_col(out, "Loan Level Delinquency").str.upper().eq("REO")
+    qend_npl = pd.Series([QEND_NPL_NONE_VALUE] * len(out), index=idx, dtype="object")
+    qend_npl = qend_npl.mask(_not_sold & _npd.notna() & _npd.le(_npl_threshold), QEND_NPL_NPL_VALUE)
+    qend_npl = qend_npl.mask(_not_sold & _lld_reo, QEND_NPL_REO_VALUE)
+    out[_qend_npl_header(q_end)] = qend_npl
+    # Needs NPL Value and Special Focus (Y/N) are deliberately NOT recomputed here: both
+    # arrive via the Bridge Asset rollup / prior-workbook carry-forward and already land
+    # within a couple of rows of the official tab (59 vs 60 Y, 190 vs 198 Y against
+    # 20260803). Deriving them off this column instead over-flags them.
     return out
 
 
@@ -7955,11 +8281,16 @@ def _materialize_term_loan_formula_columns(df: pd.DataFrame, upb_col: str) -> pd
     # Order mirrors the report's nested IF (later assignments take precedence only
     # where their condition is the matching branch).
     special_txt = special_txt.mask(active_term_or_dscr & days_past_due.ge(45) & dq.ne("REO"), "DQ 45+")
-    special_txt = special_txt.mask(portfolio.eq("Securitized Term") & dq.eq("REO"), "CAFL REO")
+    # V52 (20260810): the "CAFL REO" branch was dropped from the official formula, so a
+    # Securitized-Term REO deal now reads N/A rather than CAFL REO. Verified against
+    # 20260810 Term Loan (0 CAFL REO) and Term Asset (0 via the XLOOKUP mirror).
     special_txt = special_txt.mask(active_term_or_dscr & dq.eq("REO"), "Term REO")
+    # The NPL label carries the RUNNING quarter, e.g. "Q3 NPL" for a 9/30 quarter-end
+    # (20260803 Term Loan!AF6). This was hardcoded "Q2 NPL", which mislabelled every
+    # NPL row from Q3 onward.
     special_txt = special_txt.mask(
         active_term_or_dscr & next_payment.notna() & next_payment.le(special_threshold) & dq.ne("REO"),
-        "Q2 NPL",
+        f"Q{(q_end.month - 1) // 3 + 1} NPL",
     )
     special_header = _special_list_header(quarter_end_for_run(run_dt))
     out[special_header] = special_txt
@@ -8027,6 +8358,7 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
 
     text_headers = set(DEFAULT_TEXT_HEADERS.get(sheet_name, set())) | set(template_text_headers or set())
     text_headers = {h for h in text_headers if h not in REPORT_IDENTIFIER_HEADERS.get(sheet_name, set())}
+    text_headers -= PRESERVE_INTERNAL_WHITESPACE_HEADERS.get(sheet_name, set())
     for header in text_headers:
         if header in out.columns:
             out[header] = normalize_text_display_series(out[header])
@@ -8102,24 +8434,15 @@ def _copy_formula_columns_down(ws_formula, formula_seeds: dict, row_count: int, 
 
     header_by_col = {c: h for c, h in header_tuples}
     overrides = DRAFT_FORMULA_OVERRIDES.get(ws_formula.title, {})
+    _q_end = quarter_end_for_run(run_dt)
 
     for col_idx in sorted(formula_seeds):
         header = header_by_col.get(col_idx, "")
-        _hdr_norm = str(header).strip()
-        if header == upb_header:
-            override_key = "__UPB__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL\s+\(Y/N\)", _hdr_norm, flags=re.I):
-            override_key = "__QEND_NPL_YN__"
-        elif re.fullmatch(r"\d{1,2}/\d{1,2}\s+NPL", _hdr_norm, flags=re.I):
-            override_key = "__QEND_NPL__"
-        elif re.fullmatch(r"\dQ\d{2}\s+Special\s+Loans\s+List", _hdr_norm, flags=re.I):
-            override_key = "__SPECIAL_LIST__"
-        else:
-            override_key = header
+        override_key = _formula_override_key_for_header(header, upb_header)
         seed_info = formula_seeds.get(col_idx, {})
         if override_key in overrides:
             # Override formulas are authored relative to DATA_START_ROW (row 6).
-            origin_formula = overrides[override_key]
+            origin_formula = _resolve_formula_override(overrides[override_key], _q_end)
             origin_row = start_row
         else:
             # Seeded formulas may have been captured from any scan row; anchor the
@@ -8220,37 +8543,61 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     fcols = formula_col_indices(ws, start_row=DATA_START_ROW, header_row=HEADER_ROW)
     template_formula_cols = set(fcols)
 
-    # Columns that MUST stay live formulas because they reference another sheet
-    # that is not yet written when this sheet is written.
+    # Columns that MUST stay live formulas because they reference another sheet that is
+    # not yet written when this sheet is written. Term Loan's SFR/MF Allocation and
+    # Strategy Grouping SUMIFS into Term Asset, which is built afterwards -- those three
+    # are backfilled as values by _materialize_term_loan_allocations_on_sheet once Term
+    # Asset exists. Term Asset's UPB and special-loans-list are NOT listed: the build
+    # already computes both in Python (_allocate_term_asset_upb_from_loan and the Term
+    # Loan special-value merge in build_term_asset), so forcing them live only guaranteed
+    # the columns shipped blank.
     always_live = {
         "Term Loan": {"SFR Allocation", "MF Allocation", "Strategy Grouping"},
     }.get(sheet_name, set())
-    # Match always-live headers, plus the token-mapped cross-sheet columns on
-    # Term Asset (UPB + the special-loans-list, both of which reference Term Loan
-    # and must stay live so they recalc against the Term Loan sheet).
     always_live_cols = {col_idx for col_idx, header in hdr if clean_text(header) in always_live}
-    if sheet_name == "Term Asset":
-        for col_idx, header in hdr:
-            _k = _formula_override_key_for_header(header, upb_col)
-            if _k in {"__UPB__", "__SPECIAL_LIST__"}:
-                always_live_cols.add(col_idx)
+
+    # Resolve a sheet header to its df column the same way write_df_to_sheet_preserve_
+    # formulas does -- tolerating the trailing space the report carries on a few headers
+    # (e.g. "3Q26 Special Loans List "), which header_tuples_from_ws strips away. Without
+    # the strip-match a materialized column reads as "missing" and would be left as a
+    # blank live formula.
+    _df_col_by_stripped = {}
+    for _c in df.columns:
+        _df_col_by_stripped.setdefault(str(_c).strip(), _c)
+    _header_by_col = {col_idx: clean_text(header) for col_idx, header in hdr}
+
+    def _df_col_has_values(col_idx: int) -> bool:
+        header = _header_by_col.get(col_idx, "")
+        if not header:
+            return False
+        actual = header if header in df.columns else _df_col_by_stripped.get(header)
+        if actual is None:
+            return False
+        return bool((~_report_is_blank_or_na(df[actual])).any())
+
+    _blue_max = _sheet_blue_max_col(sheet_name)
 
     if MATERIALIZE_FORMULA_RESULT_COLUMNS:
+        # Write a value wherever the build produced one; keep a live formula only where it
+        # did not. Previously every beyond-blue template formula column was forced live,
+        # which shipped the whole Bridge Asset CALC block (Loan Type, DQ Status, the JV
+        # flags, NPL/REO, the special-loans list) and the Term Asset UPB as blank cells --
+        # openpyxl writes no cached result, so nothing appears until Excel recalculates.
         fcols = always_live_cols.copy()
-    elif sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
-        force_write_headers = {upb_col, "Special (Y/N)"}
-        force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
-        fcols = {c for c in fcols if c not in force_write_cols}
-
-    # Columns to the right of the blue range are the self-computing CALC region
-    # (Bridge Asset Days Past Due/DQ Status/Maturity Date, the special-loans list,
-    # SFR/MF allocations, etc.). They are NOT auto-filled with data, but their template
-    # formulas MUST stay live and be propagated down -- materializing or clearing them
-    # would blank the column. Keep every beyond-blue template formula column as a live
-    # formula so e.g. Days Past Due keeps recalculating off the CP4/CQ4 run-date anchor.
-    _blue_max = _sheet_blue_max_col(sheet_name)
-    if _blue_max is not None:
-        fcols |= {c for c in template_formula_cols if c > _blue_max}
+        if _blue_max is not None:
+            fcols |= {
+                c for c in template_formula_cols
+                if c > _blue_max and not _df_col_has_values(c)
+            }
+    else:
+        if sheet_name == "Term Asset" and not PRESERVE_TERM_ASSET_FORMULA_COLUMNS:
+            force_write_headers = {upb_col, "Special (Y/N)"}
+            force_write_cols = {col_idx for col_idx, header in hdr if header in force_write_headers}
+            fcols = {c for c in fcols if c not in force_write_cols}
+        # Beyond-blue CALC formulas must stay live and be propagated down so e.g. Days Past
+        # Due keeps recalculating off the CQ4 run-date anchor.
+        if _blue_max is not None:
+            fcols |= {c for c in template_formula_cols if c > _blue_max}
 
     formula_seeds = _capture_formula_seeds(ws, fcols, start_row=DATA_START_ROW)
     # Ensure always-live cross-sheet columns have a seed even if the template
@@ -8260,7 +8607,10 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
         if _col_idx in always_live_cols and _col_idx not in formula_seeds:
             _key = _formula_override_key_for_header(_header, upb_col)
             if _key in _overrides:
-                formula_seeds[_col_idx] = {"origin_row": DATA_START_ROW, "formula": _overrides[_key]}
+                formula_seeds[_col_idx] = {
+                    "origin_row": DATA_START_ROW,
+                    "formula": _resolve_formula_override(_overrides[_key], quarter_end_for_run(run_dt)),
+                }
 
     used_cols = _used_output_columns(ws, wb=wb, upb_header=upb_col, header_row=HEADER_ROW, start_row=DATA_START_ROW)
     _clear_sheet_body(ws, used_cols, start_row=DATA_START_ROW)
@@ -8270,6 +8620,63 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _refresh_subtotal_formula(ws, row_count=len(df), subtotal_row=4, start_row=DATA_START_ROW)
     _trim_sheet_body_rows(ws, row_count=len(df), start_row=DATA_START_ROW)
     _reset_sheet_autofilter(ws, hdr, row_count=len(df), header_row=HEADER_ROW, start_row=DATA_START_ROW)
+
+
+def _materialize_term_loan_allocations_on_sheet(wb, term_asset_df: pd.DataFrame, upb_col: str) -> str:
+    """Fill Term Loan SFR/MF Allocation + Strategy Grouping as values, post Term Asset.
+
+    These three columns are the only genuinely cross-sheet ones on Term Loan -- they
+    SUMIFS Property ALA out of Term Asset, which is not written yet when Term Loan is
+    written, so they ship as live formulas with no cached result (i.e. blank to every
+    non-Excel reader; 20260803 has 840/214 populated Strategy Grouping rows against the
+    previous build's 1,030 blanks). Once Term Asset exists we can compute them directly:
+      SFR Allocation    = sum(Property ALA) where Grouping == 'Single Family Rental'
+      MF Allocation     = sum(Property ALA) where Grouping == 'Multifamily'
+      Strategy Grouping = 'Single Family Rental' if SFR > MF else 'Multifamily'
+    (transcribed from Term Loan!AG6/AH6/AI6; reproduces 1,054/1,054 rows on all three).
+    The live formulas are left in place for any deal with no Term Asset rows, so Excel
+    still recalculates those on open.
+    """
+    if not MATERIALIZE_FORMULA_RESULT_COLUMNS or "Term Loan" not in wb.sheetnames:
+        return ""
+    if term_asset_df is None or term_asset_df.empty:
+        return ""
+    if not {"Deal Number", "Property ALA", "Grouping"}.issubset(set(term_asset_df.columns)):
+        return ""
+
+    keys = norm_id_series(term_asset_df["Deal Number"])
+    ala = pd.to_numeric(term_asset_df["Property ALA"], errors="coerce").fillna(0.0)
+    grouping = _report_text_series_from_col(term_asset_df, "Grouping")
+    sfr_by_deal = ala.where(grouping.eq("Single Family Rental"), 0.0).groupby(keys).sum()
+    mf_by_deal = ala.where(grouping.eq("Multifamily"), 0.0).groupby(keys).sum()
+
+    ws = wb["Term Loan"]
+    hdr = header_tuples_from_ws(ws, header_row=HEADER_ROW, wb=wb, upb_header=upb_col)
+    col_of = {clean_text(h): c for c, h in hdr}
+    deal_col = col_of.get("Deal Number")
+    sfr_col = col_of.get("SFR Allocation")
+    mf_col = col_of.get("MF Allocation")
+    strat_col = col_of.get("Strategy Grouping")
+    if None in (deal_col, sfr_col, mf_col, strat_col):
+        return ""
+
+    filled = 0
+    for r in range(DATA_START_ROW, ws.max_row + 1):
+        key = _normalize_sheet_key_value("Deal Number", ws.cell(r, deal_col).value)
+        if not key:
+            continue
+        if key not in sfr_by_deal.index and key not in mf_by_deal.index:
+            continue
+        sfr = float(sfr_by_deal.get(key, 0.0))
+        mf = float(mf_by_deal.get(key, 0.0))
+        ws.cell(r, sfr_col).value = sfr
+        ws.cell(r, mf_col).value = mf
+        ws.cell(r, strat_col).value = "Single Family Rental" if sfr > mf else "Multifamily"
+        filled += 1
+
+    if not filled:
+        return ""
+    return f"Term Loan SFR/MF allocation + Strategy Grouping materialized for {filled:,} deals"
 
 
 def _strip_timezones_from_workbook(wb):
@@ -9290,7 +9697,7 @@ if build_btn:
             template_maps = load_template_lookup_maps(tmpl_bytes)
             wb = load_workbook(BytesIO(tmpl_bytes), data_only=False, keep_links=False)
             mark_workbook_for_recalc(wb)
-            restore_template_scaffold(wb, run_dt, upb_col)
+            diagnostics.extend(restore_template_scaffold(wb, run_dt, upb_col) or [])
             sanitize_summary_formulas(wb)
 
             need_bridge = build_target in ("Bridge Asset", "Bridge Loan", "All")
@@ -9450,6 +9857,13 @@ if build_btn:
 
                     status.update(label="Writing Term Asset sheet...")
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
+
+                    # Term Loan's SFR/MF Allocation and Strategy Grouping SUMIFS into Term
+                    # Asset, so they can only be resolved now that Term Asset is written.
+                    _alloc_diag = _materialize_term_loan_allocations_on_sheet(wb, term_asset_df, upb_col)
+                    if _alloc_diag:
+                        diagnostics.append(_alloc_diag)
+
                     del term_deal_numbers, term_asset_source, term_asset_df
 
                 del term_wide, term_loan_df, term_asset_filter_deals, candidate_term_deals

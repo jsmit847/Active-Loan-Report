@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile hayden.py)",
+      "Bash(python _verify_layout.py)",
+      "Bash(python _test_migration.py)",
+      "Bash(python _test_materializers.py)"
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+# Secrets — NEVER commit these
+.streamlit/secrets.toml
+secrets.toml
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local scratch / diagnostic scripts (not part of the app)
+_*.py
+
+# Old / unused app version
+hayden_file_only_salesforce_exports_20260511.py
+
+# Local data & generated output (don't ship loan data to GitHub)
+*.xlsx
+!Active Loan Template.xlsx
+~$*.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
