@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V58_PRESERVE_TEXT_COLUMNS_IN_BULK"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V59_BOARDING_KEEPS_UPB_BORROWER_ZERO"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -336,6 +336,12 @@ REPORT_INTEGER_HEADERS = {
 # Fix N: free-text columns whose SF source can carry data-entry double-spaces. The
 # official report renders these single-spaced; collapse runs of 2+ whitespace to one
 # space so byte-only whitespace diffs stop registering as mismatches.
+# V59: N/A-fill columns where a literal 0 is a REAL value the report keeps, so the
+# text-zero-to-N/A rule must skip them. See _normalize_output_for_report.
+REPORT_ZERO_IS_REAL_HEADERS = {
+    "Term Loan": {"Borrower Entity"},
+}
+
 WHITESPACE_COLLAPSE_HEADERS = {
     "Bridge Asset": {
         "Deal Name", "Borrower Entity", "Account Name", "Address", "Primary Contact",
@@ -6768,11 +6774,16 @@ def build_term_loan(
         _l_named = (~blankish_mask(_l_servicer)) & _l_servicer.astype("string").str.strip().str.upper().ne("N/A")
         _l_boarding_only = _l_is_new & _l_named & (~_l_has_activity)
         if bool(_l_boarding_only.any()):
+            # V59: blank ONLY the servicer identity. The official report shows Servicer and
+            # Servicer ID as N/A for a newly-boarded deal, but it still carries the balance
+            # and the next payment date -- both come from Salesforce, not the servicer file.
+            # Blanking them cost 22 Term Loan deals their UPB on 20260824 (Salesforce
+            # Current Servicer UPB matched the official exactly on 12 of them, e.g. 64080
+            # 343,000 and 64219 157,500), and that cascaded into 318 Term Asset UPB cells
+            # because the asset allocation is a share of the loan UPB. It also blanked 13
+            # Next Payment Dates the official shows as 2026-10-01.
             out.loc[_l_boarding_only, "Servicer"] = "N/A"
             out.loc[_l_boarding_only, "Servicer ID"] = "N/A"
-            out.loc[_l_boarding_only, upb_col] = np.nan
-            if "Next Payment Date" in out.columns:
-                out.loc[_l_boarding_only, "Next Payment Date"] = pd.NaT
 
     terminal_zero_keys = _term_terminal_zero_exclusion_keys(sf_term)
     if terminal_zero_keys:
@@ -8478,6 +8489,13 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
         | set(SHEET_MONEY2_HEADERS.get(sheet_name, set()))
         | set(SHEET_MONEY0_HEADERS.get(sheet_name, set()))
         | set(SHEET_DATE_HEADERS.get(sheet_name, set()))
+        # V59: Term Loan "Borrower Entity" is the column the V50 zero-to-N/A rule was
+        # written for, but the official is not consistent about it -- it shows a literal 0
+        # on 20260803 (77 rows) and 20260824 (76 rows), and "N/A" only on 20260810. Two of
+        # the last three weeks keep the 0, and 0 is what the upstream blank actually
+        # produces, so exclude it from the rule and pass the value through. Flagged rather
+        # than settled: if the report standardises on N/A, drop this exclusion.
+        | REPORT_ZERO_IS_REAL_HEADERS.get(sheet_name, set())
     )
     if upb_col:
         _numeric_na_cols.add(upb_col)
