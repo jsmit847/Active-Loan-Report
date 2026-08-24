@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V56_ASSET_COMMITMENT_APPROVED_ADVANCE_MAX"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V58_PRESERVE_TEXT_COLUMNS_IN_BULK"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -1129,6 +1129,18 @@ def downcast_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# V58: report columns that must stay VERBATIM Salesforce text. The numeric hints below
+# would otherwise coerce them ("feet" catches Square Feet, "year" catches Year Built,
+# "units" catches # of Units), which strips the thousands separator Salesforce actually
+# stores and turns the official's '1,814' into '1814'. Verified against 20260824: the
+# official Square Feet equals the raw SF value on 4,695/4,782 assets, and coercion cost
+# 749 Square Feet + 52 Year Built cells. All of these are display-only -- they are declared
+# in DEFAULT_TEXT_HEADERS and are never used in arithmetic.
+BULK_PRESERVE_TEXT_COLUMNS = {
+    "Square Feet", "Year Built", "Zip", "APN", "Additional APNs", "County", "CBSA",
+}
+
+
 def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -1167,6 +1179,9 @@ def _normalize_bulk_df(df: pd.DataFrame) -> pd.DataFrame:
                     if parsed_count > 0 and (parsed_count / nonblank_count) >= 0.60:
                         out[c] = parsed
                         continue
+
+        if str(c).strip() in BULK_PRESERVE_TEXT_COLUMNS:
+            continue
 
         if any(h in cl for h in numeric_hints):
             cleaned = (
@@ -2045,6 +2060,24 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     generic_value_date_field = first_existing_field_name("Property__c", ["Value_Date__c", "Updated_Valuation_Date__c", "BPO_Appraisal_Date__c"])
     generic_value_field = first_existing_field_name("Property__c", ["Value__c", "Appraised_Value_Amount__c"])
 
+    # V57: Salesforce replaced the Bridge Warehouse Line with a Current Funding Vehicle
+    # lookup. The 20260824 SF_Bridge export no longer carries "Warehouse Line" at all, and
+    # the official Financing column matches "Current Funding Vehicle: Funding Vehicle Name"
+    # on 4,676/4,782 assets. With Warehouse_Line__c empty the build fell back to last
+    # week's carried-forward value, which is why test 73 still showed the old labels
+    # ("CAFL 2026-R1 CV" instead of "CAFL 2026-R1", "Churchill Oaktree JV" instead of
+    # "Oaktree JV - Churchill") on ~570 cells. Resolved defensively; Warehouse Line stays
+    # as the fallback so an org that still populates it is unaffected.
+    _bridge_fv_field = first_existing_field_name(
+        "Opportunity", ["Current_Funding_Vehicle__c", "FK_Current_Funding_Vehicle__c"]
+    )
+    _bridge_fv_expr = None
+    if _bridge_fv_field:
+        try:
+            _bridge_fv_expr = f"{opp_rel}.{relationship_name_for('Opportunity', _bridge_fv_field)}.Name"
+        except Exception:
+            _bridge_fv_expr = None
+
     select_pairs = [
         ("Sold To", sold_to_expr),
         ("Warehouse Line", f"{opp_rel}.Warehouse_Line__c"),
@@ -2131,6 +2164,8 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Property Created Date", "CreatedDate"),
         ("Property Last Modified Date", "LastModifiedDate"),
     ]
+    if _bridge_fv_expr:
+        select_pairs.append(("Current Funding Vehicle", _bridge_fv_expr))
     if updated_value_date_field and updated_value_date_field != "BPO_Appraisal_Date__c":
         select_pairs.append(("Updated Valuation Date Native", updated_value_date_field))
     if generic_value_date_field and generic_value_date_field not in {updated_value_date_field, "BPO_Appraisal_Date__c"}:
@@ -2188,6 +2223,14 @@ def _build_bridge_spine_like() -> pd.DataFrame:
     # Updated valuation columns should only use actual updated/current appraisal inputs.
     # Do not fall back to generic/origination valuation fields. If no updated value exists,
     # these remain blank and the report/carry-forward logic can decide what to preserve.
+    # V57: Current Funding Vehicle is the authoritative Bridge Financing source; the
+    # legacy Warehouse Line only fills in where the lookup is empty.
+    if "Current Funding Vehicle" in df.columns:
+        df["Warehouse Line"] = coalesce_keep_nonblank(
+            pd.Series(df["Current Funding Vehicle"], index=df.index, dtype="object"),
+            pd.Series(df.get("Warehouse Line", pd.Series([pd.NA] * len(df), index=df.index)), index=df.index, dtype="object"),
+        )
+
     df["Current Appraisal Date"] = _coalesce_datetime_columns(df, ["Updated Valuation Date Native", "BPO Appraisal Date"])
     df["Current Appraised As-Is Value"] = _coalesce_numeric_columns(df, ["Appraised Value Amount"])
     if "After Repair Value" in df.columns:
@@ -2245,6 +2288,18 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
     valuation_date_candidates = existing_field_names("Opportunity", ["Updated_Value_Date__c", "Valuation_Date__c"])
     valuation_asis_candidates = existing_field_names("Opportunity", ["Updated_Value__c", "Total_Valuation_Amount__c"])
 
+    # V57: prefer the Current Funding Vehicle lookup over the retired Warehouse Line
+    # (see _build_bridge_spine_like). Coalesced below so either source works.
+    _bl_fv_field = first_existing_field_name(
+        "Opportunity", ["Current_Funding_Vehicle__c", "FK_Current_Funding_Vehicle__c"]
+    )
+    _bl_fv_expr = None
+    if _bl_fv_field:
+        try:
+            _bl_fv_expr = f"{relationship_name_for('Opportunity', _bl_fv_field)}.Name"
+        except Exception:
+            _bl_fv_expr = None
+
     select_pairs = [
         ("Loan Buyer", sold_to_expr),
         ("Financing", "Warehouse_Line__c"),
@@ -2275,6 +2330,8 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
         ("AM Commentary", "Asset_Management_Comments__c"),
         ("Type", "Type"),
     ]
+    if _bl_fv_expr:
+        select_pairs.append(("Current Funding Vehicle", _bl_fv_expr))
     if servicer_primary_field:
         select_pairs.insert(3, ("Opportunity Servicer Loan Number", servicer_primary_field))
     if servicer_commitment_field:
@@ -2310,6 +2367,12 @@ def _build_bridge_loan_wide_like() -> pd.DataFrame:
         return df
 
     blank_obj = pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+    # V57: Current Funding Vehicle wins over the retired Warehouse Line.
+    if "Current Funding Vehicle" in df.columns:
+        df["Financing"] = coalesce_keep_nonblank(
+            pd.Series(df["Current Funding Vehicle"], index=df.index, dtype="object"),
+            pd.Series(df.get("Financing", blank_obj), index=df.index, dtype="object"),
+        )
     if "Opportunity Servicer Loan Number" in df.columns:
         df["Opportunity Servicer Loan Number"] = df["Opportunity Servicer Loan Number"].astype("string").str.strip().replace({"": pd.NA})
     if "Opportunity Servicer Commitment Id" in df.columns:
@@ -3662,8 +3725,17 @@ def _bridge_pick_next_payment_date(
     prior = pd.to_datetime(pd.Series(prior_dates, index=sf.index, copy=False), errors="coerce") if prior_dates is not None else pd.Series([pd.NaT] * len(sf), index=sf.index)
     out = serv.where(serv.notna(), sf)
     if BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1:
-        same_month_sf = serv.notna() & sf.notna() & serv.dt.year.eq(sf.dt.year) & serv.dt.month.eq(sf.dt.month)
-        out = out.where(~(same_month_sf & serv.dt.day.eq(1) & sf.dt.day.eq(10)), sf)
+        # V57: the old rule here was
+        #     same_month_sf & serv.day==1 & sf.day==10  ->  take the Salesforce date
+        # and it is REMOVED. The API's Property/Opportunity Next_Payment_Date__c is a
+        # SCHEDULED billing date that reads day-10 for FCI and Onity loans, while both the
+        # servicer tape and the official report keep day 1. Against the 20260824 official
+        # it forced 665 assets (560 FCI + 83 Onity) from a correct day-1 to day-10 and
+        # dragged the tab BELOW plain servicer-first: test 73 scored 4,044/4,782 where the
+        # servicer file alone scores 4,482. Note this could not be caught offline against
+        # the SF_Bridge export, whose Next Payment Date column carries the day-1 tape value
+        # rather than the API's scheduled date -- the same export/API divergence this
+        # function's own docstring warns about.
         # V53: these loans bill on the 10th. When the prior completed report carried a
         # day-10 NPD and the fresh source reports day 1, the official report keeps the 10th
         # but advances to the FRESH source's month -- e.g. asset 1190539: FCI tape says

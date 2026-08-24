@@ -24,3 +24,6 @@ hayden_file_only_salesforce_exports_20260511.py
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Editor-local settings
+.vscode/
