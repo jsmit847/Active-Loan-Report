@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_10_V55_BL_VALUATION_DATE_MIN"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V56_ASSET_COMMITMENT_APPROVED_ADVANCE_MAX"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -441,7 +441,8 @@ BRIDGE_ASSET_FROM_BRIDGE_SPINE = {
     "Referral Source Contact": "Referral Source Contact: Full Name",
     "Loan Stage": "Stage",
     "Property Status": "Status",
-    "Asset Commitment": "Loan Commitment",
+    # V56: per-asset Approved Advance Amount Max (see _build_bridge_spine_like).
+    "Asset Commitment": "Approved Advance Amount Max",
 }
 
 BRIDGE_ASSET_FROM_VALUATION = {
@@ -2136,6 +2137,19 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         select_pairs.append(("Generic Value Date", generic_value_date_field))
     if generic_value_field and generic_value_field != "Appraised_Value_Amount__c":
         select_pairs.append(("Generic Value", generic_value_field))
+    # V56: Bridge Asset "Asset Commitment" is the per-asset Approved Advance Amount Max
+    # (Property__c), NOT Opportunity.LOC_Commitment__c and NOT the funded-components sum.
+    # Verified 4,782/4,782 against 20260824; the old sum matched 4,762. This is the same
+    # field _build_bridge_property_rollup_like sums for the Bridge Loan "Loan Commitment"
+    # (V41), so asset and loan commitment now tie by construction. Resolved defensively so
+    # a field rename cannot break the (large) spine SOQL.
+    _aam_spine_field = first_existing_field_name(
+        "Property__c",
+        ["Approved_Advance_Amount_Max__c", "Approved_Max_Advance_Amount__c", "Approved_Advance_Amount__c", "Max_Advance_Amount__c"],
+    )
+    if _aam_spine_field:
+        select_pairs.append(("Approved Advance Amount Max", _aam_spine_field))
+
     # Per-property suspense balance (Property__c level). The completed report shows
     # suspense per asset, not the deal-level Opportunity suspense spread once per deal.
     # Looked up defensively so a missing field cannot break the (large) spine SOQL.
@@ -5536,11 +5550,13 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
-    # NEW column: Asset Commitment = approved Initial Disbursement + Renovation
-    # Holdback + Interest Allocation (asset-level). Components are populated by the
-    # spine map below; the final value is computed in the materialize step so it
-    # uses the same components as SF Funded Amount. Seed the column here so it exists.
-    out["Asset Commitment"] = np.nan
+    # V56: Asset Commitment is mapped from the per-asset Approved Advance Amount Max by
+    # the BRIDGE_ASSET_FROM_BRIDGE_SPINE loop above. It must NOT be re-seeded to NaN here --
+    # doing so wiped the sourced value and forced the materializer's approved-components
+    # fallback (which matches only 4,762 of 4,782 on 20260824). Seed only when the spine
+    # did not supply the column at all.
+    if "Asset Commitment" not in out.columns:
+        out["Asset Commitment"] = np.nan
 
     out["Portfolio"] = pd.NA
     out["Segment"] = pd.NA
@@ -8150,12 +8166,18 @@ def _materialize_bridge_asset_formula_columns(df: pd.DataFrame, upb_col: str) ->
     )
 
     segment = _report_text_series_from_col(out, "Segment")
-    # NEW Asset Commitment = approved Initial Disbursement + Renovation Holdback + Interest Allocation.
-    out["Asset Commitment"] = (
+    # V56: Asset Commitment comes straight from the per-asset Approved Advance Amount Max
+    # (mapped on the spine). Exact 4,782/4,782 on 20260824. The old approved-components sum
+    # (Initial Disbursement Funded + Renovation Holdback + Interest Allocation) matched only
+    # 4,762 and is kept solely as the fallback for an asset the field is missing on -- it
+    # must NOT overwrite a sourced value.
+    _asset_commitment_sum = (
         _report_numeric_series_from_col(out, "Initial Disbursement Funded").fillna(0.0)
         + _report_numeric_series_from_col(out, "Renovation Holdback").fillna(0.0)
         + _report_numeric_series_from_col(out, "Interest Allocation").fillna(0.0)
     )
+    _asset_commitment_src = _report_numeric_series_from_col(out, "Asset Commitment")
+    out["Asset Commitment"] = _asset_commitment_src.where(_asset_commitment_src.notna(), _asset_commitment_sum)
     # NEW Loan Type: Portfolio 5A/TPO/RB map to labels, else fall back to Product Type.
     portfolio_ba = _report_text_series_from_col(out, "Portfolio")
     product_type_ba = _report_text_series_from_col(out, "Product Type")
