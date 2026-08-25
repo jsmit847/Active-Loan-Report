@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V62_BRIDGE_NPD_PRIOR_BEFORE_SALESFORCE"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V63_REVERT_V62_NPD_STAYS_SERVICER_THEN_SF"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -3729,13 +3729,19 @@ def _bridge_pick_next_payment_date(
     sf = pd.to_datetime(pd.Series(sf_dates, copy=False), errors="coerce")
     serv = pd.to_datetime(pd.Series(servicer_dates, index=sf.index, copy=False), errors="coerce")
     prior = pd.to_datetime(pd.Series(prior_dates, index=sf.index, copy=False), errors="coerce") if prior_dates is not None else pd.Series([pd.NaT] * len(sf), index=sf.index)
-    # V62: when the servicer tape has no row for the asset, prefer the PRIOR COMPLETED
-    # REPORT over the Salesforce date. Opportunity/Property Next_Payment_Date__c is a
-    # SCHEDULED billing date that reads day-10 for FCI and Onity and can be years stale;
-    # the official report carries its own previous value forward instead. Measured on
-    # test 75 vs the 20260824 official with the 20260817 official as prior: 86 assets
-    # read prior=day1 / SF=day10 / official=day1, i.e. SF loses every one of them.
-    out = serv.where(serv.notna(), prior.where(prior.notna(), sf))
+    # V63: do NOT reorder this to prefer the prior report over `sf`. V62 tried exactly
+    # that -- serv -> prior -> sf, plus a prior-first FCI far-future gate -- on the
+    # strength of test 75, where the prior (20260817 official) beat the build 99.33% to
+    # 96.71% on Bridge Asset NPD. Test 76, a V61 build against the same 20260824
+    # official, scores 99.79% here: prior-first would have fixed 0 cells and broken 22.
+    # Test 75 was a V58 build and a bad baseline; measure NPD changes against a build
+    # made with the correct prior workbook, never against an older test.
+    # The residue is the opposite problem: all 10 of test 76's misses already EQUAL the
+    # prior and the official has moved a month ON (assets 1479741-1479744 Onity read
+    # 2026-08-01 where the official says 2026-09-01). The missing rule is 'advance the
+    # carried date when a payment has since been made', which needs the live tape to
+    # distinguish from a loan that simply did not pay.
+    out = serv.where(serv.notna(), sf)
     if BRIDGE_NPD_PRESERVE_DAY10_WHEN_SERVICER_DAY1:
         # V57: the old rule here was
         #     same_month_sf & serv.day==1 & sf.day==10  ->  take the Salesforce date
@@ -3777,14 +3783,7 @@ def _bridge_pick_next_payment_date(
         serv_fam = pd.Series(servicer_names, index=sf.index, copy=False).astype(str).str.strip().str.casefold()
         is_fci = serv_fam.str.startswith("fci")
         far_future = is_fci & sf.notna() & serv.notna() & ((serv - sf).dt.days > 60)
-        # V62: revert to the PRIOR REPORT's date, not the Salesforce one. The SF date on
-        # these delinquent FCI loans is frozen years back (assets 1254251/1254254 read
-        # 2023-08-10 from SF while both the 20260817 and 20260824 officials say
-        # 2026-03-10), so 'SF holds the truth' was only ever true relative to FCI's
-        # roll-forward, never absolutely. Prior-first keeps the frozen historical NPD the
-        # official actually reports.
-        _ff_pick = prior.where(prior.notna(), sf)
-        out = out.where(~far_future, _ff_pick)
+        out = out.where(~far_future, sf)
     out = pd.to_datetime(out, errors="coerce")
     # V43: the FCI day-1 -> First-Payment-day shift (_force_fci_day1_to_first_payment) is
     # DISABLED. Same-day comparison vs the 6/22 real report proved real keeps the FCI
