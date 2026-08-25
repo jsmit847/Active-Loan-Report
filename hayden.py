@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V63_REVERT_V62_NPD_STAYS_SERVICER_THEN_SF"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V64_TERM_LOAN_UPB_FLOOR_IS_LOAN_AMOUNT"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -5461,6 +5461,20 @@ def _guard_term_loan_upb_vs_amount(df: pd.DataFrame, upb_col: str, prev_maps: Op
         # value. This keeps Term Asset UPB populated (Loan Amount is always present)
         # and matches the report. Implausible matches are still logged by QA.
         out.loc[implausible, upb_col] = loan_amount.loc[implausible]
+
+    # V64: the same guard, from below. The official report never shows a Term Loan with a
+    # zero or blank UPB -- 0 of 1,025 rows on 20260824 -- so a zero here means the servicer
+    # match failed, not that the loan paid off. Deals 43422 and 43462 (Vision & Beyond 1 and
+    # 2, Legacy / Active Term, DQ 90+, Servicer 'N/A') carry no servicer row at all, and the
+    # official falls back to Loan Amount: 18,189,500 and 18,047,000, which is also exactly
+    # what each deal's Property ALA sums to. Test 76 wrote 0 for both, understating the Term
+    # tabs by 36.2M of their total 52.5M gap and blanking the 60 Term Asset rows underneath.
+    # Scoped to rows that are zero/blank AND have a Loan Amount, so it cannot touch a row the
+    # servicer file already priced.
+    upb = pd.to_numeric(out[upb_col], errors="coerce")
+    missing_upb = loan_amount.gt(0) & (upb.isna() | upb.le(0))
+    if bool(missing_upb.any()):
+        out.loc[missing_upb, upb_col] = loan_amount.loc[missing_upb]
     return downcast_numeric_frame(out)
 
 
