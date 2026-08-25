@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_24_V59_BOARDING_KEEPS_UPB_BORROWER_ZERO"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V61_PRIOR_WORKBOOK_PROVENANCE_GUARD"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -4570,6 +4570,43 @@ def read_tab_df_from_active_loans(file_bytes: bytes, sheet: str) -> pd.DataFrame
 
 
 
+# V61: sheets that only a BUILD output has -- the official completed report never
+# carries the post-build QA tabs. Used to catch a previous test being uploaded as the
+# "prior completed report", which would let its errors carry forward.
+BUILD_OUTPUT_MARKER_SHEETS = ("QA Summary", "QA Exceptions")
+
+
+def prior_workbook_provenance(prev_bytes: Optional[bytes]) -> Tuple[bool, str]:
+    """Return (looks_like_build_output, human-readable note) for the uploaded prior workbook.
+
+    Carry-forward-first columns (Segment, Strategy Grouping, the Origination valuation
+    snapshot, Remedy Plan, ...) take the prior workbook's value over the live one, and
+    Next Payment Date falls back to it when neither the servicer file nor Salesforce has a
+    date. So the prior workbook must be the OFFICIAL completed report -- uploading last
+    run's test output makes this build inherit that run's mistakes.
+    """
+    if not prev_bytes:
+        return False, ""
+    try:
+        wb = load_workbook(BytesIO(prev_bytes), read_only=True, data_only=True)
+        try:
+            names = set(wb.sheetnames)
+        finally:
+            wb.close()
+    except Exception:
+        return False, ""
+    found = [s for s in BUILD_OUTPUT_MARKER_SHEETS if s in names]
+    if found:
+        return True, (
+            "The uploaded prior workbook contains " + " and ".join(found) + ", which only a "
+            "generated build has -- it looks like a previous test output rather than the "
+            "official completed report. Carry-forward-first columns and the Next Payment Date "
+            "fallback will inherit that run's values, so any error in it compounds into this "
+            "build. Upload the official completed report for the prior week instead."
+        )
+    return False, ""
+
+
 def build_prev_maps(prev_bytes: bytes) -> dict:
     out: dict = {}
 
@@ -7040,6 +7077,32 @@ def build_bridge_loan(
             pd.to_numeric(ba.get("Origination ARV", pd.Series([np.nan] * len(ba), index=ba.index)), errors="coerce"),
         )
 
+        # V60: the Bridge Loan "Most Recent" triple must summarise the FINAL Bridge Asset
+        # values, not a second derivation from the raw Updated/Origination columns. Those
+        # two can disagree (the asset tab applies the report's own
+        # IF($BH<>"N/A",...) precedence plus the blank-zero and carry-forward rules), and
+        # the loan tab then reports a total that does not tie to the assets beneath it.
+        # Measured on 20260824 against the official: summing the materialized asset values
+        # scores 986/998 As-Is and 980/998 ARV, and MIN of the asset valuation date scores
+        # 995/998, versus 917 / 959 / 962 for the re-derived version. Recomputing the
+        # materializer here is cheap (~5k rows) and guarantees the two tabs tie.
+        try:
+            _ba_final = _materialize_bridge_asset_formula_columns(ba, upb_col)
+            for _src_col, _roll_col in (
+                ("Most Recent Valuation Date", "_roll_recent_val_dt"),
+                ("Most Recent As-Is Value", "_roll_recent_asis"),
+                ("Most Recent ARV", "_roll_recent_arv"),
+            ):
+                if _src_col in _ba_final.columns:
+                    _vals = pd.Series(_ba_final[_src_col].to_numpy(), index=ba.index)
+                    ba[_roll_col] = (
+                        pd.to_datetime(_vals, errors="coerce") if "Date" in _src_col
+                        else pd.to_numeric(_vals, errors="coerce")
+                    )
+        except Exception:
+            # Never let the consistency pass break the build; the derivation above stands.
+            pass
+
         g = ba.groupby("_deal_key", dropna=True)
 
         def _first(series: pd.Series):
@@ -7074,6 +7137,12 @@ def build_bridge_loan(
                 # (oldest) of the deal's asset valuation dates, not the newest -- it flags how
                 # stale the weakest collateral value is. 993/996 deals against 20260810; MAX
                 # matched only 893. (Consistent with Next Payment Date, which is also a MIN.)
+                # V60: the official also aggregates these straight off the asset tab --
+                # Current/Original Maturity Date as the deal MIN and Loan Stage as the single
+                # distinct value (998/998 each on 20260824).
+                "Current Maturity Date_active": g["Current Loan Maturity date"].apply(_min_dt) if "Current Loan Maturity date" in ba.columns else pd.NaT,
+                "Original Maturity Date_active": g["Original Loan Maturity date"].apply(_min_dt) if "Original Loan Maturity date" in ba.columns else pd.NaT,
+                "Loan Stage_active": g["Loan Stage"].apply(first_or_various) if "Loan Stage" in ba.columns else pd.Series(dtype="string"),
                 "Most Recent Valuation Date": g["_roll_recent_val_dt"].apply(_min_dt),
                 "Most Recent As-Is Value": pd.to_numeric(g["_roll_recent_asis"].sum(min_count=1), errors="coerce"),
                 "Most Recent ARV": pd.to_numeric(g["_roll_recent_arv"].sum(min_count=1), errors="coerce"),
@@ -7101,6 +7170,16 @@ def build_bridge_loan(
         out["3/31 NPL"] = "N"
         out["Needs NPL Value"] = "N"
         out["Special Focus (Y/N)"] = "N"
+
+    # V60: prefer the asset-tab rollup for these three (the loan-level Salesforce value is
+    # only a fallback), so the loan tab cannot contradict its own assets.
+    for _bl_col in ("Current Maturity Date", "Original Maturity Date"):
+        _src = f"{_bl_col}_active"
+        if _src in out.columns:
+            _rolled = pd.to_datetime(out[_src], errors="coerce")
+            out[_bl_col] = _rolled.where(_rolled.notna(), pd.to_datetime(out.get(_bl_col, pd.Series([pd.NaT] * len(out), index=out.index)), errors="coerce"))
+    if "Loan Stage_active" in out.columns:
+        out["Loan Stage"] = coalesce_keep_nonblank(out["Loan Stage_active"], out.get("Loan Stage", blank_obj))
 
     out["Primary Contact"] = coalesce_keep_nonblank(out.get("Primary Contact_active", blank_obj), out.get("Primary Contact", blank_obj))
     # Fix H.1: BL Last Funding Date = MAX of the per-asset "Last Funding Date" across the
@@ -9759,6 +9838,13 @@ if build_btn:
 
             if prev_upload:
                 status.update(label="Reading uploaded completed report for carry-forward...")
+                _prior_is_build, _prior_note = prior_workbook_provenance(prev_bytes)
+                if _prior_is_build:
+                    diagnostics.append("PRIOR WORKBOOK WARNING: " + _prior_note)
+                    try:
+                        st.warning("⚠️ " + _prior_note)
+                    except Exception:
+                        pass
                 prev_maps = build_prev_maps(prev_bytes)
             else:
                 diagnostics.append("No prior/completed Active Loans workbook uploaded: using the repo template only; manual carry-forward/backfill fields will be limited to Salesforce/template logic.")
