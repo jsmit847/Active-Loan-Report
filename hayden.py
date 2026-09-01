@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V68_VERIFY_SAVED_WORKBOOK"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V69_FIX_BRIDGE_NPD_INDEX_MISALIGNMENT"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -5723,6 +5723,31 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
+    # V69: carry the Salesforce payment dates as COLUMNS on `out`, here, while `out` still
+    # shares sf_spine's index. They used to be read straight off sf_spine much further down,
+    # AFTER `out` had been through eight left-merges -- and a merge replaces the index with a
+    # fresh 0..n-1 RangeIndex. sf_spine's index is NOT 0..n-1: _build_bridge_spine_like ends
+    # with a filter, a sort_values and a drop_duplicates, none of which reset it, so it is a
+    # sparse permuted subset of the original bulk-query index. Every later operation that
+    # combined those series with `out` therefore aligned on labels that no longer meant the
+    # same row, and _bridge_pick_next_payment_date made it worse by doing
+    # pd.Series(servicer_dates, index=sf.index), which REINDEXES the servicer dates onto the
+    # stale labels. Rows came out holding another row's date or NaT.
+    #
+    # On test 77 that put 2026-05-10 -- a real Statebridge value, 281 rows of it in
+    # CoreVestLoanData_08312026 -- onto 88 FCI deals whose own FCI tape rows say 2026-10-01
+    # (51 of them) or 2026-09-01 (27). Bridge Loan takes the MIN of its assets' dates, so one
+    # scrambled asset dragged the whole deal back four months, and Days Past Due and 9/30 NPL
+    # cascaded off it: 176 + 176 + 129 of that tab's 971 mismatches.
+    #
+    # Assigned as columns, the values travel with their row through every merge.
+    for _spine_src, _spine_dst in (
+        ("Property Next Payment Date", "_sf_prop_npd"),
+        ("Opportunity Next Payment Date", "_sf_opp_npd"),
+        ("First Payment Date", "_sf_first_payment_src"),
+    ):
+        out[_spine_dst] = sf_spine[_spine_src] if _spine_src in sf_spine.columns else pd.NaT
+
     # V56: Asset Commitment is mapped from the per-asset Approved Advance Amount Max by
     # the BRIDGE_ASSET_FROM_BRIDGE_SPINE loop above. It must NOT be re-seeded to NaN here --
     # doing so wiped the sourced value and forced the materializer's approved-components
@@ -5894,14 +5919,16 @@ def build_bridge_asset(
     # silently disabled the sold exclusion on recalc.
     out["Financing"] = out["Financing"].mask(blankish_mask(out["Financing"]) & base_stage_series.eq("Sold"), BRIDGE_SOLD_FINANCING)
 
-    prop_npd = pd.to_datetime(sf_spine.get("Property Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
-    opp_npd = pd.to_datetime(sf_spine.get("Opportunity Next Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
+    # V69: read these off `out`, NOT off sf_spine. `out` has been re-indexed by the merges
+    # above; sf_spine still carries its original sparse index, so anything taken from it here
+    # would align onto the wrong rows. See the note next to the _sf_* columns above.
+    _nat_col = pd.Series([pd.NaT] * len(out), index=out.index)
+    prop_npd = pd.to_datetime(out.get("_sf_prop_npd", _nat_col), errors="coerce")
+    opp_npd = pd.to_datetime(out.get("_sf_opp_npd", _nat_col), errors="coerce")
     sf_next_payment = prop_npd.where(prop_npd.notna(), opp_npd)
-    # First Payment Date for the FCI day-1 NPD correction. Computed here (same index
-    # basis as sf_next_payment) so it flows through _bridge_pick_next_payment_date with
-    # identical alignment.
-    sf_first_payment = pd.to_datetime(sf_spine.get("First Payment Date", pd.Series([pd.NaT] * len(out))), errors="coerce")
-    sf_current_upb = pd.to_numeric(sf_spine.get("Current UPB", pd.Series([np.nan] * len(out))), errors="coerce")
+    # First Payment Date for the FCI day-1 NPD correction.
+    sf_first_payment = pd.to_datetime(out.get("_sf_first_payment_src", _nat_col), errors="coerce")
+    sf_current_upb = pd.to_numeric(out.get("Current UPB", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
 
     blank_obj = pd.Series([pd.NA] * len(out), index=out.index, dtype="object")
 
