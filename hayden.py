@@ -66,7 +66,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V75_PURE_PY_WRITER_AND_SHEET_PRUNE"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V76_KEEP_PAYOFF_SHEETS_BY_DEFAULT"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -9903,10 +9903,17 @@ def enforce_zero_fillable_blanks(
 
 
 
-def _prune_non_report_sheets(wb) -> List[str]:
-    """Remove the carried-over sheets the finished report should not contain."""
+def _prune_non_report_sheets(wb, sheet_names: Optional[Sequence[str]] = None) -> List[str]:
+    """Remove carried-over sheets from the finished report.
+
+    V76: OFF by default. Keeping Bridge Payoffs / Term Payoffs / REO Sales was never what
+    emptied Bridge Asset and Term Asset -- that was openpyxl streaming the two largest
+    worksheets through lxml on Python 3.14 (see the note at the top of this file). The
+    official report carries these sheets, so the default is to carry them too, and dropping
+    them is a deliberate per-run choice.
+    """
     removed = []
-    for _name in REPORT_DROP_SHEETS:
+    for _name in (sheet_names if sheet_names is not None else REPORT_DROP_SHEETS):
         if _name in wb.sheetnames:
             try:
                 del wb[_name]
@@ -9936,6 +9943,7 @@ def _write_build_log_sheet(wb, diagnostics, upb_col, template_path, build_target
         rows = []
         rows.append(("build version", APP_BUILD_VERSION))
         rows.append(("build target", str(build_target_label)))
+        rows.append(("non-report sheets dropped", "yes" if globals().get("drop_extra_sheets") else "no"))
         rows.append(("template source", str(template_path)))
         rows.append(("UPB header", str(upb_col)))
         rows.append(("python", _sys.version.split()[0]))
@@ -10127,6 +10135,19 @@ allow_qa_fail_download = st.checkbox(
 )
 run_postbuild_qa = True
 st.caption("Zero-blank repair / QA runs automatically on every build.")
+
+drop_extra_sheets = st.checkbox(
+    "Drop the carried-over Payoffs / REO Sales / Pacific Life / 2026-1 / CAFL SA / JLL sheets",
+    value=False,
+    help=(
+        "Off by default, which matches the official report -- it carries all of these. "
+        "The template is your uploaded prior workbook, so whatever is on it comes through. "
+        "This has NO bearing on the Bridge Asset / Term Asset tabs: those were emptied by the "
+        "openpyxl worksheet writer on Python 3.14, which is fixed separately. "
+        "Strategy Groupings, SSP Loans and Legacy are never dropped -- the build reads its "
+        "lookups out of them."
+    ),
+)
 
 if st.button("Clear cached Salesforce metadata", type="secondary"):
     st.session_state.sobject_describe_cache = {}
@@ -10485,11 +10506,20 @@ if build_btn:
                 )
 
             status.update(label="Saving workbook...")
-            _dropped_sheets = _prune_non_report_sheets(wb)
-            if _dropped_sheets:
-                diagnostics.append(
-                    "Removed non-report sheets carried in from the template: " + ", ".join(_dropped_sheets)
-                )
+            if drop_extra_sheets:
+                _dropped_sheets = _prune_non_report_sheets(wb)
+                if _dropped_sheets:
+                    diagnostics.append(
+                        "Removed non-report sheets carried in from the template: " + ", ".join(_dropped_sheets)
+                    )
+            else:
+                _kept = [n for n in REPORT_DROP_SHEETS if n in wb.sheetnames]
+                if _kept:
+                    diagnostics.append(
+                        "Kept the carried-over non-report sheets (matches the official report): "
+                        + ", ".join(_kept)
+                        + '. Tick "Drop the carried-over ... sheets" to remove them.'
+                    )
             diagnostics.append("Sheets in the finished workbook: " + ", ".join(wb.sheetnames))
             _write_build_log_sheet(wb, diagnostics, upb_col, tmpl_path_used, build_target)
             out_bytes = BytesIO()
