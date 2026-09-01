@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V64_TERM_LOAN_UPB_FLOOR_IS_LOAN_AMOUNT"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V65_TERM_ASSET_MUST_CARRY_A_BALANCE"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -7009,6 +7009,26 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
             | pd.to_numeric(out.get("Updated As-Is Value", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").notna()
         )
     )
+    # V65: a Term Asset must carry a balance. Salesforce keeps sub-unit and released
+    # property records alive with a real Address but no allocation, and the mask above lets
+    # them through on the Address alone -- 116 of test 76's 152 extra Term Asset rows are
+    # exactly that. Deal 25703 is the clearest case: 23 Condo records at one address, each
+    # '# Units' = 1, every one with Property ALA and UPB of zero, because the parent
+    # property holds the allocation.
+    #
+    # Is_Sub_Unit__c is already filtered in the SOQL (_build_term_asset_like), so these rows
+    # have the checkbox unticked or null in Salesforce. This is the belt-and-braces catch for
+    # the ones the flag misses.
+    #
+    # No official report carries such a row: Property ALA <= 0 and UPB <= 0 both occur 0
+    # times across the 20260803 / 20260810 / 20260817 / 20260824 reports, 97,000+ asset rows.
+    # On test 76 the rule drops 116 rows, all 116 of them extras, and loses no real asset.
+    # Scoped to rows where BOTH are non-positive so an asset with a real balance but a
+    # missing allocation still survives.
+    _ta_ala = pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
+    _ta_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
+    meaningful_mask = meaningful_mask & (_ta_ala.gt(0) | _ta_upb.ne(0))
+
     out = out.loc[meaningful_mask].copy()
 
     # Value columns blank (not 0) to match the official report.
