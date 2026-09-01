@@ -1,7 +1,25 @@
-streamlit
-pandas
-numpy
-openpyxl
-simple-salesforce
-xlsxwriter
-requests
+# PINNED DELIBERATELY -- do not loosen without testing a full build first.
+#
+# This file is re-resolved by Streamlit Community Cloud on every rebuild. Unpinned, it drifted
+# to Python 3.14.7 / pandas 3.0.5 / numpy 2.5.2 in the rebuild at 18:34 UTC on 2026-09-01.
+# Both builds after that rebuild (tests 77 and 78) shipped with the Bridge Asset and Term
+# Asset tabs as 918-byte empty worksheets; the build before it (test 76, 2026-08-25) was fine,
+# and no code change since then touches the Bridge Asset write path. The app log for the
+# broken run contains no traceback -- only hundreds of pandas 3.0 Copy-on-Write deprecation
+# warnings -- so the failure is silent.
+#
+# The mechanism is NOT yet pinned down: write_output_sheet and the required-key row drops were
+# both tested directly against pandas 3.0.5 and behave correctly there, so the cause is
+# something further along that a small synthetic frame does not exercise. Until a full build
+# has been run and verified on pandas 3.x, stay on the 2.x line that is known to work.
+#
+# pandas 2.x publishes no cp314 wheels, so the app's Python version must also be 3.13 or
+# lower. That is NOT controlled from this file -- set it in Streamlit Cloud under
+# app -> Settings -> Advanced -> Python version, then reboot the app.
+streamlit>=1.40,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+openpyxl==3.1.5
+simple-salesforce>=1.12,<2
+xlsxwriter>=3.1,<4
+requests>=2.31,<3

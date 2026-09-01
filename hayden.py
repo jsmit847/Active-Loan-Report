@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V70_SAVE_CHECK_FAILS_CLOSED"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V71_PIN_DEPS_AND_CHECK_EACH_WRITE"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -61,6 +61,11 @@ SUBUNIT_FLAG_CENSUS: Dict[str, int] = {}
 # Bridge Asset and Term Asset as 918-byte empty stubs -- zero cells, not even the rows 1-5
 # scaffold -- while its own QA Summary reported 4,694 and 23,848 data rows for them.
 WRITTEN_SHEET_ROWS: Dict[str, int] = {}
+
+# V71: sheet_name -> {"handed": n, "on_sheet_after_write": n}, filled by write_output_sheet and
+# reported in the build diagnostics. Distinguishes "the write produced nothing" from "the rows
+# were lost later", which the V70 save check alone cannot tell apart.
+SHEET_WRITE_AUDIT: Dict[str, dict] = {}
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -8976,6 +8981,29 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
     _reset_sheet_autofilter(ws, hdr, row_count=len(df), header_row=HEADER_ROW, start_row=DATA_START_ROW)
 
 
+    # V71: confirm this sheet actually received rows, immediately after writing it. Tests 77
+    # and 78 both shipped with Bridge Asset and Term Asset as empty worksheets while the QA
+    # audit -- which runs later -- still reported 4,691 and 23,848 data rows for them, so the
+    # rows were present at audit time and gone in the saved bytes. That leaves two very
+    # different possibilities, and this check separates them: if it fires, the write itself
+    # produced nothing; if it stays quiet and the V70 save check still fails, the rows are
+    # being lost after this point. Either way the next run says which.
+    _expected_rows = int(WRITTEN_SHEET_ROWS.get(sheet_name, 0) or 0)
+    if _expected_rows > 0:
+        _written = 0
+        _probe_cols = [c for c, _h in hdr][:40] or [2]
+        for _r in range(DATA_START_ROW, min(ws.max_row, DATA_START_ROW + _expected_rows + 5) + 1):
+            if any(ws.cell(_r, _c).value not in (None, "") for _c in _probe_cols):
+                _written += 1
+        SHEET_WRITE_AUDIT[sheet_name] = {"handed": _expected_rows, "on_sheet_after_write": _written}
+        if _written == 0:
+            raise RuntimeError(
+                f"{sheet_name}: write_output_sheet was handed {_expected_rows:,} rows but the sheet "
+                f"holds none immediately after writing. Refusing to continue rather than build an "
+                f"incomplete report. This is the failure that emptied Bridge Asset and Term Asset in "
+                f"tests 77 and 78; check the pinned dependency versions in requirements.txt."
+            )
+
 def _materialize_term_loan_allocations_on_sheet(wb, term_asset_df: pd.DataFrame, upb_col: str) -> str:
     """Fill Term Loan SFR/MF Allocation + Strategy Grouping as values, post Term Asset.
 
@@ -10394,6 +10422,14 @@ if build_btn:
                     "The sheets were populated when the QA audit read them, so they were lost during the save. "
                     "Re-run; if it repeats, send the full diagnostics text -- this is a save-path or memory "
                     "problem, not a data problem."
+                )
+            if SHEET_WRITE_AUDIT:
+                diagnostics.append(
+                    "Rows on each sheet immediately after its write: "
+                    + ", ".join(
+                        f"{k} {v['on_sheet_after_write']:,}/{v['handed']:,}"
+                        for k, v in SHEET_WRITE_AUDIT.items()
+                    )
                 )
             if WRITTEN_SHEET_ROWS:
                 diagnostics.append(
