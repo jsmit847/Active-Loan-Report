@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V71_PIN_DEPS_AND_CHECK_EACH_WRITE"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V72_FIX_SAVE_CHECK_REGEX"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -10383,13 +10383,13 @@ if build_btn:
                     _rid_to_target = {
                         m.group(1): m.group(2)
                         for m in re.finditer(
-                            r'<Relationship(?=[^>]*Id="([^"]+)")(?=[^>]*Target="([^"]+)")[^>]*>', _rels
+                            r'<Relationship (?=[^>]*Id="([^"]+)")(?=[^>]*Target="([^"]+)")[^>]*>', _rels
                         )
                     }
                     _name_to_rid = {
                         m.group(1): m.group(2)
                         for m in re.finditer(
-                            r'<sheet(?=[^>]*name="([^"]+)")(?=[^>]*r:id="([^"]+)")[^>]*>', _wbx
+                            r'<sheet (?=[^>]*name="([^"]+)")(?=[^>]*r:id="([^"]+)")[^>]*>', _wbx
                         )
                     }
                     for _sn, _expected in WRITTEN_SHEET_ROWS.items():
