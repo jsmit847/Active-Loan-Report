@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V65_TERM_ASSET_MUST_CARRY_A_BALANCE"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V66_TERM_FINANCING_TAXONOMY_AND_MIXED_USE"
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -6629,6 +6629,48 @@ def _build_term_sf_sid_lookup(sf_term: pd.DataFrame, prev_maps: Optional[dict] =
     return downcast_numeric_frame(key_df.drop_duplicates("_sid_key", keep="last"))
 
 
+def _apply_term_financing_taxonomy(out: pd.DataFrame) -> pd.DataFrame:
+    """Financing pins Segment and Portfolio on both Term tabs.
+
+    Measured against the 20260824 official, with zero exceptions in either direction:
+
+      Financing contains 'CPP JV'  -> Segment 'CPP JV', Portfolio 'Active Term'
+          Term Asset 361 rows, Term Loan 25. The official says CPP JV on every one; the
+          build said 'Mortgage Banking' on 40 assets and 2 loans, all of them
+          'CPP JV - Wells Fargo' on deals 63955 and 64218 -- and the official carries the
+          same Financing text we do, so only the Segment derivation was wrong.
+
+      Financing == 'Morgan Stanley' -> Segment 'Mortgage Banking', Portfolio 'DSCR'
+          Term Loan 57 rows, Term Asset 74. The official is Mortgage Banking / DSCR on all
+          of them; the build disagreed on 6 Segment + 3 Portfolio (loans) and 7 + 4 (assets).
+
+    The Morgan Stanley test is an EXACT match, not a substring: 'CPP JV - Morgan Stanley' is
+    a CPP JV warehouse and must fall to the rule above, which is why CPP JV is applied first.
+
+    NOT done here: blanking Financing itself. The official blanks it on only 15 of the 57
+    Morgan Stanley loans and keeps 'Morgan Stanley' on the other 42, and no rule separating
+    them is visible in the report, so the value is left alone.
+    """
+    if out is None or out.empty or "Financing" not in out.columns:
+        return out
+    fin = out["Financing"].astype("string").fillna("").str.strip()
+
+    cpp = fin.str.contains("CPP JV", case=False, na=False)
+    if bool(cpp.any()):
+        if "Segment" in out.columns:
+            out.loc[cpp, "Segment"] = "CPP JV"
+        if "Portfolio" in out.columns:
+            out.loc[cpp, "Portfolio"] = "Active Term"
+
+    ms = fin.str.casefold().eq("morgan stanley")
+    if bool(ms.any()):
+        if "Segment" in out.columns:
+            out.loc[ms, "Segment"] = "Mortgage Banking"
+        if "Portfolio" in out.columns:
+            out.loc[ms, "Portfolio"] = "DSCR"
+    return out
+
+
 def build_term_loan(
     sf_term: pd.DataFrame,
     sf_am: pd.DataFrame,
@@ -6848,6 +6890,8 @@ def build_term_loan(
             out.loc[_l_boarding_only, "Servicer"] = "N/A"
             out.loc[_l_boarding_only, "Servicer ID"] = "N/A"
 
+    out = _apply_term_financing_taxonomy(out)
+
     terminal_zero_keys = _term_terminal_zero_exclusion_keys(sf_term)
     if terminal_zero_keys:
         out = _drop_term_deal_keys(out, terminal_zero_keys)
@@ -6962,6 +7006,17 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     )
     out["Grouping"] = coalesce_keep_nonblank(_grouping, _grouping_guess)
 
+    # V66: a Mixed Use property with 5 or more units is Multifamily. The guess above only
+    # fills a blank, so a carried-forward 'Single Family Rental' survived on all 68 of the
+    # official's Mixed Use assets while the official calls 40 of them Multifamily. '# Units'
+    # separates them exactly: every Multifamily one has 5+ units (5 through 63) and every
+    # Single Family Rental one has 2, 3 or 4 -- 68/68, no overlap. Applied as an override
+    # rather than a fill, and scoped to Mixed Use so it cannot disturb the other 23,771 rows.
+    _units = pd.to_numeric(out.get("# Units", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    _mixed_mf = _prop_type.astype("string").fillna("").str.strip().str.casefold().eq("mixed use") & _units.ge(5)
+    if bool(_mixed_mf.any()):
+        out.loc[_mixed_mf, "Grouping"] = "Multifamily"
+
     # V37 taxonomy cascade: Term Asset inherits the parent deal's Portfolio/Financing, but
     # the prior Term Asset carry-forward wins over the Term Loan value via
     # coalesce_report_display_first. Derive the SSR deal set from the built Term Loan
@@ -7025,6 +7080,8 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     # On test 76 the rule drops 116 rows, all 116 of them extras, and loses no real asset.
     # Scoped to rows where BOTH are non-positive so an asset with a real balance but a
     # missing allocation still survives.
+    out = _apply_term_financing_taxonomy(out)
+
     _ta_ala = pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
     _ta_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
     meaningful_mask = meaningful_mask & (_ta_ala.gt(0) | _ta_upb.ne(0))
