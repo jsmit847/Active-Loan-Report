@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V69_FIX_BRIDGE_NPD_INDEX_MISALIGNMENT"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V70_SAVE_CHECK_FAILS_CLOSED"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -10336,28 +10336,64 @@ if build_btn:
             # only touch cell values -- but test 77 shipped with Bridge Asset and Term Asset
             # as empty stubs anyway, after a QA audit that had seen 4,694 and 23,848 rows.
             # Whatever the cause, a half-workbook must never reach the user silently.
+            # V70: the V68 version of this check trusted openpyxl's read-only max_row and, worse,
+            # FAILED OPEN -- any exception in the check itself only logged a line and let the
+            # download proceed. Test 78 shipped with the same two empty stubs as test 77
+            # despite the guard being live, so the check is now made on the saved ZIP itself
+            # and every failure path blocks.
+            #
+            # A worksheet with no data serialises as either a self-closing <sheetData/> or a
+            # <sheetData></sheetData> pair with no <row> element, and its part is ~918 bytes.
+            # That is unambiguous and needs no spreadsheet parsing at all.
             _lost = []
             try:
-                _chk = load_workbook(BytesIO(out_bytes.getvalue()), read_only=True, data_only=True, keep_links=False)
-                for _sn, _expected in WRITTEN_SHEET_ROWS.items():
-                    if _expected <= 0:
-                        continue
-                    if _sn not in _chk.sheetnames:
-                        _lost.append(f"{_sn}: sheet absent from the saved file (expected {_expected:,} rows)")
-                        continue
-                    _got = max(0, int(_chk[_sn].max_row or 0) - HEADER_ROW)
-                    if _got < max(1, int(_expected * 0.5)):
-                        _lost.append(f"{_sn}: saved with {_got:,} data rows, expected {_expected:,}")
-                _chk.close()
+                import zipfile as _zf
+                _raw = out_bytes.getvalue()
+                with _zf.ZipFile(BytesIO(_raw)) as _z:
+                    _wbx = _z.read("xl/workbook.xml").decode("utf-8", errors="replace")
+                    _rels = _z.read("xl/_rels/workbook.xml.rels").decode("utf-8", errors="replace")
+                    _rid_to_target = {
+                        m.group(1): m.group(2)
+                        for m in re.finditer(
+                            r'<Relationship(?=[^>]*Id="([^"]+)")(?=[^>]*Target="([^"]+)")[^>]*>', _rels
+                        )
+                    }
+                    _name_to_rid = {
+                        m.group(1): m.group(2)
+                        for m in re.finditer(
+                            r'<sheet(?=[^>]*name="([^"]+)")(?=[^>]*r:id="([^"]+)")[^>]*>', _wbx
+                        )
+                    }
+                    for _sn, _expected in WRITTEN_SHEET_ROWS.items():
+                        if _expected <= 0:
+                            continue
+                        _rid = _name_to_rid.get(_sn)
+                        if _rid is None:
+                            _lost.append(f"{_sn}: not declared in the saved workbook (expected {_expected:,} rows)")
+                            continue
+                        _tgt = (_rid_to_target.get(_rid) or "").lstrip("/")
+                        _part = _tgt if _tgt.startswith("xl/") else "xl/" + _tgt
+                        if _part not in _z.namelist():
+                            _lost.append(f"{_sn}: worksheet part {_part} missing from the saved file (expected {_expected:,} rows)")
+                            continue
+                        _xml = _z.read(_part).decode("utf-8", errors="replace")
+                        _rows = _xml.count("<row ")
+                        if _rows < max(1, int(_expected * 0.5)):
+                            _lost.append(
+                                f"{_sn}: saved with {_rows:,} rows in {_part} ({_z.getinfo(_part).file_size:,} bytes), expected about {_expected:,}"
+                            )
             except Exception as _verr:
-                diagnostics.append(f"Save verification could not run: {type(_verr).__name__}: {_verr}")
+                # Fail CLOSED: an unverifiable workbook is treated as a failed one.
+                _lost.append(f"the check itself could not run ({type(_verr).__name__}: {_verr})")
             if _lost:
                 diagnostics.append("SAVE VERIFICATION FAILED: " + "; ".join(_lost))
                 raise RuntimeError(
                     "The saved workbook lost data that was written to it: "
                     + "; ".join(_lost)
                     + ". The file was NOT offered for download because it would be an incomplete report. "
-                    "Re-run; if it repeats, this is a save-path/memory problem rather than a data problem."
+                    "The sheets were populated when the QA audit read them, so they were lost during the save. "
+                    "Re-run; if it repeats, send the full diagnostics text -- this is a save-path or memory "
+                    "problem, not a data problem."
                 )
             if WRITTEN_SHEET_ROWS:
                 diagnostics.append(
