@@ -45,7 +45,15 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V66_TERM_FINANCING_TAXONOMY_AND_MIXED_USE"
+APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V67_SUBUNIT_FLAG_CENSUS"
+
+# V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
+# queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
+# Is_Sub_Unit__c = NULL)" -- and that OR is only safe if NULL never actually occurs. The
+# Bridge spine pulls Is_Sub_Unit__c WITHOUT filtering it, so it can count the raw values for
+# free and settle the question on a live run. If NULL shows up, "off" and "not set" are
+# different things in this org and the Term predicate needs tightening to "= FALSE".
+SUBUNIT_FLAG_CENSUS: Dict[str, int] = {}
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -2225,6 +2233,23 @@ def _build_bridge_spine_like() -> pd.DataFrame:
 
     if df.empty:
         return df
+
+    # V67: census the raw Is Sub Unit values. This query does NOT filter on the flag, so it
+    # sees the whole active-bridge property population and can tell FALSE from NULL.
+    try:
+        if "Is Sub Unit" in df.columns:
+            _raw = df["Is Sub Unit"]
+            _blank = int(_raw.isna().sum() + (_raw.astype("string").str.strip() == "").sum())
+            _yn = _yn_from_bool_series(_raw)
+            SUBUNIT_FLAG_CENSUS.clear()
+            SUBUNIT_FLAG_CENSUS.update({
+                "rows": int(len(df)),
+                "true": int((_yn == "Y").sum()),
+                "false_or_null": int((_yn == "N").sum()),
+                "null_or_blank": _blank,
+            })
+    except Exception:
+        pass
 
     # Updated valuation columns should only use actual updated/current appraisal inputs.
     # Do not fall back to generic/origination valuation fields. If no updated value exists,
@@ -10053,6 +10078,20 @@ if build_btn:
                     diagnostics.append(f"Bridge Asset baseline backfill cells: {int(bridge_asset_backfill['fills']):,} using {bridge_asset_backfill.get('keys', 'n/a')}")
 
                 diagnostics.append(f"Bridge Asset rows: {len(bridge_asset_df):,}")
+                if SUBUNIT_FLAG_CENSUS:
+                    _sc = SUBUNIT_FLAG_CENSUS
+                    diagnostics.append(
+                        "Is Sub Unit census over {rows:,} active bridge properties: "
+                        "checked ON {true:,}, OFF-or-unset {false_or_null:,}, "
+                        "of which NULL/blank {null_or_blank:,}".format(**_sc)
+                    )
+                    if int(_sc.get("null_or_blank", 0)) > 0:
+                        diagnostics.append(
+                            "NOTE: Is_Sub_Unit__c is NULL/blank on {:,} properties, so 'off' and "
+                            "'not set' are NOT the same in this org. The Term Asset queries accept "
+                            "both via (= FALSE OR = NULL); tightening them to '= FALSE' would drop "
+                            "the never-set rows.".format(int(_sc["null_or_blank"]))
+                        )
                 diagnostics.append(
                     f"Bridge Asset nonblank {upb_col}: {bridge_asset_df[upb_col].notna().mean():.1%}"
                     if upb_col in bridge_asset_df.columns
