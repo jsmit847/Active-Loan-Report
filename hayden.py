@@ -1,3 +1,24 @@
+# V74: force openpyxl onto its pure-Python worksheet writer.
+#
+# openpyxl picks its XML writer at import time: if lxml imports, it streams every worksheet
+# through lxml.etree.xmlfile (a C incremental writer); otherwise it uses et_xmlfile, which is
+# plain Python. Streamlit Cloud installs lxml as a transitive dependency, so the C path was
+# active.
+#
+# Every build through 2026-08-25 produced a 5.8-7.9 MB workbook with all four tabs. Every
+# build from 2026-09-01 produced 837 KB with Bridge Asset and Term Asset -- by a wide margin
+# the two largest sheets -- serialised as ~918-byte stubs holding zero rows, while the smaller
+# sheets were written correctly. What changed that day was the runtime: Streamlit Cloud's
+# rebuild moved the app to Python 3.14.7 / pandas 3.0.5 / lxml 6.1.2. openpyxl 3.1.5 predates
+# Python 3.14. No code change in that window touches either sheet's row count, and the
+# in-Python row counts were correct on both sheets at write time and at QA time, so the loss
+# happens during serialisation of the two biggest worksheets.
+#
+# Blocking the import makes openpyxl fall back to et_xmlfile. That is slower on a workbook this
+# size but it is the writer that produced every working report, and correctness wins.
+import sys as _sys
+_sys.modules.setdefault("lxml", None)
+
 import base64
 import calendar
 import gc
@@ -45,7 +66,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V72_FIX_SAVE_CHECK_REGEX"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V75_PURE_PY_WRITER_AND_SHEET_PRUNE"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -61,6 +82,27 @@ SUBUNIT_FLAG_CENSUS: Dict[str, int] = {}
 # Bridge Asset and Term Asset as 918-byte empty stubs -- zero cells, not even the rows 1-5
 # scaffold -- while its own QA Summary reported 4,694 and 23,848 data rows for them.
 WRITTEN_SHEET_ROWS: Dict[str, int] = {}
+
+# V75: sheets the finished report must NOT carry. The template is the uploaded prior workbook
+# whenever one is supplied, so anything on it survives into the output unless it is removed --
+# which is how Bridge Payoffs / Term Payoffs / REO Sales kept reappearing week after week.
+# None of these is a source for any build column: build_prev_maps only reads Bridge Asset,
+# Bridge Loan, Term Loan and Term Asset.
+REPORT_DROP_SHEETS = (
+    "Bridge Payoffs",
+    "Term Payoffs",
+    "REO Sales",
+    "Pacific Life",
+    "2026-1",
+    "CAFL SA",
+    "JLL",
+)
+
+# Kept deliberately even though they are not report tabs: load_template_lookup_maps reads
+# Strategy Groupings, SSP Loans and Legacy straight out of the workbook, and the workbook the
+# build starts from is last week's output. Dropping them would silently break the strategy
+# grouping, SSP and Legacy lookups on the NEXT run.
+REPORT_KEEP_LOOKUP_SHEETS = ("SSP Loans", "Legacy", "Strategy Groupings")
 
 # V71: sheet_name -> {"handed": n, "on_sheet_after_write": n}, filled by write_output_sheet and
 # reported in the build diagnostics. Distinguishes "the write produced nothing" from "the rows
@@ -8997,6 +9039,15 @@ def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
                 _written += 1
         SHEET_WRITE_AUDIT[sheet_name] = {"handed": _expected_rows, "on_sheet_after_write": _written}
         if _written == 0:
+            # V74: record it, do not abort the build. Aborting produced no file to inspect.
+            try:
+                st.error(
+                    f"⚠️ {sheet_name}: handed {_expected_rows:,} rows but the sheet holds none "
+                    f"immediately after writing. See the Build Log sheet."
+                )
+            except Exception:
+                pass
+        if False:
             raise RuntimeError(
                 f"{sheet_name}: write_output_sheet was handed {_expected_rows:,} rows but the sheet "
                 f"holds none immediately after writing. Refusing to continue rather than build an "
@@ -9852,6 +9903,90 @@ def enforce_zero_fillable_blanks(
 
 
 
+def _prune_non_report_sheets(wb) -> List[str]:
+    """Remove the carried-over sheets the finished report should not contain."""
+    removed = []
+    for _name in REPORT_DROP_SHEETS:
+        if _name in wb.sheetnames:
+            try:
+                del wb[_name]
+                removed.append(_name)
+            except Exception:
+                pass
+    return removed
+
+
+def _write_build_log_sheet(wb, diagnostics, upb_col, template_path, build_target_label):
+    """Write the build's own log into the workbook as a 'Build Log' sheet.
+
+    Three broken builds in a row could not be diagnosed because the evidence lived in the
+    Streamlit session and never travelled with the file. From now on the artifact carries its
+    own provenance: versions, which template it started from, which sheets were handed rows,
+    how many rows were on each sheet right after its write, and every diagnostics line.
+    Never raises -- a logging failure must not cost a build.
+    """
+    try:
+        import sys as _sys
+        try:
+            if "Build Log" in wb.sheetnames:
+                del wb["Build Log"]
+        except Exception:
+            pass
+        ws = wb.create_sheet("Build Log")
+        rows = []
+        rows.append(("build version", APP_BUILD_VERSION))
+        rows.append(("build target", str(build_target_label)))
+        rows.append(("template source", str(template_path)))
+        rows.append(("UPB header", str(upb_col)))
+        rows.append(("python", _sys.version.split()[0]))
+        for _mod in ("pandas", "numpy", "openpyxl"):
+            try:
+                rows.append((_mod, __import__(_mod).__version__))
+            except Exception:
+                rows.append((_mod, "unavailable"))
+        try:
+            from openpyxl.xml import LXML as _LXML
+            rows.append(("openpyxl worksheet writer", "lxml (C)" if _LXML else "et_xmlfile (pure Python)"))
+        except Exception:
+            pass
+        rows.append(("", ""))
+        rows.append(("rows handed to write_output_sheet", ""))
+        for _k, _v in (WRITTEN_SHEET_ROWS or {}).items():
+            rows.append((f"  {_k}", _v))
+        if not WRITTEN_SHEET_ROWS:
+            rows.append(("  (none - write_output_sheet was never called)", ""))
+        rows.append(("", ""))
+        rows.append(("rows on sheet immediately after its write", ""))
+        for _k, _v in (SHEET_WRITE_AUDIT or {}).items():
+            rows.append((f"  {_k}", f"{_v.get('on_sheet_after_write')} of {_v.get('handed')}"))
+        if not SHEET_WRITE_AUDIT:
+            rows.append(("  (none recorded)", ""))
+        rows.append(("", ""))
+        rows.append(("sheets present at save time", ""))
+        for _sn in wb.sheetnames:
+            try:
+                _mr = wb[_sn].max_row or 0
+            except Exception:
+                _mr = "?"
+            rows.append((f"  {_sn}", f"max_row={_mr}"))
+        rows.append(("", ""))
+        rows.append(("diagnostics", ""))
+        for _line in (diagnostics or []):
+            rows.append(("", str(_line)[:1000]))
+        ws.cell(1, 1).value = "key"
+        ws.cell(1, 2).value = "value"
+        for _i, (_a, _b) in enumerate(rows, start=2):
+            ws.cell(_i, 1).value = _a
+            ws.cell(_i, 2).value = _b
+        try:
+            ws.column_dimensions["A"].width = 44
+            ws.column_dimensions["B"].width = 130
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def sanitize_summary_formulas(wb):
     if "Summary" not in wb.sheetnames:
         return
@@ -10350,6 +10485,13 @@ if build_btn:
                 )
 
             status.update(label="Saving workbook...")
+            _dropped_sheets = _prune_non_report_sheets(wb)
+            if _dropped_sheets:
+                diagnostics.append(
+                    "Removed non-report sheets carried in from the template: " + ", ".join(_dropped_sheets)
+                )
+            diagnostics.append("Sheets in the finished workbook: " + ", ".join(wb.sheetnames))
+            _write_build_log_sheet(wb, diagnostics, upb_col, tmpl_path_used, build_target)
             out_bytes = BytesIO()
             sanitize_summary_formulas(wb)
             _strip_timezones_from_workbook(wb)
@@ -10414,7 +10556,20 @@ if build_btn:
                 # Fail CLOSED: an unverifiable workbook is treated as a failed one.
                 _lost.append(f"the check itself could not run ({type(_verr).__name__}: {_verr})")
             if _lost:
+                # V74: this reports, it no longer blocks. Refusing the download left no
+                # artifact at all to diagnose from and cost a build; a flagged workbook plus
+                # the Build Log sheet is strictly more useful than nothing.
                 diagnostics.append("SAVE VERIFICATION FAILED: " + "; ".join(_lost))
+                try:
+                    st.error(
+                        "⚠️ The saved workbook lost data that was written to it: "
+                        + "; ".join(_lost)
+                        + ". The file is still offered for download so it can be inspected -- see the "
+                        "Build Log sheet -- but do NOT use it as the weekly report."
+                    )
+                except Exception:
+                    pass
+            if False:
                 raise RuntimeError(
                     "The saved workbook lost data that was written to it: "
                     + "; ".join(_lost)
@@ -10422,6 +10577,23 @@ if build_btn:
                     "The sheets were populated when the QA audit read them, so they were lost during the save. "
                     "Re-run; if it repeats, send the full diagnostics text -- this is a save-path or memory "
                     "problem, not a data problem."
+                )
+            # V73: the template is the UPLOADED PRIOR WORKBOOK whenever one is supplied
+            # (resolve_template_bytes), and restore_template_scaffold does not clear data rows.
+            # So a report tab that never gets written still shows last week's rows -- which is
+            # what made the QA audit report 4,691 Bridge Asset rows on a build that never wrote
+            # that sheet, and why WRITTEN_SHEET_ROWS had no entry for it and the save check
+            # skipped it. Name any expected tab that was never handed rows.
+            _never_written = [
+                _sn for _sn in ("Bridge Asset", "Bridge Loan", "Term Loan", "Term Asset")
+                if _sn in selected_sheet_names and _sn not in WRITTEN_SHEET_ROWS
+            ]
+            if _never_written:
+                diagnostics.append(
+                    "SHEETS NEVER WRITTEN: " + ", ".join(_never_written)
+                    + " -- these were selected for this build but write_output_sheet was never "
+                    "called for them, so whatever they contain came from the template (which is "
+                    "the uploaded prior workbook when one is supplied), not from this run."
                 )
             if SHEET_WRITE_AUDIT:
                 diagnostics.append(
