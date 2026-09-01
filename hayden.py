@@ -45,7 +45,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V67_SUBUNIT_FLAG_CENSUS"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V68_VERIFY_SAVED_WORKBOOK"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -54,6 +54,13 @@ APP_BUILD_VERSION = "ALR_FIX_2026_08_25_V67_SUBUNIT_FLAG_CENSUS"
 # free and settle the question on a live run. If NULL shows up, "off" and "not set" are
 # different things in this org and the Term predicate needs tightening to "= FALSE".
 SUBUNIT_FLAG_CENSUS: Dict[str, int] = {}
+
+# V68: sheet_name -> number of data rows handed to write_output_sheet. Checked against the
+# SAVED bytes before the download is offered, so a workbook that loses a tab between the QA
+# audit and the save fails loudly instead of shipping as a half-report. Test 77 shipped with
+# Bridge Asset and Term Asset as 918-byte empty stubs -- zero cells, not even the rows 1-5
+# scaffold -- while its own QA Summary reported 4,694 and 23,848 data rows for them.
+WRITTEN_SHEET_ROWS: Dict[str, int] = {}
 # New official report layout: headers on row 5, data starts row 6.
 HEADER_ROW = 5
 DATA_START_ROW = 6
@@ -8840,6 +8847,7 @@ def write_df_to_sheet_preserve_formulas(
 
 
 def write_output_sheet(wb, sheet_name: str, df: pd.DataFrame, upb_col: str):
+    WRITTEN_SHEET_ROWS[sheet_name] = 0 if df is None else int(len(df))
     if sheet_name not in wb.sheetnames:
         return
 
@@ -10294,6 +10302,41 @@ if build_btn:
             wb.save(out_bytes)
             out_bytes.seek(0)
             wb.close()
+
+            # V68: read the SAVED bytes back and confirm every sheet we wrote still carries
+            # its rows. Nothing between the write and here is supposed to remove data --
+            # repair_workbook_from_baseline only fills blanks, and the timezone/recalc passes
+            # only touch cell values -- but test 77 shipped with Bridge Asset and Term Asset
+            # as empty stubs anyway, after a QA audit that had seen 4,694 and 23,848 rows.
+            # Whatever the cause, a half-workbook must never reach the user silently.
+            _lost = []
+            try:
+                _chk = load_workbook(BytesIO(out_bytes.getvalue()), read_only=True, data_only=True, keep_links=False)
+                for _sn, _expected in WRITTEN_SHEET_ROWS.items():
+                    if _expected <= 0:
+                        continue
+                    if _sn not in _chk.sheetnames:
+                        _lost.append(f"{_sn}: sheet absent from the saved file (expected {_expected:,} rows)")
+                        continue
+                    _got = max(0, int(_chk[_sn].max_row or 0) - HEADER_ROW)
+                    if _got < max(1, int(_expected * 0.5)):
+                        _lost.append(f"{_sn}: saved with {_got:,} data rows, expected {_expected:,}")
+                _chk.close()
+            except Exception as _verr:
+                diagnostics.append(f"Save verification could not run: {type(_verr).__name__}: {_verr}")
+            if _lost:
+                diagnostics.append("SAVE VERIFICATION FAILED: " + "; ".join(_lost))
+                raise RuntimeError(
+                    "The saved workbook lost data that was written to it: "
+                    + "; ".join(_lost)
+                    + ". The file was NOT offered for download because it would be an incomplete report. "
+                    "Re-run; if it repeats, this is a save-path/memory problem rather than a data problem."
+                )
+            if WRITTEN_SHEET_ROWS:
+                diagnostics.append(
+                    "Save verification passed: "
+                    + ", ".join(f"{k} {v:,} rows" for k, v in WRITTEN_SHEET_ROWS.items() if v)
+                )
 
             st.session_state.built_workbook_bytes = out_bytes.getvalue()
             st.session_state.built_workbook_name = OUTPUT_TEST_FILENAME
