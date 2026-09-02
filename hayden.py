@@ -1,23 +1,34 @@
-# V74: force openpyxl onto its pure-Python worksheet writer.
+# V77: force openpyxl's WORKSHEET WRITER onto pure Python, and prove it took effect.
 #
-# openpyxl picks its XML writer at import time: if lxml imports, it streams every worksheet
-# through lxml.etree.xmlfile (a C incremental writer); otherwise it uses et_xmlfile, which is
-# plain Python. Streamlit Cloud installs lxml as a transitive dependency, so the C path was
-# active.
+# V74 tried this with sys.modules.setdefault("lxml", None) before importing openpyxl. That is
+# a no-op: Streamlit and its dependencies import lxml long before this module runs, so the key
+# already exists and setdefault leaves the real module in place. Test 80's own Build Log said
+# so -- "openpyxl worksheet writer: lxml (C)" -- while reporting Bridge Asset 4,691 of 4,691
+# rows on the sheet after write and max_row=4,696 at save time. Fully built, then the two
+# largest sheets were dropped during serialisation.
 #
-# Every build through 2026-08-25 produced a 5.8-7.9 MB workbook with all four tabs. Every
-# build from 2026-09-01 produced 837 KB with Bridge Asset and Term Asset -- by a wide margin
-# the two largest sheets -- serialised as ~918-byte stubs holding zero rows, while the smaller
-# sheets were written correctly. What changed that day was the runtime: Streamlit Cloud's
-# rebuild moved the app to Python 3.14.7 / pandas 3.0.5 / lxml 6.1.2. openpyxl 3.1.5 predates
-# Python 3.14. No code change in that window touches either sheet's row count, and the
-# in-Python row counts were correct on both sheets at write time and at QA time, so the loss
-# happens during serialisation of the two biggest worksheets.
+# openpyxl resolves the writer at import: openpyxl/xml/__init__.py sets LXML by trying to
+# import lxml.etree, openpyxl/xml/functions.py binds `xmlfile` from lxml.etree or et_xmlfile
+# accordingly, and openpyxl/worksheet/_writer.py imports that symbol. Rebinding it on the
+# writer module is what actually decides how worksheets are streamed, and it works no matter
+# what imported lxml first.
 #
-# Blocking the import makes openpyxl fall back to et_xmlfile. That is slower on a workbook this
-# size but it is the writer that produced every working report, and correctness wins.
+# Why bother: every build through 2026-08-25 wrote 5.8-7.9 MB with all four tabs. Every build
+# from 2026-09-01 -- the day Streamlit Cloud moved the app to Python 3.14.7 -- wrote ~800 KB
+# with Bridge Asset and Term Asset missing or empty, while every smaller sheet survived.
+# openpyxl 3.1.5 predates Python 3.14. et_xmlfile is slower on a workbook this size and is the
+# writer that produced every working report.
 import sys as _sys
-_sys.modules.setdefault("lxml", None)
+
+OPENPYXL_WORKSHEET_WRITER = "unknown"
+try:
+    import et_xmlfile as _et_xmlfile
+    import openpyxl.worksheet._writer as _openpyxl_ws_writer
+
+    _openpyxl_ws_writer.xmlfile = _et_xmlfile.xmlfile
+    OPENPYXL_WORKSHEET_WRITER = getattr(_openpyxl_ws_writer.xmlfile, "__module__", "?")
+except Exception as _writer_patch_exc:  # pragma: no cover - never break the build over this
+    OPENPYXL_WORKSHEET_WRITER = f"patch failed: {type(_writer_patch_exc).__name__}: {_writer_patch_exc}"
 
 import base64
 import calendar
@@ -66,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V76_KEEP_PAYOFF_SHEETS_BY_DEFAULT"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V77_PATCH_WORKSHEET_WRITER_DIRECTLY"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -9952,9 +9963,15 @@ def _write_build_log_sheet(wb, diagnostics, upb_col, template_path, build_target
                 rows.append((_mod, __import__(_mod).__version__))
             except Exception:
                 rows.append((_mod, "unavailable"))
+        rows.append(("openpyxl worksheet writer", str(OPENPYXL_WORKSHEET_WRITER)))
+        try:
+            import openpyxl.worksheet._writer as _wchk
+            rows.append(("worksheet writer in use now", getattr(_wchk.xmlfile, "__module__", "?")))
+        except Exception:
+            pass
         try:
             from openpyxl.xml import LXML as _LXML
-            rows.append(("openpyxl worksheet writer", "lxml (C)" if _LXML else "et_xmlfile (pure Python)"))
+            rows.append(("openpyxl.xml.LXML (informational)", str(_LXML)))
         except Exception:
             pass
         rows.append(("", ""))
@@ -10521,6 +10538,17 @@ if build_btn:
                         + '. Tick "Drop the carried-over ... sheets" to remove them.'
                     )
             diagnostics.append("Sheets in the finished workbook: " + ", ".join(wb.sheetnames))
+            try:
+                import openpyxl.worksheet._writer as _wchk2
+                _w_now = getattr(_wchk2.xmlfile, "__module__", "?")
+            except Exception:
+                _w_now = "?"
+            diagnostics.append(f"Worksheet writer in use: {_w_now} (expected et_xmlfile.xmlfile)")
+            if "et_xmlfile" not in str(_w_now):
+                diagnostics.append(
+                    "WARNING: openpyxl is still streaming worksheets through lxml. That is what "
+                    "emptied Bridge Asset and Term Asset on Python 3.14."
+                )
             _write_build_log_sheet(wb, diagnostics, upb_col, tmpl_path_used, build_target)
             out_bytes = BytesIO()
             sanitize_summary_formulas(wb)
