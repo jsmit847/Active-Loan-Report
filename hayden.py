@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V84_PANDAS3_STR_DTYPE_AND_RENO_MASK"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V85_LEGACY_STICKS_AND_NEW_ORIGINATION_MB"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -6383,6 +6383,12 @@ def build_bridge_asset(
         _am1_final = out["Asset Manager 1"].map(clean_text)
         out["SA Loan (Y/N)"] = _am1_final.map(lambda x: "Y" if x in _sa_mgrs else "N")
 
+    _prior_legacy_segment = None
+    if "Segment" in out.columns:
+        _prior_legacy_segment = (
+            out["Segment"].astype("string").str.strip().str.casefold().eq("legacy").fillna(False)
+        )
+
     # CAFL re-financed deals: once a deal is re-financed into a CAFL securitization its
     # Segment must read BRIDGE_SECURITIZED_SEGMENT, even if last week's completed report still
     # carried the prior vehicle (e.g. "CPP JV"). The prior-workbook carry-forward above is
@@ -6403,6 +6409,18 @@ def build_bridge_asset(
     if "Financing" in out.columns and "Segment" in out.columns:
         _cpp_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CPP JV", na=False)
         out.loc[_cpp_mask, "Segment"] = "CPP JV"
+
+    # V85: a deal the prior report already classifies as "Legacy" STAYS Legacy. Segment is
+    # carry-forward-first, so out["Segment"] holds last week's label at the capture point
+    # above; the two overrides would then relabel it off its Financing. The 8 deals 37185,
+    # 37535, 38304, 38528, 39392, 39795, 41118 and 47079 all carry Financing "CAFL 2026-R1",
+    # so the CAFL rule rewrote them to BRIDGE_SECURITIZED_SEGMENT while the 20260831 official
+    # -- and the 20260824 report before it -- call all 23 of their Legacy deals "Legacy".
+    # Being funded through a CAFL vehicle does not move a run-off deal back into the
+    # securitized book. Measured on 20260831: +13 Bridge Asset cells, +8 Bridge Loan cells,
+    # 0 regressions.
+    if _prior_legacy_segment is not None and bool(_prior_legacy_segment.any()):
+        out.loc[_prior_legacy_segment, "Segment"] = "Legacy"
 
     # Normalize curated free-text columns for encoding artifacts (mojibake like "â€™",
     # U+2019/dash variants, _x000D_ carriage returns). Previously only Tax Commentary was
@@ -6944,6 +6962,74 @@ def _apply_term_financing_taxonomy(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Deal keys the Term Loan build classified as newly-originated Mortgage Banking. Term Loan is
+# built before Term Asset, so the asset sheet reuses this set rather than re-deriving it: the
+# asset rows carry no Origination Date for these brand-new deals (itself one of the remaining
+# open mismatches), so the date test can only be applied at loan level.
+TERM_NEW_ORIGINATION_MB_KEYS: Set[str] = set()
+
+# How recently a loan must have closed to count as newly originated. Measured on 20260831 the
+# result is identical at 14, 30 and 45 days (+10 Segment / +4 Portfolio / +4 CPP JV, with 0
+# regressions in every case), so this is not a knife-edge threshold. 30 days is a month of
+# "closed but not yet placed into a vehicle".
+TERM_NEW_ORIGINATION_WINDOW_DAYS = 30
+
+
+def _apply_term_new_origination_mortgage_banking(out: pd.DataFrame, is_loan_sheet: bool) -> pd.DataFrame:
+    """A loan that has closed but has no funding vehicle yet is Mortgage Banking.
+
+    The report already carries everything needed: "Financing" IS the Salesforce Current
+    Funding Vehicle, and "Origination Date" IS the Close Date -- verified equal on 1,012 of
+    1,012 Term Loan deals against SF_Term_20260831. A deal that closed inside the window with
+    no funding vehicle has not been placed yet, so it sits in Mortgage Banking / DSCR and is
+    not a CPP JV loan, whatever its eventual home turns out to be.
+
+    On 20260831 the build called these DSCR (5), CPP JV (4) and Securitized Term (1) while the
+    official calls all 10 Mortgage Banking. The build never produces a FALSE Mortgage Banking
+    -- 58 of the official's 68 already agree and there are 0 in the other direction -- so
+    forcing the label here is purely additive. Measured: Term Loan Segment +10, Portfolio +4,
+    CPP JV +4; Term Asset Segment +12, Portfolio +4; 0 regressions anywhere.
+    """
+    global TERM_NEW_ORIGINATION_MB_KEYS
+    if out is None or out.empty:
+        return out
+
+    if is_loan_sheet:
+        TERM_NEW_ORIGINATION_MB_KEYS = set()
+        if "Financing" not in out.columns or "Origination Date" not in out.columns:
+            return out
+        _fin = out["Financing"].astype("string").fillna("").str.strip()
+        _fin_blank = _fin.eq("") | _fin.str.casefold().isin(["n/a", "none", "nan"])
+        _orig = pd.to_datetime(out["Origination Date"], errors="coerce")
+        _cutoff = pd.Timestamp(run_dt).normalize() - pd.Timedelta(days=TERM_NEW_ORIGINATION_WINDOW_DAYS)
+        mask = _fin_blank & _orig.notna() & _orig.ge(_cutoff)
+        if "Loan Stage" in out.columns:
+            _stage = out["Loan Stage"].astype("string").str.strip().str.casefold()
+            mask = mask & ~_stage.isin(["sold", "reo"]).fillna(False)
+        if "Deal Number" in out.columns:
+            _keys = norm_id_series(out.loc[mask, "Deal Number"]).dropna()
+            TERM_NEW_ORIGINATION_MB_KEYS = set(_keys.astype(str).tolist())
+    else:
+        if not TERM_NEW_ORIGINATION_MB_KEYS or "Deal Number" not in out.columns:
+            return out
+        mask = (
+            norm_id_series(out["Deal Number"])
+            .astype("string")
+            .isin(list(TERM_NEW_ORIGINATION_MB_KEYS))
+            .fillna(False)
+        )
+
+    if not bool(mask.any()):
+        return out
+    if "Segment" in out.columns:
+        out.loc[mask, "Segment"] = "Mortgage Banking"
+    if "Portfolio" in out.columns:
+        out.loc[mask, "Portfolio"] = "DSCR"
+    if "CPP JV" in out.columns:
+        out.loc[mask, "CPP JV"] = "N"
+    return out
+
+
 def build_term_loan(
     sf_term: pd.DataFrame,
     sf_am: pd.DataFrame,
@@ -7164,6 +7250,7 @@ def build_term_loan(
             out.loc[_l_boarding_only, "Servicer ID"] = "N/A"
 
     out = _apply_term_financing_taxonomy(out)
+    out = _apply_term_new_origination_mortgage_banking(out, is_loan_sheet=True)
 
     terminal_zero_keys = _term_terminal_zero_exclusion_keys(sf_term)
     if terminal_zero_keys:
@@ -7427,6 +7514,7 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
     # Scoped to rows where BOTH are non-positive so an asset with a real balance but a
     # missing allocation still survives.
     out = _apply_term_financing_taxonomy(out)
+    out = _apply_term_new_origination_mortgage_banking(out, is_loan_sheet=False)
 
     _ta_ala = pd.to_numeric(out.get("Property ALA", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
     _ta_upb = pd.to_numeric(out.get(upb_col, pd.Series([np.nan] * len(out), index=out.index)), errors="coerce").fillna(0.0)
@@ -7847,6 +7935,12 @@ def build_bridge_loan(
                     out[c] = coalesce_keep_nonblank(out.get(c, blank_obj), out[f"{c}_prev"])
                 out = out.drop(columns=[f"{c}_prev"], errors="ignore")
 
+    _prior_legacy_segment = None
+    if "Segment" in out.columns:
+        _prior_legacy_segment = (
+            out["Segment"].astype("string").str.strip().str.casefold().eq("legacy").fillna(False)
+        )
+
     # CAFL re-financed deals: Segment must read BRIDGE_SECURITIZED_SEGMENT once the deal is
     # re-financed into a CAFL securitization, overriding the Segment-first carry-forward
     # that would otherwise pin last week's stale vehicle (e.g. "CPP JV"). Mirrors the
@@ -7865,6 +7959,18 @@ def build_bridge_loan(
     if "Financing" in out.columns and "Segment" in out.columns:
         _cpp_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CPP JV", na=False)
         out.loc[_cpp_mask, "Segment"] = "CPP JV"
+
+    # V85: a deal the prior report already classifies as "Legacy" STAYS Legacy. Segment is
+    # carry-forward-first, so out["Segment"] holds last week's label at the capture point
+    # above; the two overrides would then relabel it off its Financing. The 8 deals 37185,
+    # 37535, 38304, 38528, 39392, 39795, 41118 and 47079 all carry Financing "CAFL 2026-R1",
+    # so the CAFL rule rewrote them to BRIDGE_SECURITIZED_SEGMENT while the 20260831 official
+    # -- and the 20260824 report before it -- call all 23 of their Legacy deals "Legacy".
+    # Being funded through a CAFL vehicle does not move a run-off deal back into the
+    # securitized book. Measured on 20260831: +13 Bridge Asset cells, +8 Bridge Loan cells,
+    # 0 regressions.
+    if _prior_legacy_segment is not None and bool(_prior_legacy_segment.any()):
+        out.loc[_prior_legacy_segment, "Segment"] = "Legacy"
 
     # Hard-reconcile the loan-level math back to the already-built Bridge Asset rows.
     # This prevents servicer zeroes / wrong rollup fields from breaking loan-level Active Funded Amount or UPB.
