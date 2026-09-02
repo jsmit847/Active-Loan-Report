@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V78_BRIDGE_CPP_JV_SEGMENT_AND_RENO_PCT"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V79_DROP_DUPLICATE_PARENT_TERM_ASSETS"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -114,6 +114,9 @@ REPORT_DROP_SHEETS = (
 # build starts from is last week's output. Dropping them would silently break the strategy
 # grouping, SSP and Legacy lookups on the NEXT run.
 REPORT_KEEP_LOOKUP_SHEETS = ("SSP Loans", "Legacy", "Strategy Groupings")
+
+# V79: filled by _build_term_asset_like, reported in the build diagnostics and the Build Log.
+TERM_ASSET_PARENT_DROPS: Dict[str, float] = {}
 
 # V71: sheet_name -> {"handed": n, "on_sheet_after_write": n}, filled by write_output_sheet and
 # reported in the build diagnostics. Distinguishes "the write produced nothing" from "the rows
@@ -3295,6 +3298,37 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     df = df[df["_deal_key"].notna() & df["_asset_key"].notna()].copy()
 
     df["_is_sub_unit"] = _yn_from_bool_series(df.get("Is Sub Unit", pd.Series([pd.NA] * len(df), index=df.index))).eq("Y").astype("int8")
+
+    # V79: drop a PARENT property when the same deal also carries its individual assets.
+    #
+    # The SOQL above filters sub-units, but never filtered parents, so a property that is
+    # recorded both as one aggregate row and as its individual units came through twice. Both
+    # copies carry the full ALA, which doubles the deal's ALA total -- and Term Asset UPB is
+    # allocated as loan UPB x (asset ALA / deal ALA sum), so every asset on such a deal received
+    # half of what it should. Against the 20260831 official that was 247 of the tab's 280
+    # mismatches, over 14 deals, and the exact-2x cases are unmistakable: deal 29412 had 4
+    # assets and ALA 11,900,000 against the official's 2 assets and 5,950,000, deal 58276 had
+    # 8 / 9,882,000 against 4 / 4,941,000, with the loan UPB identical on both sides.
+    #
+    # Deal 55167 shows the shape plainly: the official keeps "228 Broad St" (ALA 424,386.89, 6
+    # units, Multifamily) and the build additionally carried "228, 230, 232, 234, 236..." with
+    # the identical ALA, unit count and property type. Deal 29734 is the same story with
+    # "1056/1058 Irene" sitting alongside "1056 Irene St" and "1058 Irene St".
+    #
+    # Scoped so it can never empty a deal: parents are dropped only where that deal also has at
+    # least one non-parent asset. A standalone property flagged as a parent is kept.
+    df["_is_parent"] = _yn_from_bool_series(df.get("Is Parent", pd.Series([pd.NA] * len(df), index=df.index))).eq("Y").astype("int8")
+    _deal_nonparent = (1 - df["_is_parent"]).groupby(df["_deal_key"]).transform("sum")
+    _drop_parent = df["_is_parent"].eq(1) & _deal_nonparent.gt(0)
+    if bool(_drop_parent.any()):
+        TERM_ASSET_PARENT_DROPS.clear()
+        TERM_ASSET_PARENT_DROPS.update({
+            "rows": int(_drop_parent.sum()),
+            "deals": int(df.loc[_drop_parent, "_deal_key"].nunique()),
+            "ala": float(pd.to_numeric(df.loc[_drop_parent, "ALA"], errors="coerce").fillna(0).sum()) if "ALA" in df.columns else 0.0,
+        })
+        df = df.loc[~_drop_parent].copy()
+
     df["_nonnull_score"] = 0
     for c in ["Address", "City", "State", "Zip", "CBSA", "ALA", "Value Date", "As-Is Value"]:
         if c in df.columns:
@@ -3305,6 +3339,7 @@ def _build_term_asset_like(deal_numbers=None) -> pd.DataFrame:
     df["_created_dt"] = _to_datetime_series_mixed(df.get("Property Created Date", pd.Series([pd.NaT] * len(df), index=df.index)))
     df = df.sort_values(["_deal_key", "_asset_key", "_is_sub_unit", "_nonnull_score", "_ala_sort", "_value_dt", "_mod_dt", "_created_dt", "_property_id_key"], ascending=[True, True, False, True, True, True, True, True, True])
     df = df.drop_duplicates(["_deal_key", "_asset_key"], keep="last")
+    df = df.drop(columns=["_is_parent"], errors="ignore")
     return downcast_numeric_frame(df)
 
 
@@ -10422,6 +10457,13 @@ if build_btn:
                 status.update(label="Pulling term asset deal universe from Salesforce...")
                 term_asset_filter_deals = _build_term_asset_deal_universe(candidate_term_deals)
                 diagnostics.append(f"Term asset deal universe: {len(term_asset_filter_deals):,} deals")
+                if TERM_ASSET_PARENT_DROPS:
+                    _pd_ = TERM_ASSET_PARENT_DROPS
+                    diagnostics.append(
+                        "Term Asset: dropped {rows:,} parent property row(s) across {deals:,} deal(s) "
+                        "that also carry their individual assets, removing {ala:,.2f} of duplicated ALA "
+                        "from the UPB allocation denominator.".format(**_pd_)
+                    )
 
                 status.update(label="Building Term Loan...")
                 term_loan_df = build_term_loan(
