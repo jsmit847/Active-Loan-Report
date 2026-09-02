@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V80_REVERT_RENO_PCT_CHANGE"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V81_DROP_SUBUNIT_TWIN_TERM_ASSETS"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -117,6 +117,9 @@ REPORT_KEEP_LOOKUP_SHEETS = ("SSP Loans", "Legacy", "Strategy Groupings")
 
 # V79: filled by _build_term_asset_like, reported in the build diagnostics and the Build Log.
 TERM_ASSET_PARENT_DROPS: Dict[str, float] = {}
+
+# V81: filled by _drop_subunit_twin_term_assets, reported in the diagnostics and Build Log.
+TERM_ASSET_SUBUNIT_TWIN_DROPS: Dict[str, float] = {}
 
 # V71: sheet_name -> {"handed": n, "on_sheet_after_write": n}, filled by write_output_sheet and
 # reported in the build diagnostics. Distinguishes "the write produced nothing" from "the rows
@@ -7070,6 +7073,74 @@ def build_term_loan(
         out = _drop_term_deal_keys(out, terminal_zero_keys)
     return downcast_numeric_frame(out.drop(columns=[c for c in out.columns if c.startswith("_") and c not in {"_deal_key", "_sid_key"}], errors="ignore"))
 
+def _drop_subunit_twin_term_assets(out: pd.DataFrame, term_loan: pd.DataFrame) -> dict:
+    """Remove sub-unit duplicates that inflate a deal's ALA above its Loan Amount.
+
+    The official report satisfies a hard invariant: per deal, sum(Property ALA) equals the Term
+    Loan's Loan Amount. It holds on 1,028 of 1,030 deals on 20260831 and 1,023 of 1,025 on
+    20260824, and the sum is NEVER below Loan Amount. So an ALA sum ABOVE Loan Amount is proof
+    of duplicate asset rows -- and because Term Asset UPB is allocated as
+    loan UPB x (asset ALA / deal ALA sum), that inflated denominator shortchanges every asset
+    on the deal. Test 83 had 7 such deals, two of them at a ratio of exactly 2.000.
+
+    Is_Sub_Unit__c does not identify these rows -- the SOQL already filters on it and they come
+    through anyway -- and V79's Is_Parent__c filter only caught about half. What does identify
+    them is the shape of the pair. Deal 58276:
+
+        KEPT   11 Lillian Dr          Multifamily  ALA 1,235,250
+        DROP   11 Lillian Dr Unit 1   Townhome     ALA 1,235,250
+
+    So a row is dropped only when all four hold: its deal is over Loan Amount, its ALA matches
+    a sibling's to the cent, that sibling is Multifamily while it is not, and its own address
+    carries a sub-unit marker. Measured on test 83 against the 20260831 official: 5 rows
+    dropped, all 5 genuinely absent from the official, 0 real assets lost, 28 UPB cells fixed.
+
+    A subset-sum approach was tried first and rejected -- it tied the invariant on all 7 deals
+    but removed 14 legitimate assets to fix 25 cells, which is a worse report, not a better one.
+    """
+    if out is None or out.empty or term_loan is None or term_loan.empty:
+        return {}
+    if "Property ALA" not in out.columns or "_deal_key" not in out.columns:
+        return {}
+    tl = _ensure_deal_key(term_loan, "Deal Number")
+    if "Loan Amount" not in tl.columns:
+        return {}
+    amt = pd.to_numeric(tl["Loan Amount"], errors="coerce").groupby(tl["_deal_key"]).max()
+
+    ala = pd.to_numeric(out["Property ALA"], errors="coerce").fillna(0.0)
+    ptype = _report_text_series_from_col(out, "Property Type")
+    grouping = _report_text_series_from_col(out, "Grouping")
+    is_mf = ptype.eq("Multifamily") | grouping.eq("Multifamily")
+    addr = out.get("Address", pd.Series([""] * len(out), index=out.index)).astype("string").fillna("")
+    addr_low = addr.str.lower()
+    has_subunit_marker = addr_low.str.contains(" unit ", regex=False) | addr_low.str.endswith(" unit") | addr.str.contains("(", regex=False)
+
+    drops = []
+    for _deal, _idx in out.groupby("_deal_key", dropna=True).groups.items():
+        _idx = list(_idx)
+        _amt = amt.get(_deal)
+        if _amt is None or not (float(_amt) > 0):
+            continue
+        _tol = abs(float(_amt)) * 0.001 + 1.0
+        if float(ala.loc[_idx].sum()) - float(_amt) <= _tol:
+            continue
+        for _i in _idx:
+            _v = float(ala.loc[_i])
+            if _v <= 0 or bool(is_mf.loc[_i]) or not bool(has_subunit_marker.loc[_i]):
+                continue
+            if any(_j != _i and abs(float(ala.loc[_j]) - _v) <= 0.01 and bool(is_mf.loc[_j]) for _j in _idx):
+                drops.append(_i)
+    if not drops:
+        return {}
+    info = {
+        "rows": len(drops),
+        "deals": int(out.loc[drops, "_deal_key"].nunique()),
+        "ala": float(ala.loc[drops].sum()),
+    }
+    out.drop(index=drops, inplace=True)
+    return info
+
+
 def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_col: str, prev_maps: Optional[dict] = None) -> pd.DataFrame:
     """Build Term Asset like the completed report: carry-forward spine first.
 
@@ -7223,6 +7294,11 @@ def build_term_asset(sf_term_asset: pd.DataFrame, term_loan: pd.DataFrame, upb_c
             out = out.drop(columns=[_tl_special_col], errors="ignore")
     else:
         out[_ta_special_header] = "N/A"
+
+    _subunit_twin_drops = _drop_subunit_twin_term_assets(out, term_loan)
+    if _subunit_twin_drops:
+        TERM_ASSET_SUBUNIT_TWIN_DROPS.clear()
+        TERM_ASSET_SUBUNIT_TWIN_DROPS.update(_subunit_twin_drops)
 
     out = _allocate_term_asset_upb_from_loan(out, term_loan, upb_col)
 
@@ -10504,6 +10580,14 @@ if build_btn:
                     diagnostics.extend(validate_term_math_or_raise(term_loan_df, term_asset_df, upb_col))
                     if term_asset_backfill and term_asset_backfill.get("fills"):
                         diagnostics.append(f"Term Asset baseline backfill cells: {int(term_asset_backfill['fills']):,} using {term_asset_backfill.get('keys', 'n/a')}")
+
+                    if TERM_ASSET_SUBUNIT_TWIN_DROPS:
+                        _st_ = TERM_ASSET_SUBUNIT_TWIN_DROPS
+                        diagnostics.append(
+                            "Term Asset: dropped {rows:,} sub-unit duplicate row(s) across {deals:,} deal(s) "
+                            "whose ALA pushed the deal above its Loan Amount, removing {ala:,.2f} of "
+                            "duplicated ALA from the UPB allocation denominator.".format(**_st_)
+                        )
 
                     status.update(label="Writing Term Asset sheet...")
                     write_output_sheet(wb, "Term Asset", term_asset_df, upb_col)
