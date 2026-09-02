@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V82_COMMITMENT_RENO_PCT_AND_VERBATIM_SF_TEXT"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V83_NBSP_AND_EXPORT_ENCODING_LOSS"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -905,6 +905,46 @@ def clean_text(val) -> str:
     if s.lower() in {"nan", "none", "<na>", "nat"}:
         return ""
     return s
+
+# The official report is built from a Salesforce REPORT EXPORT, and that export round-trips
+# its text through Latin-1. The 27 characters CP1252 maps in the 0x80-0x9F range -- the
+# "smart punctuation" block: curly quotes, en/em dashes, ellipsis, bullet, trademark -- have
+# no Latin-1 equivalent and come out as "?". Everything from 0xA0 up survives, which is why
+# the export still carries non-breaking spaces, degree signs, and even emoji.
+#
+# The app reads the Bulk API instead, which returns the true stored text, so it wrote
+# "ET Settler(U+2019)s Preserve Owner LLC" where the official has "ET Settler?s ...". To
+# replicate the official the same loss has to be applied on the way out.
+#
+# Measured over all four sheets and every text column of the 20260831 official, replacing
+# exactly this character block gains 206 cells and breaks 0. Blanket ASCII replacement gains
+# the same 206 but breaks 11 -- Term Asset Address, Bridge Loan AM Commentary and Term Loan
+# Borrower Entity all legitimately carry Latin-1 text the official preserves. Latin-1
+# replacement breaks 1 (an emoji in a Bridge Loan comment).
+#
+# The rule is self-correcting: it fires only where the true value holds a character the
+# official's own export cannot represent, which is exactly where the official shows "?". If
+# the upstream export is ever fixed, clean values pass through untouched.
+def _build_export_unmappable_chars() -> frozenset:
+    chars = set()
+    for b in range(0x80, 0xA0):
+        try:
+            chars.add(bytes([b]).decode("cp1252"))
+        except UnicodeDecodeError:
+            continue
+    return frozenset(chars)
+
+
+EXPORT_UNMAPPABLE_CHARS = _build_export_unmappable_chars()
+
+
+def apply_export_encoding_loss(value):
+    if not isinstance(value, str) or not value:
+        return value
+    if not any(ch in EXPORT_UNMAPPABLE_CHARS for ch in value):
+        return value
+    return "".join("?" if ch in EXPORT_UNMAPPABLE_CHARS else ch for ch in value)
+
 
 def strip_statebridge_display_id(servicer_id, servicer_name):
     sid = clean_text(servicer_id)
@@ -3964,7 +4004,16 @@ def _normalize_report_comment_text(value):
     for ch in ("\u2011", "\u2010", "\u2012", "\u2013", "\u2014", "\ufffd"):
         txt = txt.replace(ch, "-")
     txt = txt.replace("_x000D_", " ").replace("\r", " ")
-    txt = re.sub(r"\s+", " ", txt).strip()
+    # V83: collapse ASCII whitespace ONLY. Python's "\s" matches U+00A0, so the old
+    # pattern silently rewrote every non-breaking space as a plain space. Salesforce
+    # narrative fields are full of NBSPs (text pasted from web pages -- "January<NBSP>31,
+    # <NBSP>2027") and the official report preserves them verbatim. This function is
+    # documented as whitespace/encoding-only and never altering a clean value, which the
+    # NBSP rewrite violated: it cost 204 Tax Commentary cells on 20260831. Measured with
+    # this function itself against the official, the narrowed class gains 204 Tax
+    # Commentary cells and changes nothing on Special Asset Status, Remedy Plan,
+    # Delinquency Notes or Maturity Status.
+    txt = re.sub(r"[ \t\n\r\f\v]+", " ", txt).strip(" \t\n\r\f\v")
     return txt or pd.NA
 
 
@@ -9005,6 +9054,13 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
     for header in money_headers:
         if header in out.columns:
             out[header] = _round_report_money_series(out[header])
+
+    # Last step before the frame is written: reproduce the export encoding loss the official
+    # carries. See apply_export_encoding_loss -- +206 cells, 0 regressions on 20260831.
+    for _enc_col in out.columns:
+        _enc_ser = out[_enc_col]
+        if _enc_ser.dtype == object or str(_enc_ser.dtype) == "string":
+            out[_enc_col] = _enc_ser.map(apply_export_encoding_loss)
 
     return out
 
