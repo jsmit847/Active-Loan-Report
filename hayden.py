@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V81_DROP_SUBUNIT_TWIN_TERM_ASSETS"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V82_COMMITMENT_RENO_PCT_AND_VERBATIM_SF_TEXT"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -365,9 +365,11 @@ REPORT_NA_FILL_HEADERS = {
         "Tax Commentary", "Transaction Type", "Deal Intro Sub-Source", "Referral Source Account",
         "Referral Source Contact", "Servicer Status", "Servicer Maturity Date", "Maturity Difference",
         "Most Recent Valuation Date", "Most Recent As-Is Value", "Most Recent ARV",
-        # "% of Reno Budget" is a hand/upstream-maintained ratio with no Salesforce or
-        # servicer source the build can reach (20260803 shows values >1 on rows with zero
-        # funded renovation, so it is not any funded/approved combination available here).
+        # "% of Reno Budget" comes from Property__c.Perc_of_Rehab_Budget__c as of V82 (SF holds
+        # a percentage, the report a fraction -- see build_bridge_asset). It is genuinely NOT
+        # any funded/approved combination, which is why values above 1 appear on rows with zero
+        # funded renovation. Salesforce leaves it null on most assets, so it stays in this
+        # N/A-fill list for those.
         # It is N/A-when-missing in the report, so let the N/A policy fill it rather than
         # leaving ~4,900 true blanks for the zero-blank QA to flag.
         "% of Reno Budget",
@@ -946,7 +948,15 @@ def normalize_report_identifier_series(s: pd.Series) -> pd.Series:
     return pd.Series(s, copy=False).map(normalize_report_identifier_scalar)
 
 
-def normalize_text_display_scalar(val):
+# V82: a trailing ".0" is a float artifact only when the ENTIRE value is a plain number
+# ("824779.0" really is the integer 824779). Applying the strip unconditionally corrupted
+# genuine text: the APNs Salesforce stores as "093.-04-23.0" and "077-580-0002-012.0" were
+# being written as "093.-04-23" and "077-580-0002-012", wrong on 24 cells against the
+# 20260831 official.
+_TRAILING_DOT_ZERO_IS_FLOAT_ARTIFACT = re.compile(r"-?[\d,]*\d\.0")
+
+
+def normalize_text_display_scalar(val, preserve_verbatim: bool = False):
     if not has_any_value(val):
         return pd.NA
     if isinstance(val, pd.Timestamp):
@@ -958,7 +968,12 @@ def normalize_text_display_scalar(val):
     if isinstance(val, np.generic):
         val = val.item()
     txt = clean_text(val)
-    txt = re.sub(r"\.0$", "", txt)
+    # preserve_verbatim is set for BULK_PRESERVE_TEXT_COLUMNS -- the columns Salesforce holds
+    # as text rather than numbers. The official applies no numeric tidying to those at all: it
+    # keeps Square Feet as "1696.0" where SF stores that string, so even a pure-numeric
+    # trailing ".0" must survive there.
+    if not preserve_verbatim:
+        txt = re.sub(r"\.0$", "", txt) if _TRAILING_DOT_ZERO_IS_FLOAT_ARTIFACT.fullmatch(txt) else txt
     # Collapse internal runs of 2+ whitespace to a single space. SF text fields carry
     # data-entry double-spaces (Deal Name / APN / Borrower Entity / Account Name); the
     # official report renders them single-spaced, so match that (Fix N).
@@ -966,7 +981,9 @@ def normalize_text_display_scalar(val):
     return txt if txt else pd.NA
 
 
-def normalize_text_display_series(s: pd.Series) -> pd.Series:
+def normalize_text_display_series(s: pd.Series, preserve_verbatim: bool = False) -> pd.Series:
+    if preserve_verbatim:
+        return pd.Series(s, copy=False).map(lambda v: normalize_text_display_scalar(v, preserve_verbatim=True))
     return pd.Series(s, copy=False).map(normalize_text_display_scalar)
 
 
@@ -2225,6 +2242,12 @@ def _build_bridge_spine_like() -> pd.DataFrame:
         ("Reno Advance Amount Remaining", "Reno_Advance_Amount_Remaining__c"),
         ("Interest Allocation", "Interest_Allocation__c"),
         ("Interest Holdback Funded", "Interest_Reserves__c"),
+        # V82: this column DOES have a Salesforce source -- Property__c.Perc_of_Rehab_Budget__c
+        # -- and the long-standing comment claiming otherwise was wrong. Salesforce carries it
+        # as a percentage and the report carries it as a fraction: over the 1,240 assets where
+        # both the SF_Bridge_20260831 export and the 20260831 official hold a number, value/100
+        # equals the official on 1,240 of 1,240. Divided down in build_bridge_asset.
+        ("Reno Budget Percent Native", "Perc_of_Rehab_Budget__c"),
         ("Title Company: Account Name", "Title_Company__r.Name"),
         ("Tax Payment Next Due Date", "Tax_Payment_Next_Due_Date__c"),
         ("Taxes Payment Frequency", "Taxes_Payment_Frequency__c"),
@@ -5819,6 +5842,15 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
+    # V82: Salesforce holds "% of Reno Budget" as a percentage (100.0, 85.0, 98.535); the report
+    # holds the fraction (1, 0.85, 0.98535). Exact on 1,240/1,240 assets where both the
+    # SF_Bridge export and the official carry a number. Where Salesforce has nothing the cell is
+    # left alone, so the prior-workbook backfill and the N/A policy behave exactly as before --
+    # V78 got burned adding a fill here, and this deliberately does not.
+    if "Reno Budget Percent Native" in sf_spine.columns:
+        _reno_pct_native = pd.to_numeric(sf_spine["Reno Budget Percent Native"], errors="coerce")
+        out["% of Reno Budget"] = _reno_pct_native / 100.0
+
     # V69: carry the Salesforce payment dates as COLUMNS on `out`, here, while `out` still
     # shares sf_spine's index. They used to be read straight off sf_spine much further down,
     # AFTER `out` had been through eight left-merges -- and a merge replaces the index with a
@@ -7404,10 +7436,23 @@ def build_bridge_loan(
     # V41: Loan Commitment = SUM(per-asset Approved Advance Amount Max) from the property
     # rollup (verified deal 33182 = 102,500), which supersedes the spine LOC_Commitment__c.
     # The summed value wins when present/positive; otherwise the spine value is kept.
+    # V82: Bridge Loan "Loan Commitment" is the Opportunity's LOC_Commitment__c, NOT the sum
+    # of the per-asset Approved Advance Amount Max. V41 had these the other way round and it
+    # cost 98 cells.
+    #
+    # Measured against the 20260831 official over all 998 deals, using SF_Bridge_20260831 as
+    # the source of truth: the Salesforce Loan Commitment field disagrees with the official on
+    # 0 deals; the AAM sum disagrees on 124.
+    #
+    # V41's note cited deal 33182 as proof that LOC_Commitment__c was wrong -- 10,000,000 where
+    # it expected 102,500. The official Bridge Loan for 33182 reads 10,000,000. 102,500 is that
+    # deal's AAM sum, which is the correct source for Bridge ASSET "Asset Commitment" (V56, and
+    # still exact at 4,782/4,782), not for the loan-level commitment. The two columns were
+    # conflated. The AAM sum is kept only as a fallback for a deal with no LOC_Commitment__c.
     if "Loan Commitment (AAM)" in out.columns:
         _aam_commit = pd.to_numeric(out["Loan Commitment (AAM)"], errors="coerce")
         _spine_commit = pd.to_numeric(out.get("Loan Commitment", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-        out["Loan Commitment"] = _aam_commit.where(_aam_commit.gt(0), _spine_commit)
+        out["Loan Commitment"] = _spine_commit.where(_spine_commit.gt(0), _aam_commit)
         out = out.drop(columns=["Loan Commitment (AAM)"], errors="ignore")
 
     if bridge_asset is not None and not bridge_asset.empty:
@@ -8908,7 +8953,9 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
     text_headers -= PRESERVE_INTERNAL_WHITESPACE_HEADERS.get(sheet_name, set())
     for header in text_headers:
         if header in out.columns:
-            out[header] = normalize_text_display_series(out[header])
+            out[header] = normalize_text_display_series(
+                out[header], preserve_verbatim=header in BULK_PRESERVE_TEXT_COLUMNS
+            )
 
     # Fix N: collapse data-entry double-spaces in free-text columns so they render
     # single-spaced like the official report. These columns are written verbatim from SF
