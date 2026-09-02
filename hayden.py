@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V79_DROP_DUPLICATE_PARENT_TERM_ASSETS"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V80_REVERT_RENO_PCT_CHANGE"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -4759,11 +4759,6 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
                     # always empty and that whole branch was dead code (654 Bridge Asset NPD
                     # mismatches against 20260810).
                     "Next Payment Date",
-                    # V78: hand-maintained ratio with no Salesforce source. It was never in this
-                    # keep list, so it could not carry forward and shipped blank wherever the
-                    # build could not derive it (the 15 rows the 20260831 official shows as 1 and
-                    # the 1 row it shows as 0.8).
-                    "% of Reno Budget",
                     "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
                     "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                     "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
@@ -6228,7 +6223,6 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company", "Tax Commentary",
-            "% of Reno Budget",
             # NOTE: "Most Recent Appraisal Order Date" is deliberately excluded here. It is a live
             # value (MAX per-appraisal Order_Received_Date__c, N/A when none) and is authoritative
             # even when blank. Creating a _prev for it would let coalesce_keep_nonblank resurrect a
@@ -6251,7 +6245,17 @@ def build_bridge_asset(
             # 54127/54129/54130/54131/54180) would otherwise be pinned to last week's stale
             # name/date. Fresh SF wins; the prior workbook still backfills via the SF-first
             # else branch when SF has no value for an asset.
-            "Title Company", "Tax Commentary", "% of Reno Budget",
+            "Title Company", "Tax Commentary",
+            # V80: do NOT add "% of Reno Budget" here, and do not carry it forward at all.
+            # V78 tried both and it cost 3,300 cells on 20260831: the prior workbook holds the
+            # literal text "N/A" on those rows, coalesce_keep_nonblank treats "N/A" as a value,
+            # and last week's N/A overwrote a correctly derived ratio -- the column went from 91
+            # mismatches to 3,391. A zero-fill for rows with no approved advance was equally
+            # pointless: the column is in REPORT_NA_FILL_HEADERS and not in _numeric_na_cols, so
+            # _normalize_output_for_report turned every 0 straight back into "N/A". Reverted to
+            # the behaviour that scores 91. The official's split -- 3,375 literal zeros, 913
+            # ones, 75 N/A -- is not reproduced by funded/approved, so this needs a real
+            # derivation before anything is changed here again.
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
@@ -6312,19 +6316,6 @@ def build_bridge_asset(
     ):
         if _txtcol in out.columns:
             out[_txtcol] = pd.Series(out[_txtcol], index=out.index, dtype="object").map(_normalize_report_comment_text)
-
-    # V78: with no approved renovation advance there is nothing for the ratio to be a
-    # percentage of, and the official writes a literal 0 rather than leaving it blank -- all
-    # 3,375 of its zeros on 20260831 are rows whose approved reno budget is <= 0. Only fills a
-    # cell that is still blank, so a carried-forward hand value always wins.
-    if "% of Reno Budget" in out.columns:
-        _reno_pct = pd.Series(out["% of Reno Budget"], index=out.index, dtype="object")
-        _reno_approved = pd.to_numeric(
-            out.get("Renovation Holdback", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"
-        ).fillna(0.0)
-        _reno_fill = blankish_mask(_reno_pct) & _reno_approved.le(0)
-        if bool(_reno_fill.any()):
-            out.loc[_reno_fill, "% of Reno Budget"] = 0
 
     # Valuation/value columns must be blank (empty cell) when there is no value --
     # never 0 -- to match the official report. Guards against stale 0s from SF,
