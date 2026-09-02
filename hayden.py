@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V85_LEGACY_STICKS_AND_NEW_ORIGINATION_MB"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V86_RENO_PCT_ZERO_IS_REAL_AND_CARRY_FORWARD"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -421,6 +421,11 @@ REPORT_INTEGER_HEADERS = {
 # text-zero-to-N/A rule must skip them. See _normalize_output_for_report.
 REPORT_ZERO_IS_REAL_HEADERS = {
     "Term Loan": {"Borrower Entity"},
+    # V86: the official carries a literal 0 in "% of Reno Budget" on 3,383 of 4,698 assets
+    # (against 915 ones, 325 other ratios and 75 "N/A"). Without this the text-zero-to-N/A
+    # rule in _normalize_output_for_report rewrites every one of those zeros as "N/A" -- the
+    # exact effect V78 hit and V80 documented but could not place.
+    "Bridge Asset": {"% of Reno Budget"},
 }
 
 WHITESPACE_COLLAPSE_HEADERS = {
@@ -6333,6 +6338,9 @@ def build_bridge_asset(
             # silently no-ops (the current SF value wrongly wins).
             "Origination Value Dt", "Origination As-Is Value", "Origination ARV",
             "Deal Intro Sub-Source", "Referral Source Account", "Referral Source Contact",
+            # V86: extracted so the SF-first coalesce below can backfill the assets where
+            # Salesforce holds no percentage. See the note in bridge_asset_carry_forward_first.
+            "% of Reno Budget",
         ] if c in man.columns]
         out = out.merge(man[keep_cols], on="_asset_key", how="left", suffixes=("", "_prev"))
         bridge_asset_carry_forward_first = {
@@ -6346,16 +6354,25 @@ def build_bridge_asset(
             # name/date. Fresh SF wins; the prior workbook still backfills via the SF-first
             # else branch when SF has no value for an asset.
             "Title Company", "Tax Commentary",
-            # V80: do NOT add "% of Reno Budget" here, and do not carry it forward at all.
-            # V78 tried both and it cost 3,300 cells on 20260831: the prior workbook holds the
-            # literal text "N/A" on those rows, coalesce_keep_nonblank treats "N/A" as a value,
-            # and last week's N/A overwrote a correctly derived ratio -- the column went from 91
-            # mismatches to 3,391. A zero-fill for rows with no approved advance was equally
-            # pointless: the column is in REPORT_NA_FILL_HEADERS and not in _numeric_na_cols, so
-            # _normalize_output_for_report turned every 0 straight back into "N/A". Reverted to
-            # the behaviour that scores 91. The official's split -- 3,375 literal zeros, 913
-            # ones, 75 N/A -- is not reproduced by funded/approved, so this needs a real
-            # derivation before anything is changed here again.
+            # "% of Reno Budget" is deliberately NOT in this carry-forward-first set: it is
+            # extracted above only so the SF-FIRST branch can backfill it. Fresh Salesforce
+            # (Property__c.Perc_of_Rehab_Budget__c / 100, exact on 1,227/1,227 assets that
+            # have one on 20260831) must win; last week's value fills the rest.
+            #
+            # V86 note, because this column has now broken three times. It needs all three of
+            # the following together, and any one of them alone makes it worse:
+            #   1. the masked Salesforce write in build_bridge_asset -- write ONLY where SF has
+            #      a number. V82 assigned the whole column and NaN-ed 3,407 assets.
+            #   2. this SF-first carry-forward, so those 3,407 keep last week's value. Before
+            #      V82 the column was absent from the frame entirely, so write_output_sheet
+            #      never touched the cells and the template (which IS the prior workbook)
+            #      supplied them -- that accident is what scored 91.
+            #   3. "% of Reno Budget" in REPORT_ZERO_IS_REAL_HEADERS, or the text-zero-to-N/A
+            #      rule rewrites the 3,383 carried-forward zeros as "N/A". This is the piece
+            #      V78 was missing and V80 could not place.
+            # The official's split is 3,383 zeros / 915 ones / 325 other / 75 N/A, and it is
+            # NOT any funded-over-approved ratio -- the mix of a live SF percentage and a
+            # carried-forward remainder is what reproduces it.
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
