@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V83_NBSP_AND_EXPORT_ENCODING_LOSS"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_02_V84_PANDAS3_STR_DTYPE_AND_RENO_MASK"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -5891,14 +5891,30 @@ def build_bridge_asset(
         if extra in sf_spine.columns:
             out[extra] = sf_spine[extra]
 
-    # V82: Salesforce holds "% of Reno Budget" as a percentage (100.0, 85.0, 98.535); the report
-    # holds the fraction (1, 0.85, 0.98535). Exact on 1,240/1,240 assets where both the
-    # SF_Bridge export and the official carry a number. Where Salesforce has nothing the cell is
-    # left alone, so the prior-workbook backfill and the N/A policy behave exactly as before --
-    # V78 got burned adding a fill here, and this deliberately does not.
+    # Salesforce holds "% of Reno Budget" as a percentage (100.0, 85.0, 98.535); the report
+    # holds the fraction (1, 0.85, 0.98535). Exact on every asset where both the SF_Bridge
+    # export and the official carry a number.
+    #
+    # V84: the assignment is now masked. V82 assigned the whole column, so the 3,407 assets
+    # where Salesforce holds no percentage were overwritten with NaN -- wiping the zeros the
+    # prior-workbook backfill had supplied and taking the column from 91 mismatches to 3,336
+    # on 20260831. The official holds a literal 0 on 3,332 of those rows.
+    #
+    # Measured on 20260831: Salesforce has a number on 1,227 assets and matches the official
+    # 1,227/1,227 there, against 1,211/1,227 for the value the build already had. Keeping the
+    # existing value everywhere else takes the column to 75 mismatches (from 91). This is the
+    # third attempt at this column -- V78 broke it by preferring carry-forward, V82 broke it by
+    # clobbering the nulls -- so the rule is: write ONLY where Salesforce actually has a
+    # number, and never introduce a fill here.
     if "Reno Budget Percent Native" in sf_spine.columns:
         _reno_pct_native = pd.to_numeric(sf_spine["Reno Budget Percent Native"], errors="coerce")
-        out["% of Reno Budget"] = _reno_pct_native / 100.0
+        _reno_have = _reno_pct_native.notna()
+        if bool(_reno_have.any()):
+            _reno_existing = pd.Series(
+                out.get("% of Reno Budget", pd.Series([np.nan] * len(out), index=out.index)),
+                index=out.index,
+            )
+            out["% of Reno Budget"] = _reno_existing.where(~_reno_have, _reno_pct_native / 100.0)
 
     # V69: carry the Salesforce payment dates as COLUMNS on `out`, here, while `out` still
     # shares sf_spine's index. They used to be read straight off sf_spine much further down,
@@ -9057,10 +9073,28 @@ def _normalize_output_for_report(df: pd.DataFrame, sheet_name: str, upb_col: str
 
     # Last step before the frame is written: reproduce the export encoding loss the official
     # carries. See apply_export_encoding_loss -- +206 cells, 0 regressions on 20260831.
+    #
+    # V84: the guard here used to be `dtype == object or str(dtype) == "string"`, which is
+    # correct on pandas 2 and WRONG on the pandas 3.0.5 the cloud actually runs. Pandas 3
+    # gives a plain text column the new default dtype whose repr is "str": it equals neither
+    # object nor "string", so every pure-text column was silently skipped. Only columns an
+    # earlier .map() had forced to object were transformed, which is why V83 fixed Borrower
+    # Entity and Special Asset Status but left all 53 Deal Name cells untouched. Local pandas
+    # is 2.3.3, so the bug could not reproduce locally -- verify dtype-sensitive changes
+    # against the pinned pandas 3.0.5 instead.
+    #
+    # The guard is now inclusive: transform unless the column is provably numeric, datetime
+    # or boolean. apply_export_encoding_loss returns any non-str value unchanged, so an
+    # unrecognised dtype is passed through safely rather than skipped.
     for _enc_col in out.columns:
         _enc_ser = out[_enc_col]
-        if _enc_ser.dtype == object or str(_enc_ser.dtype) == "string":
-            out[_enc_col] = _enc_ser.map(apply_export_encoding_loss)
+        if (
+            pd.api.types.is_numeric_dtype(_enc_ser)
+            or pd.api.types.is_datetime64_any_dtype(_enc_ser)
+            or pd.api.types.is_bool_dtype(_enc_ser)
+        ):
+            continue
+        out[_enc_col] = _enc_ser.map(apply_export_encoding_loss)
 
     return out
 
