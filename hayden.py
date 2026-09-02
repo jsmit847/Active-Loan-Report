@@ -77,7 +77,7 @@ except Exception as _audit_import_exc:
 
 
 PRIMARY_USER_NAME = "Hayden"
-APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V77_PATCH_WORKSHEET_WRITER_DIRECTLY"
+APP_BUILD_VERSION = "ALR_FIX_2026_09_01_V78_BRIDGE_CPP_JV_SEGMENT_AND_RENO_PCT"
 
 # V67: filled by _build_bridge_spine_like, reported in the build diagnostics. The Term Asset
 # queries require the sub-unit check to be OFF -- "(Is_Sub_Unit__c = FALSE OR
@@ -4724,6 +4724,11 @@ def build_prev_maps(prev_bytes: bytes) -> dict:
                     # always empty and that whole branch was dead code (654 Bridge Asset NPD
                     # mismatches against 20260810).
                     "Next Payment Date",
+                    # V78: hand-maintained ratio with no Salesforce source. It was never in this
+                    # keep list, so it could not carry forward and shipped blank wherever the
+                    # build could not derive it (the 15 rows the 20260831 official shows as 1 and
+                    # the 1 row it shows as 0.8).
+                    "% of Reno Budget",
                     "3/31 NPL (Y/N)", "Needs NPL Value", "Special Flag",
                     "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
                     "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
@@ -6188,6 +6193,7 @@ def build_bridge_asset(
             "Asset Manager 1", "AM 1 Assigned Date", "Asset Manager 2", "AM 2 Assigned Date",
             "Construction Mgr.", "CM Assigned Date", "Servicer", "Servicer Status",
             "Remedy Plan", "Delinquency Notes", "Maturity Status", "Title Company", "Tax Commentary",
+            "% of Reno Budget",
             # NOTE: "Most Recent Appraisal Order Date" is deliberately excluded here. It is a live
             # value (MAX per-appraisal Order_Received_Date__c, N/A when none) and is authoritative
             # even when blank. Creating a _prev for it would let coalesce_keep_nonblank resurrect a
@@ -6210,7 +6216,7 @@ def build_bridge_asset(
             # 54127/54129/54130/54131/54180) would otherwise be pinned to last week's stale
             # name/date. Fresh SF wins; the prior workbook still backfills via the SF-first
             # else branch when SF has no value for an asset.
-            "Title Company", "Tax Commentary",
+            "Title Company", "Tax Commentary", "% of Reno Budget",
             "Updated Valuation Date", "Updated As-Is Value", "Updated ARV",
             # Most Recent Appraisal Order Date is intentionally NOT carry-forward-first: it is a
             # live current value (MAX per-appraisal Order_Received_Date__c, N/A when none),
@@ -6248,6 +6254,17 @@ def build_bridge_asset(
         _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
         out.loc[_cafl_mask, "Segment"] = BRIDGE_SECURITIZED_SEGMENT
 
+    # V78: the same treatment for CPP JV. Segment is carry-forward-first, so a deal that has
+    # since moved onto a CPP JV vehicle keeps last week's label -- 184 Bridge Asset rows and 19
+    # Bridge Loan rows read "Mortgage Banking" on 20260831 while the official says "CPP JV",
+    # and every one of them carries Financing "CPP JV - Goldman Sachs" in BOTH the build and the
+    # official, so only the Segment derivation was stale. Exact in both directions on 20260831:
+    # 731 rows have CPP JV financing, the official calls all 731 CPP JV, and the official's CPP
+    # JV population is exactly those 731.
+    if "Financing" in out.columns and "Segment" in out.columns:
+        _cpp_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CPP JV", na=False)
+        out.loc[_cpp_mask, "Segment"] = "CPP JV"
+
     # Normalize curated free-text columns for encoding artifacts (mojibake like "â€™",
     # U+2019/dash variants, _x000D_ carriage returns). Previously only Tax Commentary was
     # cleaned; the same byte-noise drove phantom Data mismatches on the other narrative
@@ -6260,6 +6277,19 @@ def build_bridge_asset(
     ):
         if _txtcol in out.columns:
             out[_txtcol] = pd.Series(out[_txtcol], index=out.index, dtype="object").map(_normalize_report_comment_text)
+
+    # V78: with no approved renovation advance there is nothing for the ratio to be a
+    # percentage of, and the official writes a literal 0 rather than leaving it blank -- all
+    # 3,375 of its zeros on 20260831 are rows whose approved reno budget is <= 0. Only fills a
+    # cell that is still blank, so a carried-forward hand value always wins.
+    if "% of Reno Budget" in out.columns:
+        _reno_pct = pd.Series(out["% of Reno Budget"], index=out.index, dtype="object")
+        _reno_approved = pd.to_numeric(
+            out.get("Renovation Holdback", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce"
+        ).fillna(0.0)
+        _reno_fill = blankish_mask(_reno_pct) & _reno_approved.le(0)
+        if bool(_reno_fill.any()):
+            out.loc[_reno_fill, "% of Reno Budget"] = 0
 
     # Valuation/value columns must be blank (empty cell) when there is no value --
     # never 0 -- to match the official report. Guards against stale 0s from SF,
@@ -7612,6 +7642,17 @@ def build_bridge_loan(
     if "Financing" in out.columns and "Segment" in out.columns:
         _cafl_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CAFL ", na=False)
         out.loc[_cafl_mask, "Segment"] = BRIDGE_SECURITIZED_SEGMENT
+
+    # V78: the same treatment for CPP JV. Segment is carry-forward-first, so a deal that has
+    # since moved onto a CPP JV vehicle keeps last week's label -- 184 Bridge Asset rows and 19
+    # Bridge Loan rows read "Mortgage Banking" on 20260831 while the official says "CPP JV",
+    # and every one of them carries Financing "CPP JV - Goldman Sachs" in BOTH the build and the
+    # official, so only the Segment derivation was stale. Exact in both directions on 20260831:
+    # 731 rows have CPP JV financing, the official calls all 731 CPP JV, and the official's CPP
+    # JV population is exactly those 731.
+    if "Financing" in out.columns and "Segment" in out.columns:
+        _cpp_mask = out["Financing"].astype("string").str.strip().str.upper().str.startswith("CPP JV", na=False)
+        out.loc[_cpp_mask, "Segment"] = "CPP JV"
 
     # Hard-reconcile the loan-level math back to the already-built Bridge Asset rows.
     # This prevents servicer zeroes / wrong rollup fields from breaking loan-level Active Funded Amount or UPB.
